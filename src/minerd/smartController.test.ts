@@ -1,0 +1,151 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { SmartController } from './smartController.js';
+
+// synthetic machine: H/s rises with throttle up to a knee, then flattens/dips (throttle).
+function machine(knee = 0.7) {
+  return (t: number) => {
+    const base = t <= knee ? 700 * t : 700 * knee - 900 * (t - knee); // dips past knee
+    return Math.max(0, base);
+  };
+}
+
+function runWindow(sc: SmartController, hps: number, advance: (ms: number) => void): void {
+  for (let s = 0; s < 5; s++) { sc.onHashrate(hps); advance(200); }
+  sc.tick();
+}
+
+test('hill-climb converges to just below the knee and holds', () => {
+  let now = 0; const clock = () => now;
+  let applied = 0.75;
+  const sink = { setThrottle: (t: number) => { applied = t; } };
+  const sc = new SmartController(sink, { dwellMs: 1000, step: 0.05, start: 0.4 }, clock);
+  // simulate 200 dwell windows; each window feed the machine's H/s at the applied throttle
+  for (let i = 0; i < 200; i++) {
+    for (let s = 0; s < 5; s++) { sc.onHashrate(machine()(applied)); now += 200; }
+    sc.tick();
+  }
+  assert.ok(applied >= 0.6 && applied <= 0.75, `settled at ${applied}, expected near knee 0.7`);
+});
+
+test('rejects noise without chasing it', () => {
+  let now = 0; const clock = () => now;
+  let applied = 0.75;
+  const sink = { setThrottle: (t: number) => { applied = t; } };
+  const sc = new SmartController(sink, { dwellMs: 1000, step: 0.05, start: 0.4 }, clock);
+  const jitter = [0.97, 1.03, 0.99, 1.01, 1.0, 1.02, 0.98];
+
+  for (let i = 0; i < 200; i++) {
+    const noisyHps = machine()(applied) * jitter[i % jitter.length]!;
+    runWindow(sc, noisyHps, (ms) => { now += ms; });
+  }
+
+  assert.ok(applied >= 0.6 && applied <= 0.75, `settled at ${applied}, expected near knee 0.7`);
+});
+
+test('re-probes after reprobeEveryMs', () => {
+  let now = 0; const clock = () => now;
+  let applied = 0.75;
+  let knee = 0.55;
+  const sink = { setThrottle: (t: number) => { applied = t; } };
+  const sc = new SmartController(
+    sink,
+    { dwellMs: 1000, step: 0.05, start: 0.4, reprobeEveryMs: 12_000 },
+    clock,
+  );
+
+  for (let i = 0; i < 60; i++) {
+    runWindow(sc, machine(knee)(applied), (ms) => { now += ms; });
+  }
+  assert.ok(applied >= 0.5 && applied <= 0.65, `settled at ${applied}, expected near first knee 0.55`);
+
+  knee = 0.8;
+  for (let i = 0; i < 80; i++) {
+    runWindow(sc, machine(knee)(applied), (ms) => { now += ms; });
+  }
+
+  assert.ok(applied >= 0.7 && applied <= 0.85, `re-probed to ${applied}, expected near shifted knee 0.8`);
+});
+
+test('considerate backs off when idle drops below headroom, recovers when it rises', () => {
+  let idleFrac = 0.5; const demand = { cpuIdleFraction: () => idleFrac };
+  let applied = 1; const sink = { setThrottle: (t: number) => { applied = t; } };
+  let now = 0;
+  const sc = new SmartController(sink, { dwellMs: 1000, start: 0.9 }, () => now,
+    { demand, headroom: 0.25 });
+  for (let i = 0; i < 30; i++) { for (let s = 0; s < 5; s++){ sc.onHashrate(600); now += 200; } sc.tick(); }
+  const high = applied;
+  idleFrac = 0.02; // your work eats the CPU -> idle below headroom
+  for (let i = 0; i < 30; i++) { for (let s = 0; s < 5; s++){ sc.onHashrate(600); now += 200; } sc.tick(); }
+  assert.ok(applied < high, `backed off under demand: ${applied} < ${high}`);
+  idleFrac = 0.6; // work subsides
+  for (let i = 0; i < 40; i++) { for (let s = 0; s < 5; s++){ sc.onHashrate(600); now += 200; } sc.tick(); }
+  assert.ok(applied > 0.5, `recovered when idle returned: ${applied}`);
+});
+
+test('applied throttle exposes considerate demand clamp', () => {
+  let idleFrac = 0.02; const demand = { cpuIdleFraction: () => idleFrac };
+  const sink = { setThrottle: (_t: number) => {} };
+  let now = 0;
+  const sc = new SmartController(sink, { dwellMs: 300_000, start: 0.9, step: 0.05 }, () => now,
+    { demand, headroom: 0.25 });
+
+  for (let i = 0; i < 20; i++) { now += 1000; sc.tick(); }
+
+  assert.ok(sc.appliedThrottle() < sc.currentThrottle());
+  assert.equal(sc.isClamped(), true);
+});
+
+test('applied throttle matches thermal target in max mode', () => {
+  const sink = { setThrottle: (_t: number) => {} };
+  let now = 0;
+  const sc = new SmartController(sink, { dwellMs: 300_000, start: 0.9, step: 0.05 }, () => now);
+
+  now += 1000; sc.tick();
+
+  assert.equal(sc.appliedThrottle(), sc.currentThrottle());
+  assert.equal(sc.isClamped(), false);
+});
+
+test('null demand signal => behaves as Max (never demand-limited)', () => {
+  let appliedMax = 1; const maxSink = { setThrottle: (t: number) => { appliedMax = t; } };
+  let appliedNull = 1; const nullSink = { setThrottle: (t: number) => { appliedNull = t; } };
+  let now = 0; const clock = () => now;
+  const max = new SmartController(maxSink, { dwellMs: 1000, step: 0.05, start: 0.4 }, clock);
+  const considerate = new SmartController(
+    nullSink,
+    { dwellMs: 1000, step: 0.05, start: 0.4 },
+    clock,
+    { demand: { cpuIdleFraction: () => null } },
+  );
+
+  for (let i = 0; i < 80; i++) {
+    for (let s = 0; s < 5; s++) {
+      max.onHashrate(machine()(appliedMax));
+      considerate.onHashrate(machine()(appliedNull));
+      now += 200;
+    }
+    max.tick();
+    considerate.tick();
+    assert.equal(appliedNull, appliedMax);
+  }
+});
+
+test('demand reacts every tick, not gated by the (large) thermal dwell', () => {
+  // Huge dwell so the slow thermal loop never runs here — isolates the fast loop.
+  // (Regression: demand handling used to sit behind the dwell early-return.)
+  let idleFrac = 0.9;
+  const demand = { cpuIdleFraction: () => idleFrac };
+  let applied = 1; const sink = { setThrottle: (t: number) => { applied = t; } };
+  let now = 0;
+  const sc = new SmartController(sink, { dwellMs: 300_000, start: 0.9, step: 0.05 }, () => now,
+    { demand, headroom: 0.25 });
+
+  idleFrac = 0.0; // CPU demand spikes: backs off within one tick, not one dwell
+  now += 1000; sc.tick();
+  assert.ok(applied <= 0.9 - 0.5, `fast demand back-off within 1 tick: ${applied}`);
+
+  idleFrac = 0.9; // CPU idle returns: recovers gently
+  for (let i = 0; i < 20; i++) { now += 1000; sc.tick(); }
+  assert.ok(applied > 0.5, `recovered after idle returned: ${applied}`);
+});

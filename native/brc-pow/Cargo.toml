@@ -1,0 +1,19 @@
+[package]
+name = "brc-pow"
+version = "0.1.0"
+edition = "2021"
+description = "Native Rust Argon2id PoW core for BrowserCoin (byte-identical to the WASM core)"
+
+[[bin]]
+name = "brc-pow"
+path = "src/main.rs"
+
+[dependencies]
+# Pinned EXACT (=) so a patch bump can never silently change Argon2id output and
+# break PoW byte-parity with src/crypto/pow.ts. Build with `cargo build --locked`
+# so Cargo.lock is honored. Keep in sync with the FulgurMiner copy + re-parity.
+argon2 = "=0.5.3"
+
+[profile.release]
+opt-level = 3
+lto = true

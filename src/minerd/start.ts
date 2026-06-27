@@ -1,0 +1,287 @@
+// src/minerd/start.ts
+// Friendly interactive launcher. On first run it asks for your wallet address,
+// remembers it in .env.local, and starts mining at FulgurPool (the default).
+// No environment variables required — `npm start` is all a normal user needs.
+//
+// By default (when stdout is a TTY) `npm start` shows a full-screen numbers
+// dashboard. Use `npm start -- --no-tui` or `FULGUR_TUI=0 npm start` for plain
+// logs. Press `s` in the dashboard to open settings, or run `npm run settings`.
+//
+// Advanced: to mine somewhere other than FulgurPool, register extra pools in
+// `pools.json` (see pools.example.json). Once you've added at least one, the
+// launcher shows a chooser so you can pick FulgurPool, one of your pools, or
+// solo. Without any registered pools there is no prompt — it just uses the
+// default. Solo is also always reachable via `MINER_POOL=solo` in `.env.local`.
+import { createInterface } from 'node:readline/promises';
+import { stdin as input, stdout as output } from 'node:process';
+import { loadConfig, DEFAULT_POOL, FULGURPOOL_NAME, FULGURPOOL_URL, FULGURPOOL_PAGE } from './config.js';
+import { runMiner, type WarmChain } from './miner.js';
+import { runPoolClient } from './poolClient.js';
+import { ConsoleReporter, type MinerReporter, type ReporterStatus } from './reporter.js';
+import { DashboardReporter } from './tui.js';
+import { runStartMenu } from './menu.js';
+import { runSettings } from './settings.js';
+import { loadEnvLocal, persist, readExtraPools, type PoolEntry } from './envLocal.js';
+import { resolveEngine } from './engine.js';
+import { currentEngine } from './selectors.js';
+import { checkForUpdate } from './updateCheck.js';
+
+const HEX64 = /^[0-9a-f]{64}$/i;
+
+async function promptWallet(rl: ReturnType<typeof createInterface>): Promise<string> {
+  console.log('\n  FulgurMiner — first-time setup');
+  console.log('  Open the BrowserCoin app → Wallet → Copy, then paste your address below.');
+  console.log('  (Your address is where mining rewards are paid. No password or key is needed.)\n');
+  for (;;) {
+    const v = (await rl.question('  Your wallet address (64 hex chars): ')).trim().toLowerCase();
+    if (HEX64.test(v)) return v;
+    console.log("  That doesn't look right — an address is exactly 64 hex characters (0-9, a-f). Try again.\n");
+  }
+}
+
+/** Show the pool chooser. Only called when the user has registered extra pools. */
+async function promptPool(rl: ReturnType<typeof createInterface>, extras: PoolEntry[]): Promise<string | undefined> {
+  console.log('\n  Where do you want to mine?');
+  console.log(`    [1] ${FULGURPOOL_NAME} — the default`);
+  extras.forEach((p, i) => console.log(`    [${i + 2}] ${p.name} — ${p.url}`));
+  console.log('    [s] Solo — mine on your own\n');
+
+  for (;;) {
+    const ans = (await rl.question('  Choose [1]: ')).trim().toLowerCase() || '1';
+    if (ans === '1') return undefined;            // FulgurPool default → no override
+    if (ans === 's') return 'solo';
+    const idx = Number(ans) - 2;
+    if (Number.isInteger(idx) && idx >= 0 && idx < extras.length) return extras[idx]!.url;
+    console.log('  Please enter one of the numbers above, or "s" for solo.\n');
+  }
+}
+
+/** First-run setup: ensure a wallet is set (+ pool chooser if pools.json exists). */
+async function firstRunSetup(): Promise<void> {
+  const needWallet = !HEX64.test((process.env.MINER_PUBKEY ?? '').trim().toLowerCase());
+  const poolUnset = (process.env.MINER_POOL ?? '').trim() === '';
+  const extras = poolUnset ? readExtraPools() : [];
+  const needPoolMenu = poolUnset && extras.length > 0;
+  if (!needWallet && !needPoolMenu) return;
+
+  const rl = createInterface({ input, output });
+  const updates: Record<string, string> = {};
+  if (needWallet) {
+    const pubkey = await promptWallet(rl);
+    updates.MINER_PUBKEY = pubkey;
+    process.env.MINER_PUBKEY = pubkey;
+  }
+  if (needPoolMenu) {
+    const choice = await promptPool(rl, extras);
+    if (choice) { updates.MINER_POOL = choice; process.env.MINER_POOL = choice; }
+    // FulgurPool default writes no MINER_POOL, so the miner follows the
+    // built-in default pool.
+  }
+  rl.close();
+  if (Object.keys(updates).length) persist(updates);
+  console.log('  Saved to .env.local — edit that file (or pools.json) to change settings.\n');
+}
+
+/** Decide whether to run the full-screen TUI for this iteration. */
+function wantTui(argv: string[]): boolean {
+  if (process.env.FULGUR_TUI === '0') return false;
+  if (argv.includes('--no-tui')) return false;
+  // The TUI emits ANSI control codes (alt-screen, cursor, colors). Writing
+  // those to a non-TTY pipe corrupts tools like grep, and the spec requires
+  // plain mode to never emit ANSI. So a real TTY is a hard gate even when
+  // FULGUR_TUI=1 forces the dashboard on: if forced on without a TTY, warn once
+  // and fall back to plain logs rather than spraying escape codes into a pipe.
+  if (!process.stdout.isTTY) {
+    if (process.env.FULGUR_TUI === '1') {
+      console.warn('  [FulgurMiner] FULGUR_TUI=1 ignored: stdout is not a TTY — using plain logs.');
+    }
+    return false;
+  }
+  return true;
+}
+
+/** Build the reporter status from config (target label + canonical URL). */
+function buildStatus(cfg: ReturnType<typeof loadConfig>): ReporterStatus {
+  const backend: 'wasm' | 'native' = currentEngine(process.env.MINER_NATIVE);
+  if (!cfg.poolUrl) {
+    return { mode: 'solo', target: 'solo', backend, workers: cfg.workers, throttle: cfg.throttle, address: cfg.minerPubkeyHex };
+  }
+  const isDefault = !!DEFAULT_POOL && cfg.poolUrl === DEFAULT_POOL;
+  if (isDefault) {
+    return {
+      mode: 'pool',
+      target: FULGURPOOL_NAME,
+      targetUrl: FULGURPOOL_URL || FULGURPOOL_PAGE,
+      targetPage: FULGURPOOL_PAGE,
+      backend,
+      workers: cfg.workers,
+      throttle: cfg.throttle,
+      address: cfg.minerPubkeyHex,
+    };
+  }
+  // A configured custom pool: show its label and host; hyperlink the host to the
+  // pool's optional `page` (from pools.json) when one is set.
+  const norm = cfg.poolUrl.replace(/\/+$/, '');
+  const match = readExtraPools().find((p) => p.url.replace(/\/+$/, '') === norm);
+  return {
+    mode: 'pool',
+    target: match?.name ?? cfg.poolUrl,
+    targetUrl: cfg.poolUrl,
+    targetPage: match?.page,
+    backend,
+    workers: cfg.workers,
+    throttle: cfg.throttle,
+    address: cfg.minerPubkeyHex,
+  };
+}
+
+/** Run one mining session with the TUI dashboard. Resolves with why it stopped. */
+async function runDashboardSession(warm?: WarmChain): Promise<{ reason: 'menu' | 'quit'; warm?: WarmChain }> {
+  const cfg = loadConfig();
+  const status = buildStatus(cfg);
+  const ac = new AbortController();
+  // Boxed so TS doesn't narrow it to its initializer across the keypress closures.
+  const control: { reason: 'menu' | 'quit' } = { reason: 'quit' };
+
+  // Construct the dashboard guarded: if the constructor throws AFTER it has
+  // entered the alternate screen / hidden the cursor but before its own teardown
+  // listeners are wired, restore the terminal here so we never strand the user in
+  // a dirty alt-screen. (DashboardReporter also registers its exit/SIGINT
+  // handlers before entering alt-screen, but this is the belt-and-braces sync
+  // guarantee for a synchronous construction failure.)
+  let reporter: MinerReporter;
+  try {
+    reporter = new DashboardReporter({
+      // `s` returns to the arrow menu (the settings screen); `q`/Ctrl+C quits.
+      onSettings: () => { control.reason = 'menu'; ac.abort(); },
+      onQuit: () => { control.reason = 'quit'; ac.abort(); },
+    });
+  } catch (e) {
+    // Best-effort terminal restore (show cursor + leave alt-screen) before
+    // re-throwing so the control loop can surface the failure and return to menu.
+    try { process.stdout.write('\x1b[?25h\x1b[?1049l'); } catch { /* ignore */ }
+    throw e;
+  }
+  void checkForUpdate({ reporter, signal: ac.signal }).catch(() => {});
+
+  // Solo keeps the synced chain in memory across settings restarts (item G); pool
+  // mode holds no local chain, so the warm handle passes through untouched.
+  let nextWarm = warm;
+  try {
+    if (cfg.poolUrl) {
+      await runPoolClient(cfg.poolUrl, cfg.minerPubkeyHex, cfg.workers, cfg.throttle, reporter, ac.signal, status, cfg.smart);
+    } else {
+      nextWarm = await runMiner(cfg, reporter, ac.signal, warm);
+    }
+  } finally {
+    // runMiner/runPoolClient call reporter.close?.() on abort, but ensure the
+    // terminal is restored even if they threw before reaching teardown. close()
+    // is idempotent and removes the dashboard's stdin listeners so the menu can
+    // safely take over raw mode on the next loop iteration.
+    reporter.close?.();
+  }
+  return { reason: control.reason, warm: nextWarm };
+}
+
+/** Run one plain (no-TUI) mining session to completion / Ctrl+C. */
+async function runPlainSession(): Promise<void> {
+  const cfg = loadConfig();
+  const status = buildStatus(cfg);
+  const reporter: MinerReporter = new ConsoleReporter();
+  void checkForUpdate({ reporter }).catch(() => {});
+  // Keep the friendly one-line intro the launcher always printed.
+  if (cfg.poolUrl) {
+    console.log(`  Mining to ${status.target} with ${cfg.workers} worker(s). Press Ctrl+C to stop.\n`);
+  } else {
+    console.log(`  Solo-mining with ${cfg.workers} worker(s) → rewards to ${cfg.minerPubkeyHex.slice(0, 16)}…  Press Ctrl+C to stop.\n`);
+  }
+  try {
+    if (cfg.poolUrl) {
+      await runPoolClient(cfg.poolUrl, cfg.minerPubkeyHex, cfg.workers, cfg.throttle, reporter, undefined, status, cfg.smart);
+    } else {
+      await runMiner(cfg, reporter);
+    }
+  } finally {
+    reporter.close?.();
+  }
+}
+
+async function main(): Promise<void> {
+  loadEnvLocal();
+
+  const argv = process.argv.slice(2);
+  if (argv.includes('settings')) {
+    await runSettings();
+    return;
+  }
+
+  if (wantTui(argv)) {
+    // TUI control loop. The arrow menu is the launcher AND the settings screen.
+    // It fully owns stdin while open and tears down before the dashboard starts;
+    // the dashboard does likewise before returning here. So menu and dashboard
+    // never both hold raw mode / keypress listeners at once.
+    //   menu → (Start) → dashboard → (`s`) → menu → … ; q/Quit breaks the loop.
+    // The synced chain is held here so workers/throttle/engine/target/wallet
+    // changes apply on restart WITHOUT re-syncing (item G, solo only).
+    let warm: WarmChain | undefined;
+    for (;;) {
+      const action = await runStartMenu();
+      if (action === 'quit') break;
+      // action === 'start' → the menu has already persisted config to .env.local
+      // and process.env, so loadConfig() inside the session picks it up.
+      //
+      // Resolve the engine selection while the terminal is back in normal mode
+      // (the menu fully restored it before resolving). If native is selected but
+      // not built, this may offer to build it — a normal readline prompt is safe
+      // here because the dashboard hasn't taken over stdin yet. resolveEngine
+      // never blocks: a decline / failure falls back to wasm.
+      await resolveEngine();
+      //
+      // Hard sync handoff: the menu's finish() restores raw mode before resolving,
+      // but make the off-state a synchronous guarantee before the dashboard takes
+      // over stdin. If anything left raw mode on (or a late keypress re-armed it),
+      // force it off here so the menu and dashboard can never both own raw mode.
+      // Bounded (single conditional call, not an unbounded while) so a misbehaving
+      // isRaw getter can never spin.
+      try {
+        const tin = process.stdin as NodeJS.ReadStream & { isRaw?: boolean };
+        if (tin.isTTY && tin.isRaw) tin.setRawMode(false);
+      } catch { /* not a TTY / setRawMode unavailable — nothing to undo */ }
+      let reason: 'menu' | 'quit';
+      try {
+        const res = await runDashboardSession(warm);
+        reason = res.reason;
+        warm = res.warm;
+      } catch (e) {
+        // A session-level failure (e.g. bad config / network) must not strand the
+        // user in a dirty terminal — surface it and drop back to the menu so they
+        // can fix settings. The dashboard already restored the terminal in close().
+        console.error(`\n  Mining stopped: ${(e as Error).message}\n`);
+        reason = 'menu';
+        // Discard any in-memory chain on a session error so the next run cold-
+        // starts cleanly rather than reusing a possibly-inconsistent chain.
+        warm = undefined;
+      }
+      if (reason === 'quit') break;
+      // reason === 'menu' → loop back to the arrow menu (settings).
+    }
+    return;
+  }
+
+  // Plain (non-TTY / --no-tui / FULGUR_TUI=0): readline first-run prompt, then a
+  // single mining session. No arrow menu; `npm run settings` covers reconfigure.
+  await firstRunSetup();
+  // Resolve the engine before mining. In a non-interactive plain run (a pipe / no
+  // TTY) we never prompt — auto-decline the build and fall back to wasm so the
+  // run can never block waiting for input that won't come.
+  if (process.stdin.isTTY) {
+    await resolveEngine();
+  } else {
+    // Explicit non-interactive contract: a pipe / no-TTY plain run must never
+    // block waiting for build confirmation, so the offer is auto-declined → wasm.
+    await resolveEngine('non-interactive');
+  }
+  await runPlainSession();
+}
+
+void main();

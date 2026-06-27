@@ -1,0 +1,6 @@
+{
+  "_comment": "Advanced: register extra mining pools here, or add them in-app via the menu's Pools screen (or `[6] Pools` in `npm run settings`). Copy this file to pools.json and edit. `url` is the mining endpoint; `page` (optional) is the pool's website — its host is shown as a clickable link next to the pool name. Once pools.json has at least one valid entry, that pool appears in the Target cycle. With no pools.json the miner just uses FulgurPool.",
+  "pools": [
+    { "name": "ExamplePool", "url": "https://pool.example.org", "page": "https://example.org" }
+  ]
+}

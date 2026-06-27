@@ -1,0 +1,251 @@
+<p align="center">
+  <img src="assets/fulgur-mark.svg" width="140" alt="FulgurMiner logo">
+</p>
+
+<h1 align="center">FulgurMiner</h1>
+
+<p align="center">
+  <strong>Mine BrowserCoin from your terminal — faster than a browser tab, and out of your way.</strong>
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/node-%E2%89%A520.6-339933?logo=nodedotjs&logoColor=white" alt="node >=20.6">
+  <img src="https://img.shields.io/badge/engine-WASM%20%7C%20native%20Rust-B7410E?logo=rust&logoColor=white" alt="engine: WASM or native Rust">
+  <img src="https://img.shields.io/badge/PoW-Argon2id-1F62D6" alt="PoW: Argon2id">
+  <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20(exp.)-1F62D6" alt="platform: macOS | Windows (experimental)">
+  <img src="https://img.shields.io/badge/pool-FulgurPool-1F62D6" alt="pool: FulgurPool">
+  <img src="https://img.shields.io/badge/license-MIT-3FB950" alt="license: MIT">
+</p>
+
+FulgurMiner is a standalone command-line miner for [BrowserCoin](https://browsercoin.org). You bring your existing wallet address; the miner does the work and pays rewards straight to it. It never asks for a password or private key.
+
+> [!NOTE]
+> **Scripting hard-fork support — activates 2026-07-05 16:00 UTC.** This version carries BrowserCoin's scripting hard-fork consensus rules, so it follows the chain correctly both before and after the upgrade. **Solo** miners should be on **0.2.0 or later** to cross the activation cleanly (older solo versions stop following the chain at that point); **pool** miners are unaffected.
+
+---
+
+## Why FulgurMiner
+
+- **It's not a browser tab.** It runs headless in your terminal — no open window, no foreground requirement. Run it on a server, or just leave it going in the background.
+- **It's faster.** FulgurMiner runs the *same* Argon2id proof-of-work as the browser miner, but with two advantages: a **native Rust core** (~1.9× faster per hash than the browser's WASM) and **every CPU core at full power**, not a single tab the browser throttles to 60% while it's focused. Measured on an Apple M5 (10 cores), that's **~557 H/s vs ~175 for a default browser tab — about 3×** (and still ~1.9× even with the browser run flat-out). See the graph below.
+- **It tunes itself.** **Smart mode** finds the highest throttle your machine sustains on its own. The **Considerate** profile goes further — it adapts to whatever else you're doing: when your other apps need the CPU it eases off, when they go quiet it ramps back up, mining just the spare capacity. Set it once and forget it.
+- **macOS and Windows.** Developed and tested on macOS. **Windows is experimental** — it should work, but it hasn't been tested on a Windows machine yet, so feedback is very welcome.
+
+### Performance
+
+Same proof-of-work as the browser miner — but headless, native, and across every core. Measured on an **Apple M5 (10 cores)** at full tilt:
+
+<p align="center">
+  <img src="assets/perf.svg" width="720" alt="Hash rate by CPU workers: FulgurMiner native vs WASM vs a browser tab, on an Apple M5">
+</p>
+
+The native engine peaks at **~557 H/s** here — **~1.9× the WASM** the browser runs, across every core at full power, and about **3× a default browser tab** (which caps itself at 60% in a focused tab; the dashed line is that same WASM engine at 60%). Argon2id is memory-bandwidth-bound, so the curves flatten near 8–10 workers.
+
+---
+
+# Getting started
+
+The easy path: install, run, and pick your settings from a menu. No config files, no flags.
+
+## 1. Install
+
+**Install [Node.js](https://nodejs.org) 20.6 or newer** (the LTS installer is fine), then check it:
+
+```bash
+node --version
+```
+
+**Get the code and install:**
+
+```bash
+git clone https://github.com/alpenmilch411/FulgurMiner.git
+cd FulgurMiner
+npm install
+```
+
+That's the whole setup — no compilers, no system libraries, nothing to edit by hand.
+
+## 2. Start
+
+```bash
+npm start
+```
+
+In a normal terminal this opens a **two-pane arrow-key menu** — your settings on the left, a plain-language explanation of whatever you've highlighted on the right:
+
+```
+┌─ FulgurMiner ──────────────────────┐ ┌─ About ────────────────────────────┐
+│   Start mining                     │ │ Manual lets you set the duty cycle │
+│   Wallet         a1b2…9f0e         │ │ by hand; Smart auto-tunes it for   │
+│   Where to mine  FulgurPool · ful… │ │ you. Press Enter to choose.        │
+│   Workers        auto (9)          │ │                                    │
+│ ▶ Mode           Smart: Considerate│ │                                    │
+│   Throttle       (auto)            │ │                                    │
+│   Engine         wasm  (portable)  │ │                                    │
+│   Check for updates  on            │ │                                    │
+│   Help / How it works              │ │                                    │
+│   Quit                             │ │                                    │
+└────────────────────────────────────┘ └────────────────────────────────────┘
+  ↑/↓ move · ←/→ change · Enter select · ? help · q quit
+```
+
+Use **↑/↓** to move and **Enter** to select. On a value row, **←/→** cycles the choices; **Where to mine** and **Mode** open their own picker with **Enter**. Press **?** any time for an in-app manual, **q** to quit.
+
+The first time, set your **Wallet** (paste your address — see below), then highlight **Start mining** and press **Enter**. Your settings are remembered, so next time you can just start. On a narrow terminal the menu folds into a single column with the explanation inline.
+
+By default FulgurMiner mines to **[FulgurPool](https://fulgurpool.xyz)**, the project's own pool — just set your wallet and start. Other pools can be added in `pools.json` and will then show up in the **Where to mine** picker.
+
+## 3. Pick a Mining mode
+
+The **Mode** row chooses how hard FulgurMiner pushes your CPU:
+
+- **Manual** — you set Workers and Throttle by hand. This is the classic behaviour.
+- **Smart: Max** — FulgurMiner auto-tunes the throttle to the highest your machine can sustain. On a well-cooled machine this is about the same as running at 100% by hand — the win is that it *finds* that point for you and adapts as the machine heats up or cools down.
+- **Smart: Considerate** *(best for a machine you're using)* — auto-tunes like Max, but adapts to what the rest of your machine is doing. When your other apps need the CPU it eases off; when they go quiet it ramps back up. You mine the spare capacity the rest of the time, without a hot, sluggish laptop.
+
+When a Smart mode is on, the **Throttle** row shows `(auto)` — the miner owns it. Switch **Mode** back to **Manual** to set the throttle yourself.
+
+## Your wallet
+
+Open the BrowserCoin app, go to **Wallet**, and click **Copy** under *"Your address"*. It's a 64-character string of letters and numbers (0–9, a–f). Paste that into FulgurMiner when asked. Rewards are paid straight to it.
+
+> You only ever share your **address** — it's public, like an email address. FulgurMiner never needs your private key, and you should never paste a private key anywhere.
+
+## The dashboard
+
+Once mining, FulgurMiner shows a live, framed dashboard:
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│ FulgurMiner  ·  terminal miner for BrowserCoin                         │
+├──────────────────────────────────────────────────────────────────────┤
+│ ● MINING   FulgurPool · fulgurpool.xyz   wasm · 8 cores       14:32:07 │
+│ auto throttle 84% Considerate · easing off (leaving CPU for your work) │
+├──────────────────────────────────────────────────────────────────────┤
+│ HASHRATE                          SESSION                              │
+│ now  3.30k H/s                    up   12m 41s                         │
+│ avg  3.11k H/s                    shrs 142 (139 ok)                    │
+│ peak 3.42k H/s                    work 2.21M                           │
+│ ▂▃▅▆▇█▇▆▅▄▅▆▇█▇▆▅▄▃▂▃▅▆▇█         hgt  11,772 diff 1e02b4ec            │
+├──────────────────────────────────────────────────────────────────────┤
+│ EVENTS                                                                 │
+│   14:32:01 synced to height 11,772                                     │
+│   14:32:05 share accepted: ok                                          │
+├──────────────────────────────────────────────────────────────────────┤
+│ q quit · s settings · u update · ? help                               │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+- **Status bar** — a coloured `●` dot and state word: amber **SYNCING** while it downloads and verifies the chain, green **MINING** once it's working, red on an error. Then your mining target and the pool's host (clickable where terminals support links), the engine, core count, and a clock.
+- **auto throttle** *(Smart mode only)* — the live duty cycle the controller settled on, and the mode. In Considerate it shows *easing off* whenever it's holding back to leave the machine free for you.
+- **HASHRATE** — current (`now`), session-average (`avg`), and best (`peak`) hash rate, plus a **sparkline** of recent rate so you can watch it ramp and settle.
+- **SESSION** — uptime, found blocks / accepted shares, total work, chain height, and difficulty.
+- **Earnings & Jackpot** — on FulgurPool, your balance (earned / pending / paid) and the **3%** finder bonus with your block strikes; in solo, an estimate from blocks you've found. A block strike (a share that solved a whole block) is worth at least **50 BRC**; the jackpot credit appears after the block matures (~25 min).
+- **EVENTS** — recent syncs, finds, shares, and warnings.
+
+**Keys:** **q** quits, **s** returns to the menu (settings), **u** shows the exact update command when one is available, **?** opens the manual. Change anything in the menu and choose **Start mining** again to apply it live — no restart. On narrow or short windows the dashboard switches to a compact, frame-free layout so it never overflows.
+
+---
+
+# Advanced
+
+Everything below is optional. FulgurMiner works out of the box with the menu above.
+
+## Running without the TUI
+
+For servers, scripts, or any non-interactive setup, run the plain-log miner:
+
+```bash
+npm run mine                 # plain logs, reads .env.local / env vars
+npm start -- --no-tui        # launcher without the dashboard
+FULGUR_TUI=0 npm start       # same, via env var
+```
+
+Plain mode prints clean, greppable lines — no ANSI, no full-screen redraw. A **default run mines on FulgurPool** (the pool serves the work, so there's no chain to download):
+
+```
+[pool-miner] connecting to FulgurPool…
+[pool-miner] registered worker 2e63e420-1557-4d3a-beae-…
+[pool-miner] 3284 H/s auto 84% (easing off)
+[pool-miner] share accepted: accepted
+[pool-miner] earnings: 1.5 BRC (pending 0.5, paid 1)
+[pool-miner] jackpot: 3% finder bonus - your strikes: 0
+```
+
+**Solo mode** (`MINER_POOL=solo`) downloads and verifies the chain, then mines full blocks locally:
+
+```
+[minerd] verifying BrowserCoin blockchain 9,200 / 11,772 (78%)
+[minerd] synced to height 11,772
+[minerd] mining to a1b2c3d4e5f60718… (8 workers, throttle 0.75)
+[minerd] h=11772 diff=1e02b4ec hps:3284
+```
+
+Later solo runs restore the verified chain from a local save and only catch up new blocks. When stdout isn't a terminal (a pipe, a log file, CI), FulgurMiner uses plain mode automatically. There's no arrow menu in plain mode; change settings with `npm run settings`.
+
+## Settings & environment variables
+
+Every option is an environment variable or a line in `.env.local` (written for you — never commit it). See `.env.example` for a template. The menu and `npm run settings` are just front-ends over these.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `MINER_PUBKEY` | *(required)* | Your wallet address (64 hex chars). Rewards go here. |
+| `MINER_POOL` | FulgurPool | `solo` to mine alone, or a pool URL. Unset/blank follows the default pool (FulgurPool). |
+| `MINER_SMART` | `off` | `off` (Manual) · `max` · `considerate`. When set, the controller owns the throttle and `MINER_THROTTLE` becomes only its starting hint. |
+| `MINER_WORKERS` | cores − 1 | CPU worker threads. Clamped to `1…cores`. |
+| `MINER_THROTTLE` | `0.75` | Duty cycle (`0.05`–`1.0`): fraction of wall-time spent hashing. Lower = cooler & quieter. Ignored as a fixed value when a Smart mode is on. |
+| `MINER_NATIVE` | *(off)* | `1` uses the native Rust engine (built on demand if missing and Rust is installed). |
+| `MINER_HELPERS` | `api1`/`api2.browsercoin.org` | Comma-separated API URLs for chain sync / solo mining. |
+| `FULGUR_TUI` | *(auto)* | `0` forces plain logs; otherwise the TUI is used when stdout is a terminal. |
+| `FULGUR_NO_UPDATE_CHECK` | *(off)* | `1` disables the best-effort startup update check. |
+
+```bash
+# Solo-mine
+MINER_PUBKEY=<your-address> MINER_POOL=solo npm run mine
+
+# Considerate smart mode, native engine
+MINER_PUBKEY=<your-address> MINER_SMART=considerate MINER_NATIVE=1 npm run mine
+
+# Mine at a specific pool
+MINER_PUBKEY=<your-address> MINER_POOL=https://pool.example.org npm run mine
+
+# Safe smoke test — syncs the chain, checks everything agrees, submits nothing
+MINER_PUBKEY=<your-address> npm run mine:dryrun
+```
+
+The update check is quiet and best-effort: it reads the version signal from the pool and fails silently offline. The miner runs from source, so updating is a `git pull && npm install`. Turn the check off with **Check for updates → off** or `FULGUR_NO_UPDATE_CHECK=1`. FulgurMiner never runs an update for you.
+
+## Native engine
+
+By default FulgurMiner uses a portable **wasm** engine that runs anywhere Node runs — zero setup. The **native** (Rust) engine is ~1.9× faster (see [Performance](#performance)). Switch via the **Engine** setting (or `MINER_NATIVE=1`). On the next start FulgurMiner:
+
+- uses the built engine if it's already there;
+- offers to **build it now** (a one-time `cargo build --release`, ~a minute) if you have the [Rust toolchain](https://rustup.rs);
+- otherwise prints the build command and keeps mining with wasm — nothing blocks.
+
+```bash
+cd native/brc-pow && cargo build --release && cd ../..
+MINER_NATIVE=1 npm start
+```
+
+The status bar shows `native` vs `wasm` so you can confirm which is active.
+
+## Troubleshooting
+
+- **The first sync takes a moment.** A fresh solo start downloads and verifies BrowserCoin's chain so you build on the right one. The `Verifying blockchain` bar (TUI) / `verifying … (P%)` lines (plain) show progress — it's working, not stuck. (Pool mining skips this; the pool serves the work.)
+- **Restarts are fast.** After the first sync the verified chain is saved in `~/.fulgurminer/`; the next launch resumes and fetches only new blocks. The save is rebuilt if missing or stale, so deleting `~/.fulgurminer/` is safe.
+- **"MINER_PUBKEY is required" / "address must be 32 bytes."** Your wallet must be exactly 64 hex characters — re-copy it from the app (**Wallet → Copy**).
+- **`npm start` errors about the Node version.** You need Node 20.6+. Check `node --version`.
+- **Fans spin up / the laptop gets hot.** Use **Smart: Considerate**, or in Manual lower the **Throttle** (e.g. `0.4`) or reduce **Workers**.
+- **The pool says syncing / busy.** Leave it running — the miner retries with backoff and resumes when the pool is ready. After a couple of minutes it reminds you that **s → Where to mine → Solo** is available if you'd rather switch.
+- **Reconfigure from scratch.** Delete `.env.local` and run `npm start` again, or open settings (**s**, or `npm run settings`).
+
+## How it works
+
+FulgurMiner syncs BrowserCoin's chain from public API helpers, builds a block template that pays the coinbase to your address, and searches for a proof-of-work solution across your CPU cores (Argon2id hashing). In **solo** mode it submits a full block when it finds one; in **pool** mode it submits *shares*, which the pool aggregates and splits. It's the same proof-of-work the browser app uses — just running headless, on the native core, across all your cores. The native core only *proposes* nonces; every solution is independently rebuilt and re-validated before submission, so it can never get an invalid block accepted.
+
+---
+
+## License
+
+MIT

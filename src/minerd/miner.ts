@@ -1,0 +1,673 @@
+// src/minerd/miner.ts
+import os from 'node:os';
+import { Blockchain } from '../chain/blockchain.js';
+import { hashHeader, type Block, type BlockHeader } from '../chain/block.js';
+import { checkPoW } from '../chain/consensus.js';
+import { bytesToHex, compareBytes } from '../util/binary.js';
+import { applyBlockTxs, cloneState, stateRoot } from '../chain/state.js';
+import type { MinerConfig } from './config.js';
+import { getTip, getBlocks, postBlock } from './http.js';
+import { VerifierPool, verifyBlocksParallel } from './verify.js';
+import { ChainSync } from './sync.js';
+import { buildTemplate, type Template } from './template.js';
+import { GrindPool } from './grindPool.js';
+import { NativeGrindPool } from './nativeGrindPool.js';
+import { submitSoloBlock } from './submitSolo.js';
+import { ConsoleReporter, type MinerReporter, type ReporterStatus } from './reporter.js';
+import { restoreSnapshot, saveSnapshot, deleteSnapshot } from './persistence.js';
+import { SmartController } from './smartController.js';
+import { createDemandSignal } from './demand.js';
+
+/**
+ * Post-restore integrity gate, identical in spirit to `mine:dryrun`: build a
+ * template off the live tip and confirm it agrees with the chain exactly
+ * (prevHashOK && stateRootOK). The stateRoot side is recomputed independently
+ * from the live tipState (not from `template.postState`, which would be
+ * circular). Returns true only when a snapshot-seeded chain is provably mining on
+ * the correct state. A `false` here forces a discard + full replay.
+ */
+function chainIntegrityOK(chain: Blockchain, minerPubkey: Uint8Array): boolean {
+  try {
+    const t = buildTemplate(chain, minerPubkey);
+    const okPrev = compareBytes(t.header.prevHash, chain.tip.hash) === 0;
+    const expected = cloneState(chain.tipState);
+    applyBlockTxs(expected, t.header.height, minerPubkey, [], chain.nextBlockScriptContext());
+    const okStateRoot = compareBytes(t.header.stateRoot, stateRoot(expected)) === 0;
+    return okPrev && okStateRoot;
+  } catch {
+    return false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// snapshot network confirmation
+// ---------------------------------------------------------------------------
+// A restored ~/.fulgurminer snapshot is attacker-writable local state. Before we
+// trust it and mine on it, pin it to the network: ask the helper for its
+// canonical block at the restored anchor height and require the header hashes
+// match. Because `seedHistoricalBlock` links every restored block to its parent
+// by hash, a matching anchor pins the WHOLE seeded prefix to canonical, so a
+// forged anchor (or any forged ancestor) is rejected here. Then PoW-verify the
+// anchor header as a belt-and-suspenders check. Mismatch, an unreachable helper,
+// or a bad PoW all return ok:false → the caller discards the snapshot and
+// full-syncs from genesis.
+//
+// Layer-1 helper confirmation is the security boundary. A full-prefix PoW
+// re-verify is deliberately NOT done: it would cost ~minutes per launch (the
+// finalized prefix is the whole chain, and grows) and negate the warm-start the
+// snapshot exists to provide — for no added security once the anchor is
+// helper-pinned and the prefix is hash-linked to it. A self-consistent cheap
+// forge (floor difficulty + matching timestamps) passes local PoW+retarget
+// anyway; only the network reference distinguishes it from the real chain.
+export interface SnapshotConfirmDeps {
+  /** Height of the restored finalized anchor (RestoreOutcome.anchorHeight). */
+  anchorHeight: number;
+  /** Hash of the restored chain tip (the anchor) — `chain.tip.hash`. */
+  anchorHash: Uint8Array;
+  /** Fetch the helper's canonical block at a height (undefined if none). */
+  fetchBlockAt: (height: number) => Promise<Block | undefined>;
+  /** PoW verifier (consensus `checkPoW`); injected for testability. */
+  checkPoW: (header: BlockHeader) => Promise<boolean>;
+}
+
+// Failure is CLASSIFIED so the caller reacts correctly:
+//   'forged'        — the helper PROVES this anchor isn't canonical (a different
+//                     block at the same height, or a bad PoW) → delete the file.
+//   'indeterminate' — we simply couldn't confirm (helper unreachable / lagging /
+//                     timed out / PoW check errored) → KEEP the file for a later
+//                     healthy-helper launch, but still don't trust it this session.
+export type SnapshotConfirmResult =
+  | { ok: true }
+  | { ok: false; kind: 'forged' | 'indeterminate'; reason: string };
+
+/** Confirm a restored snapshot sits on the network canonical chain. Never throws. */
+export async function confirmRestoredSnapshot(deps: SnapshotConfirmDeps): Promise<SnapshotConfirmResult> {
+  let helperBlock: Block | undefined;
+  try {
+    helperBlock = await deps.fetchBlockAt(deps.anchorHeight);
+  } catch (e) {
+    // Helper unreachable / timed out — can't confirm, but not proof of forgery.
+    return { ok: false, kind: 'indeterminate', reason: `helper-unreachable: ${(e as Error).message}` };
+  }
+  if (!helperBlock) return { ok: false, kind: 'indeterminate', reason: 'helper-no-block-at-anchor' };
+
+  // A helper that's BEHIND our finalized anchor (or clamps the page) can hand back
+  // a block at the wrong height. That's "can't confirm", NOT proof of a forgery —
+  // so it's indeterminate and the local file is preserved.
+  if (helperBlock.header.height !== deps.anchorHeight) {
+    return {
+      ok: false,
+      kind: 'indeterminate',
+      reason: `helper-height-mismatch (got ${helperBlock.header.height}, want ${deps.anchorHeight})`,
+    };
+  }
+
+  // Same height, different hash → the helper's canonical block here is NOT our
+  // anchor → the restored anchor (and the whole prefix it hash-links) is forged.
+  if (compareBytes(hashHeader(helperBlock.header), deps.anchorHash) !== 0) {
+    return { ok: false, kind: 'forged', reason: 'anchor-not-canonical' };
+  }
+
+  // Belt-and-suspenders: the pinned anchor must itself carry valid PoW. A thrown
+  // check is indeterminate (the verifier errored); a clean `false` is definitive.
+  let powOk: boolean;
+  try {
+    powOk = await deps.checkPoW(helperBlock.header);
+  } catch (e) {
+    return { ok: false, kind: 'indeterminate', reason: `anchor-pow-check-threw: ${(e as Error).message}` };
+  }
+  if (!powOk) return { ok: false, kind: 'forged', reason: 'anchor-pow-invalid' };
+
+  return { ok: true };
+}
+
+/** Debug logger gated on MINER_DEBUG — used for non-fatal persistence anomalies. */
+function debugLog(reporter: MinerReporter): ((msg: string) => void) | undefined {
+  if (!process.env.MINER_DEBUG) return undefined;
+  return (msg: string): void => reporter.event('info', `[minerd] ${msg}`);
+}
+
+// How often to persist a fresh snapshot: whichever of these comes first.
+const SAVE_EVERY_BLOCKS = 50;
+const SAVE_EVERY_MS = 60_000;
+
+// Bound the snapshot-confirmation fetch so a half-open helper connection can't
+// wedge startup — on timeout the confirm comes back 'indeterminate' (keep the
+// file, full-sync this session) rather than hanging unresponsive.
+const SNAPSHOT_CONFIRM_TIMEOUT_MS = 15_000;
+
+/** The subset of the grind-pool surface that runMiner depends on. Both the
+ *  default worker_threads GrindPool and the native NativeGrindPool implement it. */
+interface GrindPoolLike {
+  start(
+    headerBytes: Uint8Array,
+    targetHex: string,
+    onSolved: (nonce: number, hash: Uint8Array) => void,
+    onHashrate: (hps: number) => void,
+    onExhausted?: () => void,
+    onError?: (err: Error) => void,
+  ): void;
+  stop(): void;
+  setThrottle(throttle: number): void;
+  terminate(): void;
+}
+
+const HELPER = (cfg: MinerConfig) => cfg.helpers[0]!; // primary for reads; submit hits all
+
+// ---------------------------------------------------------------------------
+// Coordinator — testable coordination logic extracted from runMiner
+// ---------------------------------------------------------------------------
+
+export interface CoordinatorDeps {
+  buildTemplate: () => Template;
+  poolStart: (
+    headerBytes: Uint8Array,
+    targetHex: string,
+    onSolved: (nonce: number) => void,
+    onHashrate: (hps: number) => void,
+    onExhausted: () => void,
+  ) => void;
+  poolStop: () => void;
+  submit: (template: Template, nonce: number) => Promise<{ label: string }>;
+  /** Catch the chain up. The observed remote tip (when known) lets the sync fetch
+   *  below a heavier-but-SHORTER fork whose canonical tip sits below our height. */
+  syncCatchUp: (remoteTip?: { height: number; tipHash: string }) => Promise<void>;
+  onLog: (msg: string) => void;
+}
+
+/** Pure coordination logic: busy-flag, rebuild-on-solve, rebuild-on-exhaust, tip-advance. */
+export class MinerCoordinator {
+  private current: Template | null = null;
+  private busy = false;
+
+  constructor(private readonly deps: CoordinatorDeps) {}
+
+  rebuild(): void {
+    this.current = this.deps.buildTemplate();
+    this.deps.poolStart(
+      this.current.headerBytes,
+      this.current.targetHex,
+      (nonce) => void this.onSolved(nonce),
+      (hps) => this.deps.onLog(`hps:${hps}`),
+      () => void this.onExhausted(),
+    );
+  }
+
+  /** rebuild() that can never crash the miner: a throw in buildTemplate/poolStart is
+   *  caught + logged instead of becoming an unhandled rejection (onSolved/onExhausted
+   *  are fire-and-forget) or a process crash. The next tip poll re-attempts. Used by
+   *  the in-loop callers; runMiner's initial rebuild() stays throwing (startup should
+   *  surface a hard failure). */
+  private safeRebuild(): void {
+    try {
+      this.rebuild();
+    } catch (e) {
+      this.deps.onLog(`error:rebuild failed — ${(e as Error).message}`);
+    }
+  }
+
+  private async onSolved(nonce: number): Promise<void> {
+    if (this.busy || !this.current) return;
+    this.busy = true;
+    // never let the busy flag stick. EVERYTHING after busy=true (incl. poolStop —
+    // a synchronous throw there would otherwise stick busy + become an unhandled
+    // rejection) runs under try/catch/finally. CATCH + log a failure (don't re-throw —
+    // onSolved is fire-and-forget), then ALWAYS reset busy and rebuild so the next
+    // solve/tip-advance is processed. Without this the miner wedges forever.
+    try {
+      this.deps.poolStop();
+      const out = await this.deps.submit(this.current, nonce);
+      this.deps.onLog(`solved:${out.label}`);
+    } catch (e) {
+      this.deps.onLog(`error:solo submit failed — ${(e as Error).message}`);
+    } finally {
+      this.busy = false;
+      this.safeRebuild();
+    }
+  }
+
+  private async onExhausted(): Promise<void> {
+    if (this.busy) return;
+    // No solution found across the full nonce range. Rebuild with a fresh
+    // timestamp (timestamp changes → new template → new nonce search space).
+    this.safeRebuild();
+  }
+
+  /** Called by the tip poller when the network has advanced past us. The observed
+   *  remote tip is threaded into the sync so a heavier-but-shorter fork is reachable. */
+  async tipAdvanced(remoteTip?: { height: number; tipHash: string }): Promise<void> {
+    if (this.busy) return;
+    this.busy = true;
+    // busy must ALWAYS reset (try/catch/finally) or the miner wedges. On a clean
+    // catch-up we stop the stale grind and rebuild on the new tip.
+    try {
+      await this.deps.syncCatchUp(remoteTip);
+      this.deps.poolStop();
+      this.safeRebuild();
+    } catch (e) {
+      // Catch-up FAILED — but the tip HAS moved (that's why the poller called us), so
+      // the current template is known-stale. STOP grinding it rather than leaving it
+      // running: a stale-template solve broadcast to a LAGGING helper could come back
+      // 'added' and get adopted locally → a private fork the public chain won't
+      // replace. The next tip poll retries the catch-up and rebuilds once it succeeds.
+      this.deps.poolStop();
+      this.deps.onLog(`error:catch-up failed — ${(e as Error).message}`);
+    } finally {
+      this.busy = false;
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// runMiner — wires real deps into MinerCoordinator and starts the tip poller
+// ---------------------------------------------------------------------------
+
+export interface WarmChain {
+  /** The synced, integrity-proven in-memory chain to reuse across restarts. */
+  chain: Blockchain;
+  /** True once a prior session reached the mining loop. Only a `synced: true`
+   *  handle is reused; otherwise runMiner cold-starts a fresh chain. */
+  synced: boolean;
+}
+
+export async function runMiner(
+  cfg: MinerConfig,
+  reporter: MinerReporter = new ConsoleReporter(),
+  signal?: AbortSignal,
+  warm?: WarmChain,
+): Promise<WarmChain> {
+  // Reuse the prior session's chain ONLY if it was fully synced (item G). A
+  // not-synced handle (e.g. aborted mid-bootstrap) is discarded and we cold-start
+  // a fresh chain, so a half-built chain can never be mined on.
+  const chain = warm?.synced ? warm.chain : new Blockchain();
+  const isWarm = !!warm?.synced;
+  const debug = debugLog(reporter);
+
+  // the chain is only network-TRUSTED (returnable as a reusable warm handle)
+  // once it was either confirmed against the helper this session (warm reuse, or a
+  // confirmed snapshot restore) OR fully re-synced from the helper. A restored-but-
+  // unconfirmed chain (e.g. aborted before confirmation) must NEVER be returned as
+  // synced:true. The cold path sets this true only after it completes confirm +
+  // bootstrap + the integrity gate.
+  let chainConfirmed = isWarm;
+
+  // Snapshot-invalidation listener — wired in BOTH cold and warm sessions: a warm
+  // in-memory chain can still see a deep reorg while mining, which must discard
+  // the on-disk snapshot + reset. Re-subscribed fresh each session; the prior
+  // session's unsubInvalidated() ran in its done() teardown, so no listener leak.
+  let snapshotInvalidated = false;
+  const unsubInvalidated = chain.onSnapshotInvalidated(() => {
+    snapshotInvalidated = true;
+    deleteSnapshot();
+    try { chain.reset(); } catch { /* genesis-only re-init; ignore */ }
+    debug?.('snapshot invalidated (deep reorg) — cleared; will full-replay');
+  });
+
+  // The persistent verifier pool is a bootstrap-only (cold) resource. Declared at
+  // function scope (null on the warm path) so the ChainSync verify closure can
+  // fall back to the one-shot verify when no pool exists.
+  let verifierPool: VerifierPool | null = null;
+  let verifierTerminated = false;
+  const terminateVerifier = (): void => {
+    if (verifierTerminated) return;
+    verifierTerminated = true;
+    if (verifierPool) void verifierPool.terminate();
+  };
+
+  // ChainSync exists in BOTH paths — the tip poller's catchUp() needs it. The
+  // verify fn uses the persistent pool during cold bootstrap and the one-shot
+  // verifyBlocksParallel otherwise (after bootstrap, or the whole warm path).
+  const sync = new ChainSync({
+    chain,
+    cores: cfg.workers,
+    getBlocks: (from, max) => getBlocks(HELPER(cfg), from, max),
+    verifyBlocksParallel: (blocks, cores) =>
+      verifierPool && !verifierTerminated ? verifierPool.verify(blocks) : verifyBlocksParallel(blocks, cores),
+  });
+
+  // ── Cold start: restore snapshot → bootstrap → integrity gate ──
+  // Skipped on a warm reuse: the in-memory chain was already synced and
+  // integrity-proven last session, so re-running these would re-fetch ~60 pages
+  // and re-run the dryrun-equivalent gate for nothing. A bootstrap abort returns
+  // a not-synced handle so the next iteration cold-starts a fresh chain.
+  if (!isWarm) {
+    // Restore the local chain snapshot BEFORE bootstrap (§1 persistence). On
+    // success the chain is seeded to the finalized anchor and bootstrap() only
+    // fetches the delta (warm restart). On ANY anomaly restoreSnapshot resets to
+    // genesis and returns restored:false, so we fall back to a full sync.
+    const restore = restoreSnapshot(chain, debug);
+    let warmStart = restore.restored;
+    verifierPool = new VerifierPool(cfg.workers);
+    signal?.addEventListener('abort', terminateVerifier, { once: true });
+
+    // a restored snapshot is attacker-writable local state — confirm it
+    // against the network before trusting it. `restore.restored` narrows the union
+    // so `restore.anchorHeight` is available.
+    if (restore.restored) {
+      // Already aborting → we can't (and shouldn't) network-confirm. NEVER return an
+      // unconfirmed restored chain as a reusable warm handle: tear down and report
+      // not-synced so the next session cold-starts and confirms from scratch.
+      if (signal?.aborted) {
+        terminateVerifier();
+        unsubInvalidated();
+        await new Promise<void>((resolve) => { queueMicrotask(() => { reporter.close?.(); resolve(); }); });
+        return { chain, synced: false };
+      }
+      // Pin the restored anchor to the helper's canonical chain (+ a single anchor
+      // PoW check), via a bounded, cancellable fetch so a half-open helper can't
+      // wedge startup. 'forged' (a different canonical block here, or bad PoW) →
+      // delete the file; 'indeterminate' (helper down/lagging/timeout) → KEEP it for
+      // a later healthy-helper launch. Either way we don't trust it this session.
+      const confirm = await confirmRestoredSnapshot({
+        anchorHeight: restore.anchorHeight,
+        anchorHash: chain.tip.hash,
+        fetchBlockAt: async (h) => {
+          const timeout = AbortSignal.timeout(SNAPSHOT_CONFIRM_TIMEOUT_MS);
+          const composed = signal ? AbortSignal.any([signal, timeout]) : timeout;
+          return (await getBlocks(HELPER(cfg), h, 1, composed))[0];
+        },
+        checkPoW,
+      });
+      if (!confirm.ok) {
+        debug?.(
+          `restored snapshot ${confirm.kind} (${confirm.reason}) — full replay` +
+            (confirm.kind === 'forged' ? ' (deleting file)' : ' (keeping file for retry)'),
+        );
+        if (confirm.kind === 'forged') deleteSnapshot();
+        try { chain.reset(); } catch { /* genesis-only re-init; ignore */ }
+        warmStart = false;
+        reporter.event(
+          'info',
+          confirm.kind === 'forged'
+            ? '[minerd] saved chain did not match the network — re-syncing from genesis…'
+            : '[minerd] could not confirm saved chain against the network — re-syncing this session…',
+        );
+      }
+    }
+
+    if (warmStart) {
+      reporter.event(
+        'info',
+        `[minerd] Resuming saved chain (height ${chain.height.toLocaleString('en-US')}) — catching up…`,
+      );
+    }
+
+    // Learn the target tip height up front so sync progress has a denominator. A
+    // failed tip read just yields an indeterminate target (still reported).
+    let targetHeight = 0;
+    try {
+      targetHeight = (await getTip(HELPER(cfg))).height;
+    } catch (e) {
+      targetHeight = 0;
+      reporter.event(
+        'warn',
+        `[minerd] tip fetch failed (${(e as Error).message}); proceeding with indeterminate sync`,
+      );
+    }
+    reporter.event(
+      'info',
+      targetHeight > 0
+        ? `[minerd] syncing chain from ${HELPER(cfg)} (target height ${targetHeight.toLocaleString('en-US')})…`
+        : `[minerd] syncing chain from ${HELPER(cfg)}…`,
+    );
+    try {
+      await sync.bootstrap((h) => reporter.syncProgress(h, targetHeight));
+    } catch (e) {
+      // An abort during bootstrap disposes the verifier pool, rejecting the
+      // in-flight verify() and unwinding here. Intentional shutdown — tear down
+      // and return a not-synced handle so the loop cold-starts next time. Any
+      // non-abort failure is a real error and must still propagate.
+      if (signal?.aborted) {
+        terminateVerifier();
+        unsubInvalidated();
+        await new Promise<void>((resolve) => { queueMicrotask(() => { reporter.close?.(); resolve(); }); });
+        return { chain, synced: false };
+      }
+      // Release the persistent verifier pool + listener before propagating, or its
+      // worker threads (~65 MB Argon2 WASM each) leak across a caller retry.
+      terminateVerifier();
+      unsubInvalidated();
+      throw e;
+    }
+
+    // Free the bootstrap workers before mining. The occasional catchUp() (tip
+    // poller) is one small page, so the one-shot pool there is fine.
+    terminateVerifier();
+
+    // ── Post-restore safety gate (§1) ──
+    // Prove a snapshot-seeded chain mines on the correct state before any block is
+    // built. Two triggers force a clean full replay: a deep reorg during catch-up,
+    // or the dryrun-equivalent integrity check failing.
+    if (!signal?.aborted && (warmStart || snapshotInvalidated)) {
+      const integrityOK = !snapshotInvalidated && chainIntegrityOK(chain, cfg.minerPubkey);
+      if (!integrityOK) {
+        debug?.(
+          snapshotInvalidated
+            ? 'snapshot invalidated during catch-up — full replay'
+            : 'post-restore integrity check failed — discarding snapshot, full replay',
+        );
+        deleteSnapshot();
+        try { chain.reset(); } catch { /* ignore */ }
+        snapshotInvalidated = false;
+        reporter.event('info', `[minerd] re-syncing BrowserCoin chain from genesis…`);
+        try {
+          await sync.bootstrap((h) => reporter.syncProgress(h, targetHeight));
+        } catch (e) {
+          if (signal?.aborted) {
+            terminateVerifier();
+            unsubInvalidated();
+            await new Promise<void>((resolve) => { queueMicrotask(() => { reporter.close?.(); resolve(); }); });
+            return { chain, synced: false };
+          }
+          terminateVerifier();
+          unsubInvalidated();
+          throw e;
+        }
+      }
+    }
+  }
+
+  // On a warm reuse the in-memory chain may be behind the helper tip — after a
+  // menu pause, or especially a solo→pool→solo detour where it froze while
+  // pooling. Catch the delta up to the tip BEFORE mining so we never grind on a
+  // stale template (which would build rejected blocks until the tip poller caught
+  // up seconds later). bootstrap() resumes from the current height and verifies
+  // new blocks via the one-shot path; with zero drift it does a single empty
+  // getBlocks and spawns no workers, so a no-op restart stays near-instant. If a
+  // deep reorg fires its invalidation listener mid-catch-up, the chain resets and
+  // bootstrap full-replays from genesis. An abort mid-catch-up returns a
+  // not-synced handle so the next iteration cold-starts cleanly.
+  if (isWarm) {
+    try {
+      await sync.bootstrap((h) => reporter.syncProgress(h, 0));
+    } catch (e) {
+      if (signal?.aborted) {
+        unsubInvalidated();
+        await new Promise<void>((resolve) => { queueMicrotask(() => { reporter.close?.(); resolve(); }); });
+        return { chain, synced: false };
+      }
+      throw e;
+    }
+  }
+
+  // Structural guard: if the signal aborted ANYWHERE during cold-start or warm
+  // catch-up — including windows where the bootstrap fetches aren't signal-wired, so
+  // the abort didn't unwind via a bootstrap-catch — never claim a synced handle.
+  // Tear down and report not-synced. This makes the line below reachable ONLY on a
+  // non-aborted path that completed confirm + bootstrap + integrity (cold) or
+  // catch-up (warm), so a restored-but-unconfirmed chain can never be returned
+  // synced:true (do not rely on fetch-cancellation timing as the sole defense).
+  if (signal?.aborted) {
+    terminateVerifier();
+    unsubInvalidated();
+    await new Promise<void>((resolve) => { queueMicrotask(() => { reporter.close?.(); resolve(); }); });
+    return { chain, synced: false };
+  }
+  // Reaching here means the chain is network-trusted: a confirmed snapshot + delta
+  // bootstrap, a full genesis re-sync, or a warm catch-up. Safe to reuse as a warm
+  // handle and to persist.
+  chainConfirmed = true;
+
+  // Run below normal priority so foreground apps always win the CPU (safeguard).
+  try { os.setPriority(10); } catch { /* not permitted on some platforms — ignore */ }
+  // Default = worker_threads + WASM GrindPool (byte-unchanged behavior).
+  // Set MINER_NATIVE to use the native Rust grind processes instead (same
+  // interface, parity-equivalent solutions, one OS process per nonce range).
+  const useNative = !!process.env.MINER_NATIVE;
+  const pool: GrindPoolLike = useNative
+    ? new NativeGrindPool(cfg.workers, cfg.throttle)
+    : new GrindPool(cfg.workers, cfg.throttle);
+  const smartController = cfg.smart !== 'off'
+    ? new SmartController(
+      pool,
+      { start: cfg.throttle },
+      undefined,
+      cfg.smart === 'considerate' ? { demand: createDemandSignal() } : undefined,
+    )
+    : null;
+
+  const status: ReporterStatus = {
+    mode: 'solo',
+    target: 'solo',
+    backend: useNative ? 'native' : 'wasm',
+    workers: cfg.workers,
+    throttle: cfg.throttle,
+    address: cfg.minerPubkeyHex,
+  };
+  // Startup output. The pre-reporter code printed the synced height + the
+  // "mining to … (workers, throttle)" detail on a single line; the reporter
+  // abstraction emits them as separate clean lines (synced, then status). The
+  // spec explicitly allows "equivalent clean logging" over byte-parity, so this
+  // multi-line shape is intentional — same information, split for readability.
+  reporter.chain(chain.height, chain.tipDifficulty.toString(16));
+  reporter.synced(chain.height);
+  reporter.status(status);
+
+  // ── Snapshot persistence: periodic debounced save (§1) ──
+  // Persist a fresh snapshot whenever the chain has advanced ≥SAVE_EVERY_BLOCKS
+  // or ≥SAVE_EVERY_MS since the last write, whichever comes first. saveSnapshot
+  // is a no-op (returns false) until the chain is deep enough to have a finalized
+  // anchor, and never throws. lastSaveHeight tracks the chain height at the last
+  // *attempt* so a too-shallow chain doesn't retry on every single tick.
+  let lastSaveHeight = -SAVE_EVERY_BLOCKS;
+  let lastSaveAt = 0;
+  const maybeSave = (): void => {
+    const now = Date.now();
+    if (chain.height - lastSaveHeight < SAVE_EVERY_BLOCKS && now - lastSaveAt < SAVE_EVERY_MS) {
+      return;
+    }
+    lastSaveHeight = chain.height;
+    lastSaveAt = now;
+    if (saveSnapshot(chain)) debug?.(`snapshot saved at height ${chain.height}`);
+  };
+  // Write one immediately after the first successful sync so the very next launch
+  // is a warm start (subject to having a finalized anchor — short chains skip).
+  maybeSave();
+
+  const coord = new MinerCoordinator({
+    buildTemplate: () => buildTemplate(chain, cfg.minerPubkey),
+    poolStart: (headerBytes, targetHex, onSolved, onHashrate, onExhausted) =>
+      pool.start(
+        headerBytes,
+        targetHex,
+        (nonce) => onSolved(nonce),
+        (hps) => { smartController?.onHashrate(hps); onHashrate(hps); },
+        onExhausted,
+      ),
+    poolStop: () => pool.stop(),
+    submit: async (template, nonce) => {
+      // broadcast to all helpers FIRST and adopt the block locally only once
+      // ≥1 helper confirms the network has it (no private fork). `accepted` (which
+      // drives solo-earnings accounting in the reporter) is true only when the block
+      // is both on the network AND adopted into our chain.
+      const out = await submitSoloBlock(
+        { chain, helpers: cfg.helpers, postBlock },
+        template,
+        nonce,
+      );
+      const hash = bytesToHex(hashHeader(out.block.header));
+      const accepted = out.adopted;
+      reporter.found({
+        height: out.block.header.height,
+        hash,
+        accepted,
+        detail: `submit=${out.statuses.join(',')} ${
+          out.adopted ? 'adopted' : out.helperAccepted ? `adopt-failed=${out.localError}` : 'not-on-network'
+        }`,
+      });
+      return { label: `h=${out.block.header.height} hash=${hash}` };
+    },
+    syncCatchUp: (remoteTip) => sync.catchUp(remoteTip),
+    // The coordinator emits two message shapes through onLog:
+    //   `hps:<n>`      — a hashrate tick (also a good moment to refresh h/diff)
+    //   `solved:<lbl>` — after a solve has been submitted
+    // Both were printed to stdout in the pre-reporter code, so route both:
+    // hashrate ticks via reporter.hashrate(), and the `solved:` confirmation via
+    // reporter.event() so plain mode still surfaces it (the rich FOUND detail is
+    // additionally reported from `submit` via reporter.found()).
+    onLog: (msg) => {
+      const hps = /^hps:(\d+(?:\.\d+)?)$/.exec(msg);
+      if (hps) {
+        reporter.chain(chain.height, chain.tipDifficulty.toString(16));
+        reporter.hashrate(Number(hps[1]));
+        if (smartController) reporter.smart?.({ mode: cfg.smart as 'max' | 'considerate', throttle: smartController.appliedThrottle(), clamped: smartController.isClamped() });
+        // ~1/sec tick is a convenient debounce clock for the periodic save.
+        maybeSave();
+        return;
+      }
+      const solved = /^solved:(.*)$/s.exec(msg);
+      if (solved) {
+        reporter.event('info', `[minerd] solved ${solved[1]}`);
+        return;
+      }
+      // surface coordinator recovery errors (submit / catch-up failures) instead
+      // of dropping them — the miner self-recovers, but the operator should see why.
+      const err = /^error:(.*)$/s.exec(msg);
+      if (err) {
+        reporter.event('warn', `[minerd] ${err[1]}`);
+      }
+    },
+  });
+
+  // Tip poller: rebuild when the network advances past us.
+  const tipTimer = setInterval(() => {
+    void (async () => {
+      try {
+        const tip = await getTip(HELPER(cfg));
+        if (tip.height > chain.height || tip.tipHash !== bytesToHex(chain.tip.hash)) {
+          await coord.tipAdvanced(tip);
+          reporter.chain(chain.height, chain.tipDifficulty.toString(16));
+          // The chain advanced from the network — a good moment to persist.
+          maybeSave();
+        }
+      } catch (e) {
+        reporter.event('warn', `[minerd] tip poll failed: ${(e as Error).message}`);
+      }
+    })();
+  }, cfg.tipPollMs);
+
+  coord.rebuild();
+  smartController?.start();
+
+  // With no signal this Promise never resolves → runs forever, exactly like
+  // today. With a signal, abort tears everything down cleanly and resolves with
+  // the synced chain so the caller can warm-reuse it next session (item G).
+  return await new Promise<WarmChain>((resolve) => {
+    const done = (): void => {
+      clearInterval(tipTimer);
+      // Persist once more on graceful shutdown / abort so the next launch warm-
+      // starts from the freshest finalized anchor. Forced (bypasses the debounce)
+      // and best-effort — saveSnapshot never throws. Gated on chainConfirmed so an
+      // unconfirmed chain is never (re)persisted (defensive — we only reach
+      // done() with chainConfirmed true).
+      if (chainConfirmed && saveSnapshot(chain)) debug?.(`snapshot saved on shutdown at height ${chain.height}`);
+      unsubInvalidated();
+      smartController?.stop();
+      pool.terminate();
+      reporter.close?.();
+      resolve({ chain, synced: chainConfirmed });
+    };
+    if (signal?.aborted) return done();
+    signal?.addEventListener('abort', done, { once: true });
+  });
+}

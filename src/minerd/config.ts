@@ -1,0 +1,88 @@
+// src/minerd/config.ts
+import os from 'node:os';
+import { addressFromHex } from '../crypto/keys.js';
+
+export interface MinerConfig {
+  minerPubkeyHex: string;
+  minerPubkey: Uint8Array;
+  helpers: string[];
+  workers: number;
+  tipPollMs: number;
+  throttle: number; // duty cycle in (0.05, 1]: fraction of wall-time spent hashing
+  smart: 'off' | 'max' | 'considerate';
+  poolUrl?: string; // set via MINER_POOL; enables pool-client mode
+}
+
+const DEFAULT_HELPERS = [
+  'https://api1.browsercoin.org',
+  'https://api2.browsercoin.org',
+];
+
+// FulgurPool — the default mining target. FULGURPOOL_URL is the default pool
+// endpoint (the live, deployed API base); miners that haven't opted out route
+// there. Set 2026-06-17 now that the pool is live + synced; opt out per-run with
+// MINER_POOL=solo (or off/none). The website link is FULGURPOOL_PAGE below.
+export const FULGURPOOL_NAME = 'FulgurPool';
+export const FULGURPOOL_URL = 'https://pool.fulgurpool.xyz';
+// Website for the default pool (used for the clickable host link in the UI).
+export const FULGURPOOL_PAGE = 'https://fulgurpool.xyz';
+export const DEFAULT_POOL = FULGURPOOL_URL;
+
+// The public source repo. The miner runs from source (git clone → npm install →
+// npm start), so updates are a `git pull` from here — this is the always-visible
+// "where to get updates" link.
+export const REPO_URL = 'https://github.com/alpenmilch411/FulgurMiner';
+
+/**
+ * Resolve the pool target from MINER_POOL:
+ *   MINER_POOL=<url>        → mine at that pool
+ *   MINER_POOL=solo|off|none → force solo mining (opt out of the default pool)
+ *   MINER_POOL unset/blank   → the default pool (DEFAULT_POOL) if set, else solo
+ */
+export function resolvePoolUrl(raw: string | undefined): string | undefined {
+  const v = (raw ?? '').trim();
+  if (v === '') return DEFAULT_POOL || undefined;
+  if (/^(solo|off|none)$/i.test(v)) return undefined;
+  return v.replace(/\/+$/, '');
+}
+
+/** Load + validate miner config from an env-like record (defaults to process.env). */
+export function loadConfig(env: Record<string, string | undefined> = process.env): MinerConfig {
+  const minerPubkeyHex = (env.MINER_PUBKEY ?? '').trim().toLowerCase();
+  if (!minerPubkeyHex) throw new Error('MINER_PUBKEY is required (64-hex Ed25519 pubkey)');
+  // addressFromHex throws "address must be 32 bytes" on the wrong length.
+  const minerPubkey = addressFromHex(minerPubkeyHex);
+
+  const helpers = (env.MINER_HELPERS
+    ? env.MINER_HELPERS.split(',')
+    : DEFAULT_HELPERS
+  )
+    .map((h) => h.trim().replace(/\/+$/, ''))
+    .filter((h) => h.length > 0);
+
+  // Leave one core free by default so the machine stays responsive (and cooler).
+  // A hand-set MINER_WORKERS is clamped to 1…cores so it can never exceed the
+  // machine (the menu/settings selectors already constrain the UI; this clamps
+  // the env-var path too, matching that guarantee).
+  const cores = Math.max(1, os.cpus().length);
+  const workers = env.MINER_WORKERS
+    ? Math.min(cores, Math.max(1, Math.floor(Number(env.MINER_WORKERS))))
+    : Math.max(1, cores - 1);
+
+  const tipPollMs = env.MINER_TIP_POLL_MS
+    ? Math.max(500, Math.floor(Number(env.MINER_TIP_POLL_MS)))
+    : 3000;
+
+  // Duty cycle: fraction of wall-time spent hashing vs sleeping. Balanced default
+  // 0.75 keeps heat/fan/power in check while staying productive. Clamp to (0.05, 1].
+  const throttleRaw = env.MINER_THROTTLE !== undefined ? Number(env.MINER_THROTTLE) : 0.75;
+  const throttle = Math.min(1, Math.max(0.05, Number.isFinite(throttleRaw) ? throttleRaw : 0.75));
+
+  const rawSmart = (env.MINER_SMART ?? '').trim().toLowerCase();
+  const smart: 'off' | 'max' | 'considerate' =
+    rawSmart === 'max' ? 'max' : rawSmart === 'considerate' ? 'considerate' : 'off';
+
+  const poolUrl = resolvePoolUrl(env.MINER_POOL);
+
+  return { minerPubkeyHex, minerPubkey, helpers, workers, tipPollMs, throttle, smart, poolUrl };
+}

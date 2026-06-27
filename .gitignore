@@ -1,0 +1,7 @@
+node_modules/
+.env.local
+pools.json
+native/brc-pow/target/
+.fulgurminer/
+*.log
+.DS_Store

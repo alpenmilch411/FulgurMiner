@@ -1,0 +1,111 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { ChainSync } from './sync.js';
+
+// catchUp() absorbs a reorg DEEPER than the fixed 5-block overlap by widening
+// toward the common ancestor, deciding whether to widen by whether the fetched branch
+// CONNECTS to our chain (hasBlock of the lowest block's parent), NOT by height — fork
+// choice is strictly work-based, so a heavier-but-SHORTER fork (helper tip BELOW our
+// height) is canonical. The observed remote tip is threaded in so we fetch from below
+// it (else an empty page above the short tip masks the reorg). Fake chain + getBlocks,
+// no Argon2. prevHash byte [1]→hasBlock '01' true ('connected'); [0]→'00' false.
+
+function scenario(opts: {
+  start: number; forkAt: number; helperTip: number; onConnect: 'reorg' | 'insync'; remoteHasTip?: boolean;
+}): { run: () => Promise<void>; froms: number[]; height: () => number } {
+  let height = opts.start;
+  let tipHash = new Uint8Array([opts.start & 0xff, 1]);
+  const froms: number[] = [];
+  const chain = {
+    get height() { return height; },
+    get tip() { return { hash: tipHash }; },
+    hasBlock: (hex: string) => hex === '01',
+    addBlockWithPow: async (block: any): Promise<string | null> => {
+      if (!block.__connects) return 'parent block unknown';
+      if (opts.onConnect === 'reorg') { height = block.__tipHeight; tipHash = new Uint8Array([block.__tipHeight & 0xff, 2]); }
+      return null; // connected (applied / known / equal-work sibling)
+    },
+  };
+  const getBlocks = async (from: number): Promise<any[]> => {
+    froms.push(from);
+    if (from > opts.helperTip) return []; // helper has nothing at/above this height
+    const connects = opts.forkAt >= 0 && from <= opts.forkAt;
+    return [{ header: { height: from, prevHash: new Uint8Array([connects ? 1 : 0]) }, __connects: connects, __tipHeight: opts.helperTip, transactions: [] }];
+  };
+  const sync = new ChainSync({ chain: chain as any, cores: 1, getBlocks, verifyBlocksParallel: async (b) => b.map(() => true) });
+  const remoteTip = { height: opts.helperTip, tipHash: opts.remoteHasTip ? '01' : 'ff' };
+  return { run: () => sync.catchUp(remoteTip), froms, height: () => height };
+}
+
+test('a reorg deeper than the 5-overlap is absorbed by progressively widening', async () => {
+  const s = scenario({ start: 200, forkAt: 130, helperTip: 205, onConnect: 'reorg' });
+  await s.run();
+  assert.deepEqual(s.froms, [195, 175, 110], 'widened 5→25→90(cap) until the page connected past the fork');
+  assert.equal(s.height(), 205);
+});
+
+test('a heavier-but-SHORTER fork BELOW our height is taken (fetch below the remote tip, reorg by WORK)', async () => {
+  // Helper canonical tip at 190 (< our 200), ancestor at 165. height-overlap alone would
+  // fetch from 195 → empty page → missed. Threading the remote tip fetches from below 190.
+  const s = scenario({ start: 200, forkAt: 165, helperTip: 190, onConnect: 'reorg' });
+  await s.run();
+  assert.equal(s.height(), 190, 'reorged DOWN to the heavier-shorter canonical fork');
+  assert.equal(s.froms[0], 185, 'fetched from below the remote tip (190), not from 195');
+  assert.ok(s.froms.includes(165), 'widened to reach the ancestor (then a harmless no-op bootstrap)');
+});
+
+test('an equal-work sibling (connects, not heavier) does NOT widen or throw', async () => {
+  const s = scenario({ start: 100, forkAt: 100, helperTip: 100, onConnect: 'insync' });
+  await s.run(); // must not throw
+  assert.deepEqual(s.froms, [95], 'one fetch — connected + not heavier → in sync, no deep widen');
+  assert.equal(s.height(), 100);
+});
+
+test('a fork deeper than the cap (90) THROWS after a bounded widen', async () => {
+  const s = scenario({ start: 200, forkAt: -1, helperTip: 205, onConnect: 'reorg' }); // never connects
+  await assert.rejects(s.run(), /fork deeper than/);
+  assert.deepEqual(s.froms, [195, 175, 110], 'widened 5→25→90(cap), then threw — bounded, finite');
+  assert.equal(s.height(), 200, 'no spurious progress');
+});
+
+test('a normal single-page advance needs no widening', async () => {
+  const s = scenario({ start: 100, forkAt: 100, helperTip: 110, onConnect: 'reorg' });
+  await s.run();
+  assert.equal(s.froms.length, 1);
+  assert.equal(s.height(), 110);
+});
+
+test('fast-path — we already hold the helper tip block → return without fetching', async () => {
+  const s = scenario({ start: 200, forkAt: 100, helperTip: 50, onConnect: 'insync', remoteHasTip: true });
+  await s.run();
+  assert.deepEqual(s.froms, [], 'no getBlocks/re-verify when we already have the helper tip');
+  assert.equal(s.height(), 200);
+});
+
+test('a reset (height drops below us mid-apply) re-syncs via bootstrap, not "progress"', async () => {
+  let height = 200;
+  let tipHash = new Uint8Array([9]);
+  let didReset = false;
+  const froms: number[] = [];
+  const chain = {
+    get height() { return height; },
+    get tip() { return { hash: tipHash }; },
+    hasBlock: (hex: string) => hex === '01',
+    addBlockWithPow: async (block: any): Promise<string | null> => {
+      if (block.__resets && !didReset) { didReset = true; height = 0; tipHash = new Uint8Array([0]); return null; }
+      if (block.__advance) { height = block.__tipHeight; tipHash = new Uint8Array([height & 0xff]); return null; }
+      return 'rejected';
+    },
+  };
+  const getBlocks = async (from: number): Promise<any[]> => {
+    froms.push(from);
+    if (!didReset) return [{ header: { height: from, prevHash: new Uint8Array([1]) }, __resets: true, transactions: [] }];
+    if (from > 205) return [];
+    return [{ header: { height: from, prevHash: new Uint8Array([1]) }, __advance: true, __tipHeight: 205, transactions: [] }];
+  };
+  const sync = new ChainSync({ chain: chain as any, cores: 1, getBlocks, verifyBlocksParallel: async (b) => b.map(() => true) });
+  await sync.catchUp({ height: 205, tipHash: 'ff' });
+  assert.equal(didReset, true, 'the reset fired during applyBatch');
+  assert.equal(height, 205, 're-synced forward via bootstrap (NOT left at genesis to mine from)');
+  assert.ok(froms.includes(1), 'bootstrap re-fetched from genesis+1 after the reset');
+});

@@ -1,0 +1,32 @@
+{
+  "name": "fulgurminer",
+  "version": "0.2.0",
+  "private": false,
+  "type": "module",
+  "description": "FulgurMiner — standalone terminal miner for BrowserCoin. Mine without a browser.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.6.0"
+  },
+  "scripts": {
+    "start": "tsx src/minerd/start.ts",
+    "settings": "tsx src/minerd/settings.ts",
+    "mine": "tsx src/minerd/index.ts",
+    "mine:dryrun": "tsx src/minerd/index.ts dryrun",
+    "test": "npm run test:chain && npm run test:minerd",
+    "test:chain": "vitest run",
+    "test:minerd": "node --import tsx --test src/minerd/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@noble/ed25519": "^2.1.0",
+    "@noble/hashes": "^1.5.0",
+    "argon2id": "^1.0.1",
+    "tsx": "^4.19.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.5"
+  }
+}
