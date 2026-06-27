@@ -49,29 +49,37 @@ The easy path: install, run, and pick your settings from a menu. No config files
 
 ## 1. Install
 
-**Install [Node.js](https://nodejs.org) 20.6 or newer** (the LTS installer is fine), then check it:
+**First, for everyone: install [Node.js](https://nodejs.org) 20.6 or newer** (the LTS installer is fine; check with `node --version`). Then pick the path that fits you.
+
+### A · Quick start (if you're comfortable with a terminal)
 
 ```bash
-node --version
-```
-
-**Get the code and install:**
-
-```bash
-git clone https://github.com/alpenmilch411/FulgurMiner.git
+git clone https://github.com/alpenmilch411/FulgurMiner.git   # or grab the ZIP: Code → Download ZIP
 cd FulgurMiner
 npm install
+npm start
 ```
 
-That's the whole setup for the default engine — no compilers, no system libraries, nothing to edit by hand. *(The optional, faster **native** engine needs the Rust toolchain — see [Native engine](#native-engine). It's not required.)*
+No compilers, no system libraries — that's the whole setup for the default engine. *(The optional, faster **native** engine needs Rust — see [Native engine](#native-engine). Not required.)*
 
-> **No git?** You don't need it — on the repo page click **Code → Download ZIP**, unpack the folder, then open a terminal inside it and run `npm install` / `npm start`.
->
-> **Windows (PowerShell):** if `npm` fails with *"running scripts is disabled on this system,"* either use **Command Prompt (cmd)** instead, or allow local scripts. `CurrentUser` is a persistent per-user setting; use `-Scope Process` if you'd rather only affect the current terminal:
-> ```powershell
-> Set-ExecutionPolicy -Scope CurrentUser RemoteSigned   # or: -Scope Process (this session only)
-> ```
-> An `npm warn allow-scripts … esbuild …` notice during install is **harmless** — esbuild is the build tool that runs the TypeScript; the install still completes.
+> **Windows (PowerShell):** if `npm` is blocked with *"running scripts is disabled on this system,"* either use **Command Prompt (cmd)** instead, or run once: `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` (or `-Scope Process` for just this terminal). An `npm warn allow-scripts … esbuild …` notice is **harmless** — the install still completes.
+
+### B · Step-by-step (new to this — no terminal experience needed)
+
+This is the **Windows** walkthrough; macOS/Linux is the same idea (open Terminal in the folder — no execution-policy step needed).
+
+1. **Install Node.js** from [nodejs.org](https://nodejs.org) (the big green **LTS** button).
+2. **Download FulgurMiner:** on the [repo page](https://github.com/alpenmilch411/FulgurMiner) click **Code → Download ZIP**, then unpack the folder (e.g. onto your Desktop). *(No git needed.)*
+3. Open that folder and **right-click an empty space → "Open in Terminal."**
+4. *(Windows PowerShell only)* type this and press Enter: `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`
+5. Type `npm install` and press Enter.
+6. Type `npm start` and press Enter. The miner opens — paste your **wallet address**, choose your settings, highlight **Start mining** and press Enter. It runs the portable **wasm** engine.
+
+**Optional — switch to the faster "native" engine (~1.6–1.9× the speed):**
+
+7. Install **Rust** from [rustup.rs](https://rustup.rs): download and run `rustup-init.exe`, type **1** and press Enter. It installs the **Visual Studio build tools** (accept that), then finishes Rust. *(macOS: if the build later complains about a missing linker, run `xcode-select --install`.)*
+8. **Close the terminal and open a new one** in the FulgurMiner folder. **This step matters** — only a freshly opened terminal sees Rust on your PATH.
+9. Run `npm start` again, set **Engine → native**, and **Start mining**. When it asks *"build the native engine now?"*, type **Y**. After a one-time build (~a minute), it mines with the faster engine.
 
 ## 2. Start
 
@@ -225,7 +233,7 @@ MINER_PUBKEY=<your-address> MINER_POOL=https://pool.example.org npm run mine
 MINER_PUBKEY=<your-address> npm run mine:dryrun
 ```
 
-The update check is quiet and best-effort: it reads the latest version from the project's [GitHub releases](https://github.com/alpenmilch411/FulgurMiner/releases) (plus the pool's notice / required-version signal) and fails silently offline. The miner runs from source, so updating is a `git pull && npm install`. Turn the check off with **Check for updates → off** or `FULGUR_NO_UPDATE_CHECK=1`. FulgurMiner never runs an update for you.
+The update check is quiet and best-effort: it reads the latest version from the project's [GitHub releases](https://github.com/alpenmilch411/FulgurMiner/releases) (plus the pool's notice / required-version signal) and fails silently offline. The miner runs from source, so updating is a `git pull && npm install` (or, if you installed from the ZIP, download the latest ZIP and run `npm install` again). Turn the check off with **Check for updates → off** or `FULGUR_NO_UPDATE_CHECK=1`. FulgurMiner never runs an update for you.
 
 ## Native engine
 
