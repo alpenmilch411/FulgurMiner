@@ -42,8 +42,12 @@ export function isValidNativeHit(nonce: number, hashHex: unknown, start: number,
 import { partitionNonceSpace } from './partition.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+/** Executable suffix: Windows cargo emits `brc-pow.exe`; Linux/macOS emit a bare name.
+ *  Without this, existsSync(NATIVE_BIN) never matches on Windows → the engine reports
+ *  "build failed" after a successful cargo build and re-prompts every launch. */
+const EXE = process.platform === 'win32' ? '.exe' : '';
 /** Path to the release binary built by `cargo build --release` in native/brc-pow. */
-export const NATIVE_BIN = resolve(__dirname, '../../native/brc-pow/target/release/brc-pow');
+export const NATIVE_BIN = resolve(__dirname, `../../native/brc-pow/target/release/brc-pow${EXE}`);
 
 export type OnSolved = (nonce: number, hash: Uint8Array) => void;
 export type OnHashrate = (hashesPerSec: number) => void;
