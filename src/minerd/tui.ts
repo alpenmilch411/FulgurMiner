@@ -99,7 +99,8 @@ export class DashboardReporter implements MinerReporter {
   private rejectedCount = 0;
   private shareCount = 0;
   private shareAccepted = 0;
-  private soloHeights: number[] = [];
+  private soloBlocks: { height: number; hash: string }[] = [];
+  private orphanedSoloHashes = new Set<string>();
   private earnings_: EarningsInfo | null = null;
   private jackpot_: JackpotInfo | null = null;
   private updateNotice_: UpdateNotice | null = null;
@@ -155,6 +156,13 @@ export class DashboardReporter implements MinerReporter {
 
     this.renderTimer = setInterval(() => this.render(), RENDER_MS);
     this.render();
+  }
+
+  private canonicalSolo(): { heights: number[]; earnedBrc: number; count: number } {
+    const heights = this.soloBlocks
+      .filter((b) => !this.orphanedSoloHashes.has(b.hash))
+      .map((b) => b.height);
+    return { heights, earnedBrc: soloEarnedBrc(heights), count: heights.length };
   }
 
   private sigintSeen = false;
@@ -265,10 +273,38 @@ export class DashboardReporter implements MinerReporter {
       `FOUND h=${group(info.height)} ${info.hash.slice(0, 16)}… ${info.detail}`,
     );
     if (info.accepted && this.status_?.mode !== 'pool') {
-      this.soloHeights.push(info.height);
-      this.earnings({ kind: 'solo', earnedBrc: soloEarnedBrc(this.soloHeights) });
+      this.soloBlocks.push({ height: info.height, hash: info.hash });
+      this.earnings({ kind: 'solo', earnedBrc: this.canonicalSolo().earnedBrc });
     }
     this.render();
+  }
+
+  reorg(connectedHashes: string[], disconnectedHashes: string[]): void {
+    let changed = false;
+    for (const h of disconnectedHashes) {
+      if (this.soloBlocks.some((b) => b.hash === h) && !this.orphanedSoloHashes.has(h)) {
+        this.orphanedSoloHashes.add(h);
+        changed = true;
+      }
+    }
+    for (const h of connectedHashes) {
+      if (this.orphanedSoloHashes.has(h)) {
+        this.orphanedSoloHashes.delete(h);
+        changed = true;
+      }
+    }
+    if (changed) this.earnings({ kind: 'solo', earnedBrc: this.canonicalSolo().earnedBrc });
+  }
+
+  soloReorgReset(): void {
+    let changed = false;
+    for (const b of this.soloBlocks) {
+      if (!this.orphanedSoloHashes.has(b.hash)) {
+        this.orphanedSoloHashes.add(b.hash);
+        changed = true;
+      }
+    }
+    if (changed) this.earnings({ kind: 'solo', earnedBrc: this.canonicalSolo().earnedBrc });
   }
 
   share(accepted: boolean, result: string): void {
@@ -685,7 +721,7 @@ export class DashboardReporter implements MinerReporter {
       const stats = e.pageUrl ? ` (stats: ${link(e.pageUrl, e.pageUrl)})` : '';
       return `shares: ${e.shares}${stats}`;
     }
-    return `earnings (est): ${e.earnedBrc} BRC (${this.soloHeights.length} blocks)`;
+    return `earnings (est): ${e.earnedBrc} BRC (${this.canonicalSolo().count} blocks)`;
   }
 
   private jackpotText(j: JackpotInfo): string {

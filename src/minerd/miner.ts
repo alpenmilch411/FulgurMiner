@@ -1,6 +1,6 @@
 // src/minerd/miner.ts
 import os from 'node:os';
-import { Blockchain } from '../chain/blockchain.js';
+import { Blockchain, type ReorgDelta } from '../chain/blockchain.js';
 import { hashHeader, type Block, type BlockHeader } from '../chain/block.js';
 import { checkPoW } from '../chain/consensus.js';
 import { bytesToHex, compareBytes } from '../util/binary.js';
@@ -173,14 +173,21 @@ export interface CoordinatorDeps {
    *  below a heavier-but-SHORTER fork whose canonical tip sits below our height. */
   syncCatchUp: (remoteTip?: { height: number; tipHash: string }) => Promise<void>;
   onLog: (msg: string) => void;
+  retryRebuildMs?: number;
 }
 
 /** Pure coordination logic: busy-flag, rebuild-on-solve, rebuild-on-exhaust, tip-advance. */
 export class MinerCoordinator {
   private current: Template | null = null;
   private busy = false;
+  private retryTimer: ReturnType<typeof setTimeout> | null = null;
+  private disposed = false;
 
   constructor(private readonly deps: CoordinatorDeps) {}
+
+  private get retryMs(): number {
+    return this.deps.retryRebuildMs ?? 5000;
+  }
 
   rebuild(): void {
     this.current = this.deps.buildTemplate();
@@ -199,10 +206,43 @@ export class MinerCoordinator {
    *  the in-loop callers; runMiner's initial rebuild() stays throwing (startup should
    *  surface a hard failure). */
   private safeRebuild(): void {
+    if (this.disposed) return;
+    if (this.retryTimer !== null) {
+      clearTimeout(this.retryTimer);
+      this.retryTimer = null;
+    }
     try {
       this.rebuild();
     } catch (e) {
       this.deps.onLog(`error:rebuild failed — ${(e as Error).message}`);
+      this.scheduleRebuildRetry();
+    }
+  }
+
+  // Retry a failed rebuild without waiting for the next network block — but NEVER
+  // mid-flight. If a solve / tip-advance owns the chain (busy) when the timer fires,
+  // reschedule instead of starting a grind over a chain another op is mutating (that
+  // race could stack pool starts or grind a stale template, emitting a solve from the
+  // wrong tip). The in-flight op runs its own safeRebuild on completion, which clears
+  // this timer; the reschedule only matters when that op took the no-rebuild failure
+  // path (a catch-up failure) — exactly the idle case this retry exists to cover.
+  // unref so a pending retry never holds the process open on its own.
+  private scheduleRebuildRetry(): void {
+    if (this.disposed || this.retryTimer !== null) return;
+    this.retryTimer = setTimeout(() => {
+      this.retryTimer = null;
+      if (this.disposed) return;
+      if (this.busy) { this.scheduleRebuildRetry(); return; }
+      this.safeRebuild();
+    }, this.retryMs);
+    this.retryTimer.unref?.();
+  }
+
+  dispose(): void {
+    this.disposed = true;
+    if (this.retryTimer !== null) {
+      clearTimeout(this.retryTimer);
+      this.retryTimer = null;
     }
   }
 
@@ -300,7 +340,20 @@ export async function runMiner(
     snapshotInvalidated = true;
     deleteSnapshot();
     try { chain.reset(); } catch { /* genesis-only re-init; ignore */ }
+    // reset() clears the chain WITHOUT firing onTipChanged, so the tip-change prune
+    // can't see the displaced blocks. Orphan ALL recorded solo rewards here; the full
+    // replay re-connects (onTipChanged) any block still canonical, which un-orphans
+    // the survivors via reorg() — genuine orphans stay excluded. (Correct, not just
+    // conservative.)
+    reporter.soloReorgReset?.();
     debug?.('snapshot invalidated (deep reorg) — cleared; will full-replay');
+  });
+  const unsubTipChanged = chain.onTipChanged((d: ReorgDelta) => {
+    if (d.connected.length === 0 && d.disconnected.length === 0) return;
+    reporter.reorg?.(
+      d.connected.map((cb) => bytesToHex(cb.hash)),
+      d.disconnected.map((cb) => bytesToHex(cb.hash)),
+    );
   });
 
   // The persistent verifier pool is a bootstrap-only (cold) resource. Declared at
@@ -350,6 +403,7 @@ export async function runMiner(
       if (signal?.aborted) {
         terminateVerifier();
         unsubInvalidated();
+        unsubTipChanged();
         await new Promise<void>((resolve) => { queueMicrotask(() => { reporter.close?.(); resolve(); }); });
         return { chain, synced: false };
       }
@@ -418,15 +472,17 @@ export async function runMiner(
       // and return a not-synced handle so the loop cold-starts next time. Any
       // non-abort failure is a real error and must still propagate.
       if (signal?.aborted) {
-        terminateVerifier();
-        unsubInvalidated();
-        await new Promise<void>((resolve) => { queueMicrotask(() => { reporter.close?.(); resolve(); }); });
-        return { chain, synced: false };
+          terminateVerifier();
+          unsubInvalidated();
+          unsubTipChanged();
+          await new Promise<void>((resolve) => { queueMicrotask(() => { reporter.close?.(); resolve(); }); });
+          return { chain, synced: false };
       }
       // Release the persistent verifier pool + listener before propagating, or its
       // worker threads (~65 MB Argon2 WASM each) leak across a caller retry.
       terminateVerifier();
       unsubInvalidated();
+      unsubTipChanged();
       throw e;
     }
 
@@ -456,11 +512,13 @@ export async function runMiner(
           if (signal?.aborted) {
             terminateVerifier();
             unsubInvalidated();
+            unsubTipChanged();
             await new Promise<void>((resolve) => { queueMicrotask(() => { reporter.close?.(); resolve(); }); });
             return { chain, synced: false };
           }
           terminateVerifier();
           unsubInvalidated();
+          unsubTipChanged();
           throw e;
         }
       }
@@ -483,6 +541,7 @@ export async function runMiner(
     } catch (e) {
       if (signal?.aborted) {
         unsubInvalidated();
+        unsubTipChanged();
         await new Promise<void>((resolve) => { queueMicrotask(() => { reporter.close?.(); resolve(); }); });
         return { chain, synced: false };
       }
@@ -500,6 +559,7 @@ export async function runMiner(
   if (signal?.aborted) {
     terminateVerifier();
     unsubInvalidated();
+    unsubTipChanged();
     await new Promise<void>((resolve) => { queueMicrotask(() => { reporter.close?.(); resolve(); }); });
     return { chain, synced: false };
   }
@@ -662,6 +722,8 @@ export async function runMiner(
       // done() with chainConfirmed true).
       if (chainConfirmed && saveSnapshot(chain)) debug?.(`snapshot saved on shutdown at height ${chain.height}`);
       unsubInvalidated();
+      unsubTipChanged();
+      coord.dispose();
       smartController?.stop();
       pool.terminate();
       reporter.close?.();

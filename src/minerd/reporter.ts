@@ -113,6 +113,11 @@ export interface MinerReporter {
   smart?(info: SmartInfo): void;
   /** Earnings KPI. Optional — renders nothing when not provided. */
   earnings?(e: EarningsInfo): void;
+  /** Canonical-tip reorg delta, used to prune orphaned solo rewards. */
+  reorg?(connectedHashes: string[], disconnectedHashes: string[]): void;
+  /** A deep-reorg chain reset (reset() fires no tip-change): orphan all recorded solo
+   *  rewards; the replay re-connects survivors via reorg(). */
+  soloReorgReset?(): void;
   /** Jackpot KPI / FulgurPool. Optional — renders nothing when not provided. */
   jackpot?(j: JackpotInfo): void;
   /** Update-available nudge. Optional — renders nothing when not provided. */
@@ -141,8 +146,16 @@ export class ConsoleReporter implements MinerReporter {
   // show steady progress without flooding. -1 = no line emitted yet this sync.
   private lastSyncLogAt = 0;
   private lastSyncPct = -1;
-  private soloHeights: number[] = [];
+  private soloBlocks: { height: number; hash: string }[] = [];
+  private orphanedSoloHashes = new Set<string>();
   private smart_: SmartInfo | null = null;
+
+  private canonicalSolo(): { heights: number[]; earnedBrc: number; count: number } {
+    const heights = this.soloBlocks
+      .filter((b) => !this.orphanedSoloHashes.has(b.hash))
+      .map((b) => b.height);
+    return { heights, earnedBrc: soloEarnedBrc(heights), count: heights.length };
+  }
 
   status(s: ReporterStatus): void {
     this.status_ = s;
@@ -205,9 +218,37 @@ export class ConsoleReporter implements MinerReporter {
   found(info: FoundInfo): void {
     console.log(`\n[minerd] FOUND height=${info.height} hash=${info.hash} ${info.detail}`);
     if (info.accepted && this.status_?.mode !== 'pool') {
-      this.soloHeights.push(info.height);
-      this.earnings({ kind: 'solo', earnedBrc: soloEarnedBrc(this.soloHeights) });
+      this.soloBlocks.push({ height: info.height, hash: info.hash });
+      this.earnings({ kind: 'solo', earnedBrc: this.canonicalSolo().earnedBrc });
     }
+  }
+
+  reorg(connectedHashes: string[], disconnectedHashes: string[]): void {
+    let changed = false;
+    for (const h of disconnectedHashes) {
+      if (this.soloBlocks.some((b) => b.hash === h) && !this.orphanedSoloHashes.has(h)) {
+        this.orphanedSoloHashes.add(h);
+        changed = true;
+      }
+    }
+    for (const h of connectedHashes) {
+      if (this.orphanedSoloHashes.has(h)) {
+        this.orphanedSoloHashes.delete(h);
+        changed = true;
+      }
+    }
+    if (changed) this.earnings({ kind: 'solo', earnedBrc: this.canonicalSolo().earnedBrc });
+  }
+
+  soloReorgReset(): void {
+    let changed = false;
+    for (const b of this.soloBlocks) {
+      if (!this.orphanedSoloHashes.has(b.hash)) {
+        this.orphanedSoloHashes.add(b.hash);
+        changed = true;
+      }
+    }
+    if (changed) this.earnings({ kind: 'solo', earnedBrc: this.canonicalSolo().earnedBrc });
   }
 
   share(accepted: boolean, result: string): void {
@@ -234,7 +275,7 @@ export class ConsoleReporter implements MinerReporter {
     } else if (e.kind === 'pool-shares') {
       console.log(`[pool-miner] shares: ${e.shares}${e.pageUrl ? ` (stats: ${e.pageUrl})` : ''}`);
     } else {
-      console.log(`[minerd] earnings (est): ${e.earnedBrc} BRC (${this.soloHeights.length} blocks)`);
+      console.log(`[minerd] earnings (est): ${e.earnedBrc} BRC (${this.canonicalSolo().count} blocks)`);
     }
   }
 
