@@ -110,11 +110,16 @@ export async function resolveEngine(
         log('  Native engine built. Using native.');
         return 'native';
       }
-      log('  Native build failed — falling back to the wasm engine.');
+      log('  Native build failed — using the wasm engine. If cargo printed a linker/');
+      log('  compiler error, install a C toolchain (Windows: the MSVC build tools via the');
+      log('  Visual Studio installer; macOS: xcode-select --install; Linux: build-essential),');
+      log('  then try again.');
     }
   } else {
-    log('  The native engine is faster but needs Rust. To build it, run:');
-    log(`    ${BUILD_CMD}`);
+    log('  The native engine is ~1.6x faster but needs the Rust toolchain.');
+    log('    1) Install Rust from https://rustup.rs (on Windows it also installs the MSVC build tools).');
+    log('    2) Open a NEW terminal so cargo is on PATH, then build it:');
+    log(`         ${BUILD_CMD}`);
     log('  Continuing with the portable wasm engine for now.');
   }
 

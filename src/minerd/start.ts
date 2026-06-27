@@ -25,6 +25,7 @@ import { loadEnvLocal, persist, readExtraPools, type PoolEntry } from './envLoca
 import { resolveEngine } from './engine.js';
 import { currentEngine } from './selectors.js';
 import { checkForUpdate } from './updateCheck.js';
+import { assertNodeVersion } from './version.js';
 
 const HEX64 = /^[0-9a-f]{64}$/i;
 
@@ -162,7 +163,9 @@ async function runDashboardSession(warm?: WarmChain): Promise<{ reason: 'menu' |
     try { process.stdout.write('\x1b[?25h\x1b[?1049l'); } catch { /* ignore */ }
     throw e;
   }
-  void checkForUpdate({ reporter, signal: ac.signal }).catch(() => {});
+  // Solo only: runPoolClient runs its own check (with the pool's notice/min fields),
+  // so guarding here avoids a duplicate GitHub fetch + a render race in pool mode.
+  if (!cfg.poolUrl) void checkForUpdate({ reporter, signal: ac.signal }).catch(() => {});
 
   // Solo keeps the synced chain in memory across settings restarts (item G); pool
   // mode holds no local chain, so the warm handle passes through untouched.
@@ -188,7 +191,8 @@ async function runPlainSession(): Promise<void> {
   const cfg = loadConfig();
   const status = buildStatus(cfg);
   const reporter: MinerReporter = new ConsoleReporter();
-  void checkForUpdate({ reporter }).catch(() => {});
+  // Solo only — runPoolClient runs its own check with the pool's version fields.
+  if (!cfg.poolUrl) void checkForUpdate({ reporter }).catch(() => {});
   // Keep the friendly one-line intro the launcher always printed.
   if (cfg.poolUrl) {
     console.log(`  Mining to ${status.target} with ${cfg.workers} worker(s). Press Ctrl+C to stop.\n`);
@@ -207,6 +211,7 @@ async function runPlainSession(): Promise<void> {
 }
 
 async function main(): Promise<void> {
+  assertNodeVersion();
   loadEnvLocal();
 
   const argv = process.argv.slice(2);

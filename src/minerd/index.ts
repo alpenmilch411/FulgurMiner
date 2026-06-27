@@ -1,5 +1,6 @@
 // src/minerd/index.ts
 import { loadConfig } from './config.js';
+import { assertNodeVersion } from './version.js';
 import { runMiner } from './miner.js';
 import { runPoolClient } from './poolClient.js';
 import { Blockchain } from './../chain/blockchain.js';
@@ -108,6 +109,7 @@ async function dryrun(): Promise<void> {
 }
 
 async function main(): Promise<void> {
+  assertNodeVersion();
   const cmd = process.argv[2];
   if (cmd === 'dryrun') {
     await dryrun();

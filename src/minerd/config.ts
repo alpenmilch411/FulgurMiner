@@ -33,6 +33,14 @@ export const DEFAULT_POOL = FULGURPOOL_URL;
 // "where to get updates" link.
 export const REPO_URL = 'https://github.com/alpenmilch411/FulgurMiner';
 
+// Latest-release endpoint for the update check. Derived from REPO_URL so there is
+// one source of truth for the repo. The miner reads `tag_name` here (e.g. "v0.2.3")
+// to learn the newest published version — authoritative + self-maintaining (no
+// hand-maintained version field), and it reaches solo miners too (who never hit
+// the pool). Fail-silent: offline / rate-limited / parse errors just skip the check.
+export const GITHUB_LATEST_RELEASE_API =
+  REPO_URL.replace('https://github.com/', 'https://api.github.com/repos/') + '/releases/latest';
+
 /**
  * Resolve the pool target from MINER_POOL:
  *   MINER_POOL=<url>        → mine at that pool

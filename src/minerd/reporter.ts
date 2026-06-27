@@ -29,6 +29,9 @@ export interface ReporterStatus {
   /** Website to hyperlink the shown host to (OSC 8). Falls back to targetUrl. */
   targetPage?: string;
   backend: 'wasm' | 'native';
+  /** Optional one-line note about the backend choice, e.g. why native fell back to
+   *  wasm. Shown persistently so the user doesn't have to quit to discover it. */
+  backendNote?: string;
   workers: number;
   throttle: number;
   /** Full 64-hex payout address. */
@@ -76,11 +79,14 @@ export interface JackpotInfo {
   lastStrikeHeight?: number; // height of the last strike
 }
 
-/** One-line update nudge from the pool's version signaling (npm poll removed — the
- *  miner updates via `git pull` from the public repo). */
+/** One-line update nudge. The latest version comes from the repo's GitHub release;
+ *  the miner updates via `git pull` from the public repo. */
 export interface UpdateNotice {
   currentVersion: string;
   latestVersion?: string;
+  /** true ⇒ a newer version exists (currentVersion < latestVersion). Only then is
+   *  an "update available" line shown; a bare `notice` while current must not. */
+  available?: boolean;
   /** true ⇒ 426 / minMinerVersion gate: must update before mining continues. */
   mustUpdate: boolean;
   /** Free-form pool 'notice' string from /register or GET /version. */
@@ -159,6 +165,7 @@ export class ConsoleReporter implements MinerReporter {
 
   status(s: ReporterStatus): void {
     this.status_ = s;
+    if (s.backendNote) console.log(`[${s.mode === 'pool' ? 'pool-miner' : 'minerd'}] ${s.backendNote}`);
     if (s.mode === 'pool') return; // pool registration line is emitted by poolClient flow
     const backend = s.backend === 'native' ? 'native (Rust)' : 'wasm (worker_threads)';
     // Mirror miner.ts's old startup lines so plain mode looks unchanged.
@@ -287,8 +294,10 @@ export class ConsoleReporter implements MinerReporter {
   updateNotice(n: UpdateNotice): void {
     if (n.mustUpdate) {
       console.log(`[minerd] UPDATE REQUIRED: v${n.currentVersion} -> v${n.latestVersion ?? '?'} - ${n.notice ?? 'run the update command'}`);
-    } else {
+    } else if (n.available && n.latestVersion) {
       console.log(`[minerd] update available: v${n.currentVersion} -> v${n.latestVersion} (press 'u' for the command)`);
+    } else if (n.notice) {
+      console.log(`[minerd] notice: ${n.notice}`);
     }
   }
 }

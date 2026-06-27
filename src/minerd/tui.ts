@@ -217,8 +217,10 @@ export class DashboardReporter implements MinerReporter {
 
   private showUpdateCommand(): void {
     const n = getLastNotice();
-    if (!n) {
-      this.event('info', `you're on the latest version (v${VERSION})`);
+    // Only offer the update command when there is a real update (behind / 426
+    // gate). A bare notice while current must not tell the user to "git pull".
+    if (!n || !(n.available || n.mustUpdate)) {
+      this.event('info', n?.notice ?? `you're on the latest version (v${VERSION})`);
       return;
     }
     const notes = (n as UpdateNotice & { releaseNotesUrl?: string }).releaseNotesUrl;
@@ -608,10 +610,15 @@ export class DashboardReporter implements MinerReporter {
       const label = this.smart_.mode === 'considerate' ? 'Considerate' : 'Max';
       const easing = this.smart_.clamped ? ` ${YELLOW}· easing off (leaving CPU for your work)${RESET}` : '';
       lines.push(row(`${DIM}auto throttle${RESET} ${BOLD}${pct}${RESET} ${DIM}${label}${RESET}${easing}`));
+    } else if (s) {
+      // Manual mode: confirm the configured throttle so the user can see their
+      // setting is applied. Any decline below this is the OS/thermals, not the miner.
+      lines.push(row(`${DIM}throttle${RESET} ${BOLD}${Math.round(s.throttle * 100)}%${RESET} ${DIM}· manual${RESET}`));
     }
+    if (s?.backendNote) lines.push(row(`${YELLOW}${s.backendNote}${RESET}`));
 
     // ── update banner ──
-    if (this.updateNotice_) {
+    if (this.updateNotice_ && this.updateNoticeText(this.updateNotice_)) {
       const color = this.updateNotice_.mustUpdate ? RED : YELLOW;
       lines.push(row(`${BOLD}${color}${this.updateNoticeText(this.updateNotice_)}${RESET}`));
       lines.push(sep);
@@ -733,7 +740,12 @@ export class DashboardReporter implements MinerReporter {
     if (n.mustUpdate) {
       return `UPDATE REQUIRED: v${n.currentVersion} -> v${n.latestVersion ?? '?'} - ${n.notice ?? 'run the update command'}`;
     }
-    return `update available: v${n.currentVersion} -> v${n.latestVersion} (press 'u' for the command)`;
+    // Only show the version arrow when genuinely behind; otherwise surface the
+    // pool's notice text (e.g. a fork heads-up) without a misleading "update".
+    if (n.available && n.latestVersion) {
+      return `update available: v${n.currentVersion} -> v${n.latestVersion} (press 'u' for the command)`;
+    }
+    return n.notice ?? '';
   }
 
   private kpiRows(): string[] {
@@ -757,7 +769,10 @@ export class DashboardReporter implements MinerReporter {
       const pct = `${Math.round(this.smart_.throttle * 100)}%`;
       const easing = this.smart_.clamped ? ' (easing off)' : '';
       lines.push(this.clampVisible(`${DIM}auto ${RESET}${pct}${easing}`, cols));
+    } else if (s) {
+      lines.push(this.clampVisible(`${DIM}thr ${RESET}${Math.round(s.throttle * 100)}% ${DIM}manual${RESET}`, cols));
     }
+    if (s?.backendNote) lines.push(this.clampVisible(`${YELLOW}${s.backendNote}${RESET}`, cols));
     if (!this.synced_ && this.syncTarget > 0) {
       const pct = Math.floor((Math.min(this.syncCurrent, this.syncTarget) / this.syncTarget) * 100);
       lines.push(`${DIM}sync ${RESET}${group(this.syncCurrent)}/${group(this.syncTarget)} ${pct}%`);
@@ -772,7 +787,7 @@ export class DashboardReporter implements MinerReporter {
       lines.push(`${DIM}fnd ${RESET}${group(this.foundCount)}`);
     }
     lines.push(`${DIM}hgt ${RESET}${group(this.height)}`);
-    if (this.updateNotice_) {
+    if (this.updateNotice_ && this.updateNoticeText(this.updateNotice_)) {
       const color = this.updateNotice_.mustUpdate ? RED : YELLOW;
       lines.push(this.clampVisible(`${color}${this.updateNoticeText(this.updateNotice_)}${RESET}`, cols));
     }

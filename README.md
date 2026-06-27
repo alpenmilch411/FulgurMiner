@@ -63,7 +63,15 @@ cd FulgurMiner
 npm install
 ```
 
-That's the whole setup — no compilers, no system libraries, nothing to edit by hand.
+That's the whole setup for the default engine — no compilers, no system libraries, nothing to edit by hand. *(The optional, faster **native** engine needs the Rust toolchain — see [Native engine](#native-engine). It's not required.)*
+
+> **No git?** You don't need it — on the repo page click **Code → Download ZIP**, unpack the folder, then open a terminal inside it and run `npm install` / `npm start`.
+>
+> **Windows (PowerShell):** if `npm` fails with *"running scripts is disabled on this system,"* either use **Command Prompt (cmd)** instead, or allow local scripts. `CurrentUser` is a persistent per-user setting; use `-Scope Process` if you'd rather only affect the current terminal:
+> ```powershell
+> Set-ExecutionPolicy -Scope CurrentUser RemoteSigned   # or: -Scope Process (this session only)
+> ```
+> An `npm warn allow-scripts … esbuild …` notice during install is **harmless** — esbuild is the build tool that runs the TypeScript; the install still completes.
 
 ## 2. Start
 
@@ -110,6 +118,10 @@ When a Smart mode is on, the **Throttle** row shows `(auto)` — the miner owns 
 Open the BrowserCoin app, go to **Wallet**, and click **Copy** under *"Your address"*. It's a 64-character string of letters and numbers (0–9, a–f). Paste that into FulgurMiner when asked. Rewards are paid straight to it.
 
 > You only ever share your **address** — it's public, like an email address. FulgurMiner never needs your private key, and you should never paste a private key anywhere.
+
+## Running on multiple machines
+
+You can run FulgurMiner on as many machines as you like, **all set to the same wallet address** — there's nothing to configure beyond pasting the same address on each. In pool mode every machine registers as its own worker and the pool credits all of their shares to that one address, so your hashrate and earnings simply add up. (Solo works the same way — each machine mines independently to the address.)
 
 ## The dashboard
 
@@ -213,7 +225,7 @@ MINER_PUBKEY=<your-address> MINER_POOL=https://pool.example.org npm run mine
 MINER_PUBKEY=<your-address> npm run mine:dryrun
 ```
 
-The update check is quiet and best-effort: it reads the version signal from the pool and fails silently offline. The miner runs from source, so updating is a `git pull && npm install`. Turn the check off with **Check for updates → off** or `FULGUR_NO_UPDATE_CHECK=1`. FulgurMiner never runs an update for you.
+The update check is quiet and best-effort: it reads the latest version from the project's [GitHub releases](https://github.com/alpenmilch411/FulgurMiner/releases) (plus the pool's notice / required-version signal) and fails silently offline. The miner runs from source, so updating is a `git pull && npm install`. Turn the check off with **Check for updates → off** or `FULGUR_NO_UPDATE_CHECK=1`. FulgurMiner never runs an update for you.
 
 ## Native engine
 
@@ -223,12 +235,18 @@ By default FulgurMiner uses a portable **wasm** engine that runs anywhere Node r
 - offers to **build it now** (a one-time `cargo build --release`, ~a minute) if you have the [Rust toolchain](https://rustup.rs);
 - otherwise prints the build command and keeps mining with wasm — nothing blocks.
 
+**Getting Rust (one-time).** Install it from **[rustup.rs](https://rustup.rs)**, then **open a new terminal** so `cargo` is on your PATH before building. The build also needs a C toolchain:
+
+- **Windows** — when you run `rustup-init.exe` it offers to install the **MSVC build tools** (via the Visual Studio Installer); accept that. Then reopen the terminal in the FulgurMiner folder.
+- **macOS** — if the build reports a missing linker, install the Command Line Tools: `xcode-select --install`.
+- **Linux** — install a build toolchain, e.g. `build-essential` (Debian/Ubuntu).
+
 ```bash
 cd native/brc-pow && cargo build --release && cd ../..
 MINER_NATIVE=1 npm start
 ```
 
-The status bar shows `native` vs `wasm` so you can confirm which is active.
+The status bar shows `native` vs `wasm` so you can confirm which is active. If native was selected but isn't built yet, the dashboard says so and keeps mining with wasm.
 
 ## Troubleshooting
 
@@ -238,6 +256,9 @@ The status bar shows `native` vs `wasm` so you can confirm which is active.
 - **`npm start` errors about the Node version.** You need Node 20.6+. Check `node --version`.
 - **Fans spin up / the laptop gets hot.** Use **Smart: Considerate**, or in Manual lower the **Throttle** (e.g. `0.4`) or reduce **Workers**.
 - **The pool says syncing / busy.** Leave it running — the miner retries with backoff and resumes when the pool is ready. After a couple of minutes it reminds you that **s → Where to mine → Solo** is available if you'd rather switch.
+- **Windows: hashrate drops when the window isn't focused.** Windows power-throttles background apps to save energy. Set **Power mode** to *Best Performance* (Settings → System → Power & battery), plug in a laptop, or just keep the miner window in the foreground.
+- **Windows: a "Windows protected your PC" (SmartScreen) prompt** for the native engine. The `brc-pow` binary you build locally is unsigned. It's the engine you just compiled — choose *More info → Run anyway*, or stick with the wasm engine.
+- **Windows: the menu looks garbled.** Use **Windows Terminal** or **PowerShell 7** (the arrow-key dashboard needs modern ANSI support), or run plain mode with `npm start -- --no-tui`.
 - **Reconfigure from scratch.** Delete `.env.local` and run `npm start` again, or open settings (**s**, or `npm run settings`).
 
 ## How it works

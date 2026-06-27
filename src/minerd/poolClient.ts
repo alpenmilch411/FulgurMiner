@@ -350,14 +350,28 @@ export async function runPoolClient(
   // would crash-loop, so probe once and fall back to wasm if missing/outdated.
   const nativeSelected = currentEngine(process.env.MINER_NATIVE) === 'native';
   const useNative = nativeSelected && existsSync(NATIVE_BIN) && nativeContinuousOk();
+  // Surface the fallback PERSISTENTLY (via status.backendNote, rendered by both
+  // reporters) instead of a scrolling event, so the user sees WHY native isn't
+  // running without quitting. Distinguish "not built" (needs Rust) from "outdated".
+  let backendNote: string | undefined;
   if (nativeSelected && !useNative) {
-    reporter.event('warn', '[pool-miner] native engine selected but binary missing/outdated — rebuild: cd native/brc-pow && cargo build --release. Using wasm.');
+    backendNote = existsSync(NATIVE_BIN)
+      ? 'native engine outdated — rebuild: cd native/brc-pow && cargo build --release; using wasm'
+      : 'native engine not built — install Rust (https://rustup.rs) and build it; using wasm';
+  }
+  if (status) {
+    // Correct the passed-in status to what the pool gate actually resolved: the
+    // launcher set backend from the engine selection, but nativeContinuousOk() can
+    // demote a present-but-stale binary to wasm here.
+    status.backend = useNative ? 'native' : 'wasm';
+    status.backendNote = backendNote;
   }
 
   reporter.status(status ?? {
     mode: 'pool',
     target: poolUrl,
     backend: useNative ? 'native' : 'wasm',
+    backendNote,
     workers,
     throttle,
     address: payoutAddress,

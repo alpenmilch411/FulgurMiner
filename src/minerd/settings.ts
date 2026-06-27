@@ -297,6 +297,8 @@ export async function runSettings(): Promise<void> {
 // load .env.local first so the menu shows the user's saved values.
 import { fileURLToPath } from 'node:url';
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  const { assertNodeVersion } = await import('./version.js');
+  assertNodeVersion();
   const { loadEnvLocal } = await import('./envLocal.js');
   loadEnvLocal();
   await runSettings();
