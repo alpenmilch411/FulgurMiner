@@ -1,0 +1,14 @@
+.git
+.gitignore
+.DS_Store
+node_modules
+npm-debug.log*
+*.log
+.env
+.env.*
+!.env.example
+pools.json
+.fulgurminer
+native/brc-pow/target
+coverage
+dist
