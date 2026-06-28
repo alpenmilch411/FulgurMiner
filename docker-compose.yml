@@ -2,7 +2,7 @@ services:
   fulgurminer:
     build:
       context: .
-    image: ghcr.io/alpenmilch411/fulgurminer:latest
+    image: ghcr.io/alpenmilch411/fulgurminer:${FULGUR_IMAGE_TAG:-v0.2.4}
     restart: unless-stopped
     init: true
     environment:

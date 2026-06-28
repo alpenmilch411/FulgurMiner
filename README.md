@@ -252,23 +252,20 @@ MINER_PUBKEY=<your-address> docker compose up --build
 If you do not have the repo cloned:
 
 ```bash
-docker pull ghcr.io/alpenmilch411/fulgurminer:latest
+docker pull ghcr.io/alpenmilch411/fulgurminer:v0.2.4
 docker run --rm -it --init \
   -e MINER_PUBKEY=<your-address> \
   -v fulgurminer-data:/data \
-  ghcr.io/alpenmilch411/fulgurminer:latest
+  ghcr.io/alpenmilch411/fulgurminer:v0.2.4
 ```
 
 Defaults: FulgurPool, native engine, full throttle, and all available CPU cores. Override with the same env vars as a normal run.
 
 ### Publish image
 
-For maintainers:
+For maintainers, run the **Publish Docker Image** workflow from GitHub Actions and enter the version tag, for example `v0.2.4`.
 
-```bash
-docker build -t ghcr.io/alpenmilch411/fulgurminer:latest .
-docker push ghcr.io/alpenmilch411/fulgurminer:latest
-```
+It publishes `ghcr.io/alpenmilch411/fulgurminer:<version>` and a matching `sha-...` tag.
 
 ## Native engine
 
