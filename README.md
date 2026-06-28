@@ -239,14 +239,17 @@ The update check is quiet and best-effort: it reads the latest version from the 
 
 Docker runs FulgurMiner with plain logs, persisted state, and the native engine built in. Install Docker from [docs.docker.com/get-docker](https://docs.docker.com/get-docker/).
 
-### From a git checkout
+### Run with Docker
+
+If you have the repo cloned:
 
 ```bash
+git checkout main
 git pull
 MINER_PUBKEY=<your-address> docker compose up --build
 ```
 
-### Without git
+If you do not have the repo cloned:
 
 ```bash
 docker pull ghcr.io/alpenmilch411/fulgurminer:latest
@@ -257,6 +260,15 @@ docker run --rm -it --init \
 ```
 
 Defaults: FulgurPool, native engine, full throttle, and all available CPU cores. Override with the same env vars as a normal run.
+
+### Publish image
+
+For maintainers:
+
+```bash
+docker build -t ghcr.io/alpenmilch411/fulgurminer:latest .
+docker push ghcr.io/alpenmilch411/fulgurminer:latest
+```
 
 ## Native engine
 
