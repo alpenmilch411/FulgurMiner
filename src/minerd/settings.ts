@@ -12,11 +12,12 @@ import { stdin as input, stdout as output } from 'node:process';
 import {
   readEnvFile, persist, readExtraPools, type PoolEntry,
 } from './envLocal.js';
-import { FULGURPOOL_NAME } from './config.js';
+import { FULGURPOOL_NAME, REPO_URL } from './config.js';
 import {
   THROTTLE_PRESETS, throttleLabel, clampWorkers, MAX_WORKERS, DEFAULT_WORKERS, currentEngine,
   currentMode, modeLabel, MODE_OPTIONS, type SmartMode,
 } from './selectors.js';
+import { nativeEngineAvailable } from './engine.js';
 
 const HEX64 = /^[0-9a-f]{64}$/i;
 
@@ -217,9 +218,14 @@ async function editThrottle(rl: RL): Promise<void> {
 }
 
 async function editEngine(rl: RL): Promise<void> {
+  // Mirror the arrow-menu behavior: if the Rust toolchain isn't installed, native
+  // can't run, so flag it rather than letting the choice silently fall back to wasm.
+  const nativeOk = nativeEngineAvailable();
   console.log('\n  Mining engine:');
   console.log('    [1] wasm   — portable, runs anywhere Node runs (default)');
-  console.log('    [2] native — Rust engine, faster (needs a one-time build)');
+  console.log(nativeOk
+    ? '    [2] native — Rust engine, faster (needs a one-time build)'
+    : '    [2] native — Rust engine, faster — NEEDS RUST (not installed)');
   console.log('    [Enter] Cancel\n');
   for (;;) {
     const v = (await rl.question('  Choose: ')).trim().toLowerCase();
@@ -233,7 +239,13 @@ async function editEngine(rl: RL): Promise<void> {
     if (v === '2' || v === 'native') {
       persist({ MINER_NATIVE: '1' });
       process.env.MINER_NATIVE = '1';
-      console.log('  Engine set to native. It is built on first start if needed (see README).\n');
+      if (nativeOk) {
+        console.log('  Engine set to native. It is built on first start if needed (see README).\n');
+      } else {
+        console.log("  Engine set to native, but the Rust toolchain isn't installed — mining will use");
+        console.log('  the portable WASM engine until you install it. Install Rust from https://rustup.rs,');
+        console.log(`  then restart. Step-by-step in the repo README: ${REPO_URL}\n`);
+      }
       return;
     }
     console.log('  Enter 1 (wasm) or 2 (native), or Enter to cancel.\n');
@@ -297,6 +309,8 @@ export async function runSettings(): Promise<void> {
 // load .env.local first so the menu shows the user's saved values.
 import { fileURLToPath } from 'node:url';
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  const { installCrashGuard } = await import('./crashGuard.js');
+  installCrashGuard();
   const { assertNodeVersion } = await import('./version.js');
   assertNodeVersion();
   const { loadEnvLocal } = await import('./envLocal.js');

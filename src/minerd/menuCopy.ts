@@ -9,6 +9,16 @@
 // type-only (erased by the compiler), so there is no import cycle.
 import type { RowKind } from './menu.js';
 import type { SmartMode } from './selectors.js';
+import { REPO_URL } from './config.js';
+
+/**
+ * Shown (in red) in the right "About" pane when Native is selected but the Rust
+ * toolchain isn't installed — so the selection would silently fall back to wasm.
+ * Explains the effect and the fix instead of leaving the user wondering why
+ * native "didn't take".
+ */
+export const NATIVE_NEEDS_RUST =
+  `Native (Rust) is faster, but the Rust toolchain isn't installed on this machine — so this stays on the portable WASM engine for now. To enable native: install Rust from https://rustup.rs, then restart FulgurMiner. Step-by-step in the repo README: ${REPO_URL}`;
 
 /**
  * One short explanation per main-menu row, shown in the right "About" pane when

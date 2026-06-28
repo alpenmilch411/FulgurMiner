@@ -30,6 +30,17 @@ export const NATIVE_DIR = resolve(__dirname, '../../native/brc-pow');
 /** The exact command a user runs to build the native engine by hand. */
 export const BUILD_CMD = 'cd native/brc-pow && cargo build --release';
 
+/**
+ * True when the native engine can actually run on this machine: either a binary
+ * is already built, OR cargo is on PATH to build it on first start. When false,
+ * choosing native silently falls back to wasm — the UI surfaces a "needs Rust"
+ * notice instead of letting the selection do nothing. (Spawns `cargo --version`
+ * once via hasCargo(); callers should cache the result, not call it per render.)
+ */
+export function nativeEngineAvailable(): boolean {
+  return existsSync(NATIVE_BIN) || hasCargo();
+}
+
 /** True when `cargo` is callable on PATH. */
 export function hasCargo(): boolean {
   try {

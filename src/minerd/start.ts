@@ -26,6 +26,7 @@ import { resolveEngine } from './engine.js';
 import { currentEngine } from './selectors.js';
 import { checkForUpdate } from './updateCheck.js';
 import { assertNodeVersion } from './version.js';
+import { installCrashGuard } from './crashGuard.js';
 
 const HEX64 = /^[0-9a-f]{64}$/i;
 
@@ -137,12 +138,12 @@ function buildStatus(cfg: ReturnType<typeof loadConfig>): ReporterStatus {
 }
 
 /** Run one mining session with the TUI dashboard. Resolves with why it stopped. */
-async function runDashboardSession(warm?: WarmChain): Promise<{ reason: 'menu' | 'quit'; warm?: WarmChain }> {
+async function runDashboardSession(warm?: WarmChain): Promise<{ reason: 'menu' | 'quit' | 'fallback'; warm?: WarmChain }> {
   const cfg = loadConfig();
   const status = buildStatus(cfg);
   const ac = new AbortController();
   // Boxed so TS doesn't narrow it to its initializer across the keypress closures.
-  const control: { reason: 'menu' | 'quit' } = { reason: 'quit' };
+  const control: { reason: 'menu' | 'quit' | 'fallback' } = { reason: 'quit' };
 
   // Construct the dashboard guarded: if the constructor throws AFTER it has
   // entered the alternate screen / hidden the cursor but before its own teardown
@@ -156,6 +157,9 @@ async function runDashboardSession(warm?: WarmChain): Promise<{ reason: 'menu' |
       // `s` returns to the arrow menu (the settings screen); `q`/Ctrl+C quits.
       onSettings: () => { control.reason = 'menu'; ac.abort(); },
       onQuit: () => { control.reason = 'quit'; ac.abort(); },
+      // The dashboard's terminal went away (EPIPE) — end this session and let the
+      // launcher continue in plain mode instead of crashing.
+      onTerminalLost: () => { control.reason = 'fallback'; ac.abort(); },
     });
   } catch (e) {
     // Best-effort terminal restore (show cursor + leave alt-screen) before
@@ -211,6 +215,10 @@ async function runPlainSession(): Promise<void> {
 }
 
 async function main(): Promise<void> {
+  // Last-resort guard: turn an otherwise-silent uncaught error (e.g. a write
+  // EPIPE from a dying console, or any stray async throw) into a restored
+  // terminal + a readable message instead of a vanished window.
+  installCrashGuard();
   assertNodeVersion();
   loadEnvLocal();
 
@@ -252,7 +260,7 @@ async function main(): Promise<void> {
         const tin = process.stdin as NodeJS.ReadStream & { isRaw?: boolean };
         if (tin.isTTY && tin.isRaw) tin.setRawMode(false);
       } catch { /* not a TTY / setRawMode unavailable — nothing to undo */ }
-      let reason: 'menu' | 'quit';
+      let reason: 'menu' | 'quit' | 'fallback';
       try {
         const res = await runDashboardSession(warm);
         reason = res.reason;
@@ -268,6 +276,17 @@ async function main(): Promise<void> {
         warm = undefined;
       }
       if (reason === 'quit') break;
+      if (reason === 'fallback') {
+        // The dashboard couldn't write to this terminal (e.g. an EPIPE on a
+        // Windows console). Switch to plain (no-TUI) mode for the rest of this
+        // process: it does no alternate-screen work and writes simple lines, so
+        // it survives consoles the full-screen dashboard can't drive. One-way —
+        // we don't bounce back to the dashboard on a terminal we know is broken.
+        process.env.FULGUR_TUI = '0';
+        console.log("\n  The live dashboard isn't supported by this terminal — switching to plain text mode.\n");
+        await runPlainSession();
+        return;
+      }
       // reason === 'menu' → loop back to the arrow menu (settings).
     }
     return;

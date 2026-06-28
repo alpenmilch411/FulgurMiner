@@ -21,10 +21,11 @@ import { FULGURPOOL_NAME, FULGURPOOL_PAGE, REPO_URL } from './config.js';
 import { link, STRIP_OSC8 } from './link.js';
 import {
   THROTTLE_PRESETS, throttleLabel, throttleIndex, throttleNum,
-  clampWorkers, MAX_WORKERS, DEFAULT_WORKERS, workersDisplay, currentEngine,
+  clampWorkers, MAX_WORKERS, DEFAULT_WORKERS, workersDisplay, currentEngine, engineRowValue,
   MODE_OPTIONS, currentMode, modeIndex, modeLabel,
 } from './selectors.js';
-import { ROW_EXPLAIN, modeExplain, whereExplain } from './menuCopy.js';
+import { ROW_EXPLAIN, modeExplain, whereExplain, NATIVE_NEEDS_RUST } from './menuCopy.js';
+import { nativeEngineAvailable } from './engine.js';
 
 // --- ANSI helpers (kept local so the menu has no import coupling to tui.ts) --
 const ESC = '\x1b[';
@@ -121,6 +122,11 @@ export class StartMenu {
   private rawModeOn = false;
   private closed = false;
   private resolveRun: ((r: MenuResult) => void) | null = null;
+  // Whether the native engine can actually run here (a built binary, or cargo to
+  // build it on first start). Computed ONCE — nativeEngineAvailable() spawns
+  // `cargo --version`, so it must not be called per render. Drives the greyed
+  // "native (needs Rust)" value + the red "install Rust" About-pane notice.
+  private readonly nativeAvailable = nativeEngineAvailable();
 
   private readonly onKeypress = (str: string, key: readline.Key): void => { this.handleKey(str, key); };
   private readonly onResize = (): void => this.render();
@@ -584,7 +590,16 @@ export class StartMenu {
 
   private engineValue(): string {
     const e = currentEngine(process.env.MINER_NATIVE);
-    return e === 'native' ? 'native  (faster)' : 'wasm  (portable)';
+    const val = engineRowValue(e, this.nativeAvailable);
+    // Grey it out when native is chosen but can't run (no Rust) — the matching
+    // red About-pane notice (see buildMain) explains how to enable it.
+    return e === 'native' && !this.nativeAvailable ? `${DIM}${val}${RESET}` : val;
+  }
+
+  /** True when the Engine row is on native but native can't run here (no Rust).
+   *  Drives the greyed value + the red "install Rust" notice. */
+  private nativeUnavailableSelected(): boolean {
+    return currentEngine(process.env.MINER_NATIVE) === 'native' && !this.nativeAvailable;
   }
 
   private updateCheckValue(): string {
@@ -686,14 +701,14 @@ export class StartMenu {
    * and appends the hint line below both. Returns the framed lines, or null when
    * the terminal is too narrow for two panes (caller falls back to one column).
    */
-  private twoPane(cols: number, leftTitle: string, leftBodyFn: (inner: number) => string[], explain: string, hint: string): string[] | null {
+  private twoPane(cols: number, leftTitle: string, leftBodyFn: (inner: number) => string[], explain: string, hint: string, explainStyle: string = DIM): string[] | null {
     if (cols < TWO_PANE_MIN) return null;
     const gap = 1;
     const leftOuter = Math.min(46, Math.max(34, Math.floor((cols - 1) / 2)));
     const rightOuter = (cols - 1) - leftOuter - gap;
     if (rightOuter < 26) return null;
     const leftBody = leftBodyFn(leftOuter - 2);
-    const right = this.wrap(explain, rightOuter - 3).map((ln) => `${DIM}${ln}${RESET}`);
+    const right = this.wrap(explain, rightOuter - 3).map((ln) => `${explainStyle}${ln}${RESET}`);
     while (right.length < leftBody.length) right.push('');
     const leftBox = this.frame(leftOuter - 2, leftTitle, leftBody, '');
     const rightBox = this.frame(rightOuter - 2, 'About', right, '');
@@ -785,13 +800,18 @@ export class StartMenu {
   /** Main menu — two-pane (list + About) when wide, single column with the
    *  explanation inline when narrow. */
   private buildMain(cols: number): string[] {
-    const explain = ROW_EXPLAIN[this.currentRow().kind] ?? '';
-    const paned = this.twoPane(cols, 'FulgurMiner', (inner) => this.buildMainRows(inner), explain, this.mainHint());
+    // On the Engine row, when native is selected but Rust isn't installed, replace
+    // the normal dim "About" text with a RED notice explaining the wasm fallback
+    // and how to enable native (rustup.rs + repo README).
+    const onEngineNeedsRust = this.currentRow().kind === 'engine' && this.nativeUnavailableSelected();
+    const explain = onEngineNeedsRust ? NATIVE_NEEDS_RUST : (ROW_EXPLAIN[this.currentRow().kind] ?? '');
+    const explainStyle = onEngineNeedsRust ? RED : DIM;
+    const paned = this.twoPane(cols, 'FulgurMiner', (inner) => this.buildMainRows(inner), explain, this.mainHint(), explainStyle);
     if (paned) return paned;
     const inner = this.mainWidth(cols) - 2;
     const body = this.buildMainRows(inner);
     body.push('');
-    for (const ln of this.wrap(explain, inner - 1)) body.push(`${DIM}${ln}${RESET}`);
+    for (const ln of this.wrap(explain, inner - 1)) body.push(`${explainStyle}${ln}${RESET}`);
     return this.frame(inner, 'FulgurMiner', body, this.mainHint());
   }
 

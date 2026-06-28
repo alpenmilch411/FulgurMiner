@@ -94,6 +94,17 @@ export function currentEngine(raw: string | undefined): Engine {
   return raw && raw.trim() !== '' && raw.trim() !== '0' ? 'native' : 'wasm';
 }
 
+/**
+ * Display label for the Engine selector. `nativeAvailable` is whether the native
+ * engine can actually run here (a built binary or a cargo toolchain to build it);
+ * when it can't, native reads "(needs Rust)" so the UI can flag — rather than
+ * silently ignore — a native selection that would fall back to wasm.
+ */
+export function engineRowValue(engine: Engine, nativeAvailable: boolean): string {
+  if (engine === 'native') return nativeAvailable ? 'native  (faster)' : 'native  (needs Rust)';
+  return 'wasm  (portable)';
+}
+
 /** Smart mode options: off/manual, max throughput, or considerate auto-tuning. */
 export type SmartMode = 'off' | 'max' | 'considerate';
 

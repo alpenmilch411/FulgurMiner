@@ -45,6 +45,21 @@ const MIN_FRAME_COLS = 44;
 export interface DashboardCallbacks {
   onSettings: () => void;
   onQuit: () => void;
+  /** Fired when the dashboard's output terminal goes away mid-session (an EPIPE
+   *  on stdout — seen on some Windows consoles). The launcher should continue in
+   *  plain (no-TUI) mode rather than crash, since the dashboard can no longer
+   *  draw to this terminal. */
+  onTerminalLost?: () => void;
+}
+
+/** The slice of a writable terminal stream the dashboard touches. process.stdout
+ *  satisfies it; tests pass a fake so construction never hits the real terminal. */
+export interface DashboardOutput {
+  write(s: string): boolean;
+  on(event: string, listener: (...args: unknown[]) => void): unknown;
+  removeListener(event: string, listener: (...args: unknown[]) => void): unknown;
+  columns?: number;
+  rows?: number;
 }
 
 interface EventLine {
@@ -114,12 +129,26 @@ export class DashboardReporter implements MinerReporter {
   /** When true the full-screen help overlay is shown; any key closes it. */
   private showHelp = false;
   private readonly cbs: DashboardCallbacks;
+  private readonly out: DashboardOutput;
+  private outErrored = false;
   private readonly onKeypress = (str: string, key: readline.Key): void => this.handleKey(key, str);
   private readonly onResize = (): void => this.render();
   private readonly onProcExit = (): void => this.restoreTerminal();
+  // The output stream emits 'error' (e.g. write EPIPE when the console/pipe goes
+  // away) — with no listener Node treats that as an UNHANDLED error event and
+  // kills the process (on Windows the console window just vanishes). ANY error on
+  // this stream means we can no longer reliably draw, so restore the terminal and
+  // hand off to plain mode once, rather than crash or silently freeze.
+  private readonly onOutError = (): void => {
+    if (this.outErrored || this.closed) return;
+    this.outErrored = true;
+    this.restoreTerminal();
+    this.cbs.onTerminalLost?.();
+  };
 
-  constructor(cbs: DashboardCallbacks) {
+  constructor(cbs: DashboardCallbacks, out: DashboardOutput = process.stdout) {
     this.cbs = cbs;
+    this.out = out;
     // Register the signal/exit teardown handlers FIRST, before entering the
     // alternate screen. A SIGINT (or a throw that triggers `exit`) in the narrow
     // window between writing ALT_ON and wiring these listeners would otherwise
@@ -129,11 +158,14 @@ export class DashboardReporter implements MinerReporter {
     process.on('SIGINT', this.handleSigint);
     process.on('SIGTERM', this.handleSigint);
     process.on('exit', this.onProcExit);
-    process.stdout.on('resize', this.onResize);
+    this.out.on('resize', this.onResize);
+    // Wire the stream 'error' handler BEFORE the first write, so even an EPIPE on
+    // the very first frame is caught (graceful plain-mode fallback) not fatal.
+    this.out.on('error', this.onOutError as (...args: unknown[]) => void);
 
     // Enter the alternate screen + hide the cursor up front so the scrollback is
     // never polluted and the dashboard owns the whole viewport.
-    process.stdout.write(ALT_ON + CURSOR_HIDE + HOME + CLEAR_DOWN);
+    this.out.write(ALT_ON + CURSOR_HIDE + HOME + CLEAR_DOWN);
 
     // Wire keypresses ONLY when stdin is a real TTY. In a pipe (tests) there is
     // no raw mode, so we skip key handling but still render frames.
@@ -357,7 +389,8 @@ export class DashboardReporter implements MinerReporter {
     // A resize event firing between here and removeListener fires onResize →
     // render(), but render() early-returns on `closed`, so no work is scheduled
     // against a torn-down dashboard.
-    process.stdout.removeListener('resize', this.onResize);
+    this.out.removeListener('resize', this.onResize);
+    this.out.removeListener('error', this.onOutError as (...args: unknown[]) => void);
     process.removeListener('SIGINT', this.handleSigint);
     process.removeListener('SIGTERM', this.handleSigint);
     process.removeListener('exit', this.onProcExit);
@@ -372,7 +405,7 @@ export class DashboardReporter implements MinerReporter {
 
   /** Restore cursor + leave the alternate screen. Idempotent; safe on exit. */
   private restoreTerminal(): void {
-    try { process.stdout.write(CURSOR_SHOW + ALT_OFF); } catch { /* ignore */ }
+    try { this.out.write(CURSOR_SHOW + ALT_OFF); } catch { /* ignore */ }
   }
 
   private pushEvent(level: 'info' | 'warn' | 'error', msg: string): void {
@@ -392,8 +425,8 @@ export class DashboardReporter implements MinerReporter {
 
   private render(): void {
     if (this.closed) return;
-    const cols = Math.max(20, process.stdout.columns || 80);
-    const rows = Math.max(8, process.stdout.rows || 24);
+    const cols = Math.max(20, this.out.columns || 80);
+    const rows = Math.max(8, this.out.rows || 24);
     const lines = this.buildLines(cols);
 
     // Cursor home, then write each line padded to clear leftovers. We cap at the
@@ -405,7 +438,7 @@ export class DashboardReporter implements MinerReporter {
       if (i < max - 1) out += '\n';
     }
     out += CLEAR_DOWN; // wipe anything below the last line we wrote
-    process.stdout.write(out);
+    this.out.write(out);
   }
 
   /** Strip OSC 8 hyperlink wrappers AND CSI/SGR codes — both are zero-width. */
@@ -678,7 +711,7 @@ export class DashboardReporter implements MinerReporter {
       // Show the most recent events that fit, always keeping the footer
       // (separator + keys + bottom border = 3 lines) visible. Grows on tall
       // terminals, shrinks on short ones.
-      const rows = Math.max(8, process.stdout.rows || 24);
+      const rows = Math.max(8, this.out.rows || 24);
       const budget = Math.max(1, rows - 1 - lines.length - 3);
       for (const e of this.events.slice(-budget)) {
         const color = e.level === 'error' ? RED : e.level === 'warn' ? YELLOW : DIM;
