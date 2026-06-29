@@ -1,0 +1,488 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>FulgurMiner · Control Panel</title>
+<style>
+  :root{
+    --bg:#0b0e14; --panel:#121723; --panel2:#0f141e; --line:#1f2733;
+    --txt:#e6edf3; --dim:#8b97a7; --dim2:#5e6b7d;
+    --accent:#ffb02e; --accent2:#ff8c00;
+    --green:#34d27b; --amber:#ffb02e; --red:#ff5b5b; --blue:#4aa8ff;
+    --shadow:0 10px 40px rgba(0,0,0,.45);
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%}
+  body{
+    background:radial-gradient(1200px 700px at 80% -10%, #16202f 0%, var(--bg) 55%);
+    color:var(--txt); font:14px/1.45 -apple-system,BlinkMacSystemFont,"SF Pro Text",Segoe UI,Roboto,sans-serif;
+    -webkit-font-smoothing:antialiased; padding:28px 22px 40px;
+  }
+  .wrap{max-width:1080px;margin:0 auto}
+  header{display:flex;align-items:center;gap:14px;margin-bottom:22px}
+  .logo{width:40px;height:40px;border-radius:11px;
+    background:linear-gradient(135deg,var(--accent),var(--accent2));
+    display:grid;place-items:center;font-size:22px;box-shadow:0 6px 18px rgba(255,140,0,.35)}
+  h1{font-size:19px;margin:0;letter-spacing:.2px;font-weight:650}
+  .sub{color:var(--dim);font-size:12px;margin-top:2px}
+  .grow{flex:1}
+  .statuspill{display:flex;align-items:center;gap:9px;background:var(--panel);
+    border:1px solid var(--line);padding:8px 14px;border-radius:999px;font-weight:600}
+  .dot{width:11px;height:11px;border-radius:50%;background:var(--dim2);transition:.3s}
+  .dot.mining{background:var(--green);box-shadow:0 0 0 4px rgba(52,210,123,.18)}
+  .dot.syncing{background:var(--amber);box-shadow:0 0 0 4px rgba(255,176,46,.18);animation:pulse 1.1s infinite}
+  .dot.error{background:var(--red);box-shadow:0 0 0 4px rgba(255,91,91,.18)}
+  .dot.idle{background:var(--dim2)}
+  @keyframes pulse{50%{opacity:.4}}
+
+  .panel{background:linear-gradient(180deg,var(--panel),var(--panel2));
+    border:1px solid var(--line);border-radius:16px;box-shadow:var(--shadow)}
+  .pad{padding:20px 22px}
+
+  /* Top control row */
+  .toprow{display:flex;gap:18px;align-items:stretch;margin-bottom:18px;flex-wrap:wrap}
+  .toggle-card{display:flex;align-items:center;gap:20px;flex:1;min-width:320px}
+  .bigtoggle{position:relative;width:118px;height:60px;border-radius:999px;cursor:pointer;
+    background:#1c2433;border:1px solid var(--line);transition:.25s;flex:none}
+  .bigtoggle .knob{position:absolute;top:5px;left:5px;width:50px;height:50px;border-radius:50%;
+    background:#3a4456;transition:.28s cubic-bezier(.5,1.6,.5,1);display:grid;place-items:center;
+    font-size:19px;color:#0b0e14;font-weight:800}
+  .bigtoggle.on{background:linear-gradient(135deg,var(--green),#1fa85e);border-color:#1fa85e}
+  .bigtoggle.on .knob{left:63px;background:#fff}
+  .bigtoggle.busy{opacity:.55;pointer-events:none}
+  .toggle-meta .lbl{font-size:12px;color:var(--dim);text-transform:uppercase;letter-spacing:.8px}
+  .toggle-meta .val{font-size:26px;font-weight:750;margin-top:2px}
+  .toggle-meta .hint{font-size:12px;color:var(--dim);margin-top:3px}
+
+  /* Estimate card */
+  .est{flex:1;min-width:320px;display:flex;flex-direction:column;justify-content:center}
+  .est .cap{font-size:12px;color:var(--dim);text-transform:uppercase;letter-spacing:.8px;margin-bottom:7px}
+  .est .big{font-size:30px;font-weight:760;color:var(--accent);letter-spacing:.3px}
+  .est .row{display:flex;gap:26px;margin-top:8px;flex-wrap:wrap}
+  .est .row div span{display:block}
+  .est .k{font-size:11px;color:var(--dim2);text-transform:uppercase;letter-spacing:.6px}
+  .est .v{font-size:15px;font-weight:650;margin-top:2px}
+
+  /* Metric cards */
+  .metrics{display:grid;grid-template-columns:repeat(6,1fr);gap:12px;margin-bottom:18px}
+  .metric{background:var(--panel);border:1px solid var(--line);border-radius:13px;padding:14px 14px}
+  .metric .k{font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.7px}
+  .metric .v{font-size:22px;font-weight:730;margin-top:7px;font-variant-numeric:tabular-nums}
+  .metric .u{font-size:11px;color:var(--dim2);margin-left:3px;font-weight:500}
+  .metric.hl .v{color:var(--accent)}
+  @media(max-width:900px){.metrics{grid-template-columns:repeat(3,1fr)}}
+  @media(max-width:560px){.metrics{grid-template-columns:repeat(2,1fr)}}
+
+  /* Settings + log columns */
+  .cols{display:grid;grid-template-columns:1.05fr 1fr;gap:18px}
+  @media(max-width:860px){.cols{grid-template-columns:1fr}}
+  .sect{margin-bottom:22px}
+  .sect:last-child{margin-bottom:0}
+  .sect h3{font-size:12px;color:var(--dim);text-transform:uppercase;letter-spacing:.9px;margin:0 0 11px}
+
+  .seg{display:flex;background:#0d121b;border:1px solid var(--line);border-radius:11px;padding:4px;gap:4px}
+  .seg button{flex:1;background:transparent;border:0;color:var(--dim);padding:9px 8px;border-radius:8px;
+    cursor:pointer;font-size:13px;font-weight:600;transition:.15s}
+  .seg button:hover{color:var(--txt)}
+  .seg button.active{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#1a1200;box-shadow:0 3px 12px rgba(255,140,0,.3)}
+
+  .slider-head{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:9px}
+  .slider-head .cur{font-weight:750;font-size:16px;color:var(--accent)}
+  input[type=range]{-webkit-appearance:none;width:100%;height:6px;border-radius:6px;
+    background:#1d2738;outline:none;cursor:pointer}
+  input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;height:20px;border-radius:50%;
+    background:linear-gradient(135deg,var(--accent),var(--accent2));border:3px solid #0b0e14;box-shadow:0 2px 8px rgba(0,0,0,.5)}
+  input[type=range]:disabled{opacity:.4;cursor:not-allowed}
+
+  .ticks{display:flex;justify-content:space-between;margin-top:10px;gap:2px}
+  .tick{flex:1;text-align:center;font-size:12px;color:var(--dim2);padding:5px 0;border-radius:7px;
+    cursor:pointer;font-variant-numeric:tabular-nums;transition:.12s;border:1px solid transparent}
+  .tick:hover{color:var(--txt);background:#161d29}
+  .tick.on{color:#1a1200;background:linear-gradient(135deg,var(--accent),var(--accent2));font-weight:750}
+
+  .wallet{display:flex;gap:8px;align-items:center}
+  .wallet code{flex:1;background:#0d121b;border:1px solid var(--line);border-radius:9px;padding:9px 11px;
+    font:12px/1.3 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .balcard{display:flex;align-items:baseline;gap:10px;margin-bottom:10px;
+    background:#0d121b;border:1px solid var(--line);border-radius:11px;padding:13px 15px}
+  .balcard .bal{font-size:28px;font-weight:780;color:var(--green);letter-spacing:.3px;font-variant-numeric:tabular-nums}
+  .balcard .bu{font-size:13px;color:var(--dim);font-weight:600}
+  .balcard .bsub{margin-left:auto;font-size:11px;color:var(--dim2);text-align:right;line-height:1.4}
+  .textin{width:100%;background:#0d121b;border:1px solid var(--line);border-radius:9px;padding:9px 11px;
+    color:var(--txt);font:13px/1.3 -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;outline:none}
+  .textin.mono{flex:1;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
+  .textin:focus{border-color:var(--accent)}
+  .textin.invalid{border-color:var(--red)}
+  .btn{background:linear-gradient(135deg,var(--accent),var(--accent2));color:#1a1200;border:0;border-radius:9px;
+    padding:9px 15px;font-weight:700;cursor:pointer;font-size:13px;white-space:nowrap}
+  .btn:disabled{opacity:.4;cursor:default}
+
+  .log{background:#080b11;border:1px solid var(--line);border-radius:13px;height:430px;overflow:auto;
+    padding:12px 14px;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;color:#aeb9c7}
+  .log .l{white-space:pre-wrap;word-break:break-word}
+  .log .l.found{color:var(--green);font-weight:600}
+  .log .l.err{color:var(--red)}
+  .log .l.gui{color:var(--blue)}
+  .log .l.warn{color:var(--amber)}
+
+  .note{font-size:12px;color:var(--dim);margin-top:14px;line-height:1.55}
+  .note b{color:var(--amber)}
+  .syncbar{height:6px;border-radius:6px;background:#1d2738;overflow:hidden;margin-top:10px;display:none}
+  .syncbar.show{display:block}
+  .syncbar i{display:block;height:100%;background:linear-gradient(90deg,var(--amber),var(--accent2));width:0;transition:.4s}
+  .footer{margin-top:18px;color:var(--dim2);font-size:11px;text-align:center}
+  a{color:var(--blue);text-decoration:none}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="logo">⚡</div>
+    <div>
+      <h1>FulgurMiner</h1>
+      <div class="sub">BrowserCoin · solo mining control panel</div>
+    </div>
+    <div class="grow"></div>
+    <div class="statuspill"><span class="dot idle" id="dot"></span><span id="statusText">idle</span></div>
+  </header>
+
+  <!-- Top row: toggle + estimate -->
+  <div class="toprow">
+    <div class="panel pad toggle-card">
+      <div class="bigtoggle" id="toggle"><div class="knob" id="knob">OFF</div></div>
+      <div class="toggle-meta">
+        <div class="lbl">Miner</div>
+        <div class="val" id="onoff">OFF</div>
+        <div class="hint" id="toggleHint">Tap to start mining</div>
+      </div>
+    </div>
+    <div class="panel pad est">
+      <div class="cap" id="estCap">Estimated yield (live)</div>
+      <div class="big" id="estDay">—</div>
+      <div class="row">
+        <div><span class="k" id="estK1">One block every</span><span class="v" id="estEvery">—</span></div>
+        <div><span class="k" id="estK2">Reward rate</span><span class="v" id="estBrc">—</span></div>
+      </div>
+      <div class="syncbar" id="syncbar"><i id="syncfill"></i></div>
+    </div>
+  </div>
+
+  <!-- Metric cards -->
+  <div class="metrics">
+    <div class="metric hl"><div class="k">Hashrate now</div><div class="v"><span id="hNow">0</span><span class="u">H/s</span></div></div>
+    <div class="metric"><div class="k">Avg</div><div class="v"><span id="hAvg">0</span><span class="u">H/s</span></div></div>
+    <div class="metric"><div class="k">Peak</div><div class="v"><span id="hPeak">0</span><span class="u">H/s</span></div></div>
+    <div class="metric"><div class="k">Block height</div><div class="v" id="mHeight">0</div></div>
+    <div class="metric"><div class="k">Difficulty</div><div class="v" id="mDiff" style="font-size:15px">—</div></div>
+    <div class="metric"><div class="k">Uptime</div><div class="v" id="mUptime" style="font-size:17px">—</div></div>
+  </div>
+  <div class="metrics" style="grid-template-columns:repeat(3,1fr)">
+    <div class="metric"><div class="k" id="mBlocksLabel">Blocks found</div><div class="v" id="mBlocks">0</div></div>
+    <div class="metric"><div class="k">Engine (active)</div><div class="v" id="mBackend" style="font-size:16px">—</div></div>
+    <div class="metric"><div class="k">Workers</div><div class="v" id="mWorkers">0<span class="u">cores</span></div></div>
+  </div>
+
+  <!-- Settings + log -->
+  <div class="cols">
+    <div class="panel pad">
+      <div class="sect">
+        <h3>Engine</h3>
+        <div class="seg" id="segEngine">
+          <button data-v="native">Native (Rust)</button>
+          <button data-v="wasm">WASM</button>
+        </div>
+      </div>
+      <div class="sect">
+        <h3>Mode</h3>
+        <div class="seg" id="segMode">
+          <button data-v="max">Smart&nbsp;Max</button>
+          <button data-v="considerate">Considerate</button>
+          <button data-v="manual">Manual</button>
+        </div>
+      </div>
+      <div class="sect">
+        <h3>Where to mine</h3>
+        <div class="seg" id="segPool">
+          <button data-v="solo">Solo</button>
+          <button data-v="pool">Pool</button>
+        </div>
+        <div id="poolUrlWrap" style="margin-top:10px;display:none">
+          <input type="text" id="poolUrlIn" class="textin" spellcheck="false" autocomplete="off" placeholder="https://pool.fulgurpool.xyz" />
+        </div>
+        <div class="note" id="poolNote">Solo mines whole blocks to your address (lumpy, high-variance). Pool pays steady shares — defaults to FulgurPool.</div>
+      </div>
+      <div class="sect">
+        <div class="slider-head"><h3 style="margin:0">Max CPU cores</h3><span class="cur" id="wkCur">0</span></div>
+        <input type="range" id="wkRange" min="1" max="10" step="1" value="9" />
+        <div class="ticks" id="wkTicks"></div>
+      </div>
+      <div class="sect">
+        <div class="slider-head"><h3 style="margin:0">Throttle (duty cycle)</h3><span class="cur" id="thCur">75%</span></div>
+        <input type="range" id="thRange" min="5" max="100" step="5" value="75" />
+        <div class="note" id="thNote" style="margin-top:8px">Only adjustable in <b>Manual</b> mode — Smart modes steer this automatically.</div>
+      </div>
+      <div class="sect">
+        <h3>Wallet balance</h3>
+        <div class="balcard">
+          <span class="bal" id="walBal">—</span><span class="bu">BRC</span>
+          <span class="bsub" id="walBalSub">start mining once<br>to sync balance</span>
+        </div>
+        <h3 style="margin-top:16px">Payout address</h3>
+        <div class="wallet">
+          <input type="text" id="walletIn" class="textin mono" spellcheck="false" autocomplete="off" placeholder="64-hex BrowserCoin address" />
+          <button id="walletSave" class="btn" disabled>Save</button>
+        </div>
+        <div class="note" id="walletNote">Rewards are paid to this address. Must be 64 hex characters.</div>
+      </div>
+    </div>
+
+    <div class="panel pad">
+      <div class="sect" style="margin-bottom:11px"><h3 style="margin:0">Activity log</h3></div>
+      <div class="log" id="log"></div>
+      <div class="note">
+        <b>Heads-up:</b> Smart&nbsp;Max runs every core hard — expect fan noise &amp; heat; keep airflow clear.
+        Solo rewards are <b>high-variance (Poisson)</b>: the est/day is a long-run average, not a schedule —
+        you may wait far longer (or get lucky sooner) than “one every Yh”.
+      </div>
+    </div>
+  </div>
+
+  <div class="footer">Bound to 127.0.0.1:7311 · settings persist to gui/state.json · system kept awake while panel is open (Windows / macOS / Linux)</div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let cfg = { engine:'native', mode:'max', workers:9, throttle:0.75, wallet:'', pool:'solo', poolUrl:'https://pool.fulgurpool.xyz' };
+let running = false, busy = false, cores = 10, booted = false, cfgInit = false;
+const HEX64 = /^[0-9a-f]{64}$/i;
+
+function fmt(n){ if(n==null) return '—'; n=Number(n);
+  if(n>=1e9) return (n/1e9).toFixed(2)+'G';
+  if(n>=1e6) return (n/1e6).toFixed(2)+'M';
+  if(n>=1e3) return (n/1e3).toFixed(2)+'k';
+  return Math.round(n).toLocaleString(); }
+function dur(s){ s=Math.max(0,s|0); const h=(s/3600)|0,m=((s%3600)/60)|0,x=s%60;
+  return (h?h+'h ':'')+(h||m?m+'m ':'')+x+'s'; }
+
+async function api(path, method='GET', body){
+  const o={method,headers:{'Content-Type':'application/json'}};
+  if(body) o.body=JSON.stringify(body);
+  const r=await fetch(path,o); return r.json();
+}
+
+function buildTicks(){
+  const t=$('wkTicks'); t.innerHTML='';
+  for(let i=1;i<=cores;i++){
+    const d=document.createElement('div');
+    d.className='tick'; d.textContent=i; d.dataset.v=i;
+    d.onclick=()=>{ setWorkers(i); };
+    t.appendChild(d);
+  }
+  $('wkRange').max=cores;
+}
+function paintTicks(v){
+  [...$('wkTicks').children].forEach(c=>c.classList.toggle('on', Number(c.dataset.v)===v));
+}
+
+function setWorkers(v){
+  v=Math.min(cores,Math.max(1,v|0));
+  cfg.workers=v; $('wkRange').value=v; $('wkCur').textContent=v; paintTicks(v);
+  pushConfig();
+}
+
+function applyCfgToUI(){
+  [...$('segEngine').children].forEach(b=>b.classList.toggle('active',b.dataset.v===cfg.engine));
+  [...$('segMode').children].forEach(b=>b.classList.toggle('active',b.dataset.v===cfg.mode));
+  $('wkRange').value=cfg.workers; $('wkCur').textContent=cfg.workers; paintTicks(cfg.workers);
+  const th=Math.round(cfg.throttle*100);
+  $('thRange').value=th; $('thCur').textContent=th+'%';
+  const manual = cfg.mode==='manual';
+  $('thRange').disabled=!manual;
+  $('thNote').style.display=manual?'none':'block';
+  // where to mine
+  [...$('segPool').children].forEach(b=>b.classList.toggle('active',b.dataset.v===cfg.pool));
+  $('poolUrlWrap').style.display = cfg.pool==='pool' ? 'block' : 'none';
+  if(document.activeElement!==$('poolUrlIn')) $('poolUrlIn').value = cfg.poolUrl||'';
+  // payout address (don't clobber while the user is typing)
+  if(document.activeElement!==$('walletIn')) $('walletIn').value = cfg.wallet||'';
+  validateWallet();
+  $('mWorkers').innerHTML=cfg.workers+'<span class="u">cores</span>';
+}
+
+// Enable Save only when the field holds a valid, changed address.
+function validateWallet(){
+  const v=$('walletIn').value.trim();
+  const valid=HEX64.test(v);
+  $('walletIn').classList.toggle('invalid', v.length>0 && !valid);
+  $('walletSave').disabled = !(valid && v.toLowerCase()!==cfg.wallet);
+}
+
+let pushTimer=null;
+function pushConfig(){
+  clearTimeout(pushTimer);
+  pushTimer=setTimeout(async()=>{
+    const r=await api('/api/config','POST',cfg);
+    if(r) ingest(r);
+  },180);
+}
+
+// Controls
+$('segEngine').onclick=(e)=>{const b=e.target.closest('button'); if(!b)return; cfg.engine=b.dataset.v; applyCfgToUI(); pushConfig();};
+$('segMode').onclick=(e)=>{const b=e.target.closest('button'); if(!b)return; cfg.mode=b.dataset.v; applyCfgToUI(); pushConfig();};
+$('wkRange').oninput=(e)=>{ setWorkers(Number(e.target.value)); };
+$('thRange').oninput=(e)=>{ const th=Number(e.target.value); $('thCur').textContent=th+'%'; cfg.throttle=th/100; pushConfig(); };
+
+// Where to mine (solo / pool)
+$('segPool').onclick=(e)=>{const b=e.target.closest('button'); if(!b)return; cfg.pool=b.dataset.v; applyCfgToUI(); pushConfig();};
+$('poolUrlIn').onchange=(e)=>{ const u=e.target.value.trim(); if(u){ cfg.poolUrl=u; pushConfig(); } };
+
+// Payout address — explicit Save (so a half-typed address never gets applied)
+$('walletIn').oninput=validateWallet;
+$('walletSave').onclick=()=>{
+  const v=$('walletIn').value.trim().toLowerCase();
+  if(!HEX64.test(v)) return;
+  cfg.wallet=v; validateWallet(); pushConfig();
+};
+
+$('toggle').onclick=async()=>{
+  if(busy) return; busy=true; $('toggle').classList.add('busy');
+  try{
+    // Decide from FRESH server truth, not the up-to-1s-stale poll, so a click that
+    // lands during a config-restart window can't flip start/stop the wrong way.
+    const cur=await api('/api/status');
+    if(cur.running) await api('/api/stop','POST');
+    else await api('/api/start','POST');
+  }finally{
+    setTimeout(()=>{busy=false; $('toggle').classList.remove('busy'); refresh();},400);
+  }
+};
+
+function lineClass(s){
+  if(/FOUND/.test(s)) return 'found';
+  if(/ERROR|FAIL|error/.test(s)) return 'err';
+  if(/^\[gui\]/.test(s)) return 'gui';
+  if(/warn|WARN|update/.test(s)) return 'warn';
+  return '';
+}
+
+let lastLogLen=-1;
+function renderLog(log){
+  if(!log) return;
+  if(log.length===lastLogLen) return;
+  lastLogLen=log.length;
+  const el=$('log');
+  const atBottom = el.scrollHeight-el.scrollTop-el.clientHeight < 40;
+  el.innerHTML = log.map(e=>{
+    const ln=(e.line||e).replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]));
+    return `<div class="l ${lineClass(ln)}">${ln}</div>`;
+  }).join('');
+  if(atBottom) el.scrollTop=el.scrollHeight;
+}
+
+function ingest(s){
+  if(!s) return;
+  running = s.running;
+  cores = s.cores||cores;
+  if($('wkTicks').children.length!==cores) buildTicks();
+
+  // Adopt persisted settings from the server ONCE on first load. After that the
+  // client owns the control state, so the 1s poll never clobbers an in-flight
+  // change (which would otherwise race the debounced /api/config POST and revert it).
+  if(!cfgInit){
+    cfg.engine=s.engine; cfg.mode=s.mode; cfg.workers=s.workers; cfg.throttle=s.throttle; cfg.wallet=s.wallet;
+    cfg.pool=s.pool||'solo'; cfg.poolUrl=s.poolUrl||cfg.poolUrl;
+    applyCfgToUI(); cfgInit=true;
+  } else if(s.wallet && s.wallet!==cfg.wallet && document.activeElement!==$('walletIn')){
+    cfg.wallet=s.wallet; $('walletIn').value=s.wallet; validateWallet(); // external change
+  }
+
+  // status dot + text
+  const dot=$('dot'); dot.className='dot '+s.status;
+  $('statusText').textContent=s.status;
+
+  // toggle visual
+  const on = s.status==='mining'||s.status==='syncing';
+  $('toggle').classList.toggle('on',on);
+  $('knob').textContent=on?'ON':'OFF';
+  $('onoff').textContent=on?'ON':'OFF';
+  $('toggleHint').textContent = s.status==='syncing'?'Syncing chain…'
+    : s.status==='mining'?'Mining — tap to stop'
+    : s.status==='error'?'Error — see log':'Tap to start mining';
+
+  // metrics
+  $('hNow').textContent=fmt(s.hashrate.now);
+  $('hAvg').textContent=fmt(s.hashrate.avg);
+  $('hPeak').textContent=fmt(s.hashrate.peak);
+  $('mHeight').textContent=Number(s.height||0).toLocaleString();
+  $('mDiff').textContent=s.difficulty?('0x'+s.difficulty):'—';
+  $('mUptime').textContent=s.running?dur(s.uptimeSec):'—';
+  const poolMode = s.pool==='pool';
+  $('mBlocksLabel').textContent = poolMode ? 'Shares' : 'Blocks found';
+  $('mBlocks').textContent = poolMode ? (s.shares||0) : (s.blocks||0);
+  // Pool mode doesn't print a "grind backend" line; fall back to the selected engine while running.
+  $('mBackend').textContent = s.backend ? (s.backend==='native'?'Native (Rust)':'WASM')
+    : (s.running ? (cfg.engine==='native'?'Native (Rust)':'WASM') : '—');
+
+  // wallet balance (confirmed, from the miner's local verified snapshot)
+  const b=s.balance;
+  if(b && b.brc!=null){
+    $('walBal').textContent = b.brc.toLocaleString(undefined,{minimumFractionDigits:b.brc<1?4:2,maximumFractionDigits:4});
+    $('walBalSub').innerHTML = (b.anchorHeight?('confirmed @ height<br>'+Number(b.anchorHeight).toLocaleString()):'confirmed on-chain');
+  } else {
+    $('walBal').textContent='—';
+    $('walBalSub').innerHTML='start mining once<br>to sync balance';
+  }
+
+  // estimate / earnings card — mode-aware
+  if(poolMode){
+    // Pool: show running earnings the miner reports (earned / pending / paid).
+    $('estCap').textContent='Pool earnings (live)';
+    $('estK1').textContent='Pending'; $('estK2').textContent='Paid';
+    const ps=s.poolStats||{};
+    if(ps.earned!=null){
+      $('estDay').textContent=ps.earned.toFixed(2)+' BRC';
+      $('estEvery').textContent=(ps.pending!=null?ps.pending.toFixed(2):'—')+' BRC';
+      $('estBrc').textContent=(ps.paid!=null?ps.paid.toFixed(2):'—')+' BRC';
+    } else {
+      $('estDay').textContent = s.status==='mining' ? 'mining…' : '—';
+      $('estEvery').textContent='—'; $('estBrc').textContent='—';
+    }
+  } else {
+    // Solo: estimated blocks/day from difficulty + hashrate.
+    $('estCap').textContent='Estimated yield (live)';
+    $('estK1').textContent='One block every'; $('estK2').textContent='Reward rate';
+    const e=s.est||{};
+    if(e.blocksPerDay!=null){
+      const bpd=e.blocksPerDay;
+      $('estDay').textContent='≈ '+(bpd>=0.01?bpd.toFixed(bpd<1?3:2):bpd.toExponential(2))+' / day';
+      const hrs=e.hoursPerBlock;
+      $('estEvery').textContent = hrs>=48?('~'+(hrs/24).toFixed(1)+' days')
+        : hrs>=1?('~'+hrs.toFixed(1)+' h') : ('~'+(hrs*60).toFixed(0)+' min');
+      $('estBrc').textContent='~'+(e.brcPerDay>=0.01?e.brcPerDay.toFixed(2):e.brcPerDay.toExponential(2))+' BRC/day';
+    } else {
+      $('estDay').textContent='—'; $('estEvery').textContent='—'; $('estBrc').textContent='—';
+    }
+  }
+
+  // sync bar
+  const sb=$('syncbar');
+  if(s.status==='syncing'&&s.sync&&s.sync.target>0){
+    sb.classList.add('show'); $('syncfill').style.width=s.sync.pct+'%';
+    $('estDay').textContent='syncing '+s.sync.pct+'%';
+  } else { sb.classList.remove('show'); }
+
+  renderLog(s.log);
+}
+
+async function refresh(){
+  try{ ingest(await api('/api/status')); booted=true; }
+  catch(e){ if(booted){ $('statusText').textContent='server down'; $('dot').className='dot error'; } }
+}
+
+buildTicks();
+refresh();
+setInterval(refresh, 1000);
+</script>
+</body>
+</html>
