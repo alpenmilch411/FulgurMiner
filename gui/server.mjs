@@ -324,6 +324,93 @@ function balanceForStatus() {
   return null;
 }
 
+// ─── Pending (unconfirmed) balance ─────────────────────────────────────────
+// The balance above is the FINALIZED snapshot (tip − ~100 blocks, ~4h deep), so a
+// freshly-won block is invisible there until it finalizes. To surface earned-but-
+// not-yet-finalized rewards immediately, read the canonical UNFINALIZED tail from
+// the same public helper API the miner uses, decode each block header in PURE JS
+// (no chain-code import — keeps this server dependency-free), and sum the coinbase
+// reward of every block whose `miner` field is our wallet. Chain-derived, so it
+// captures wins from BOTH machines and survives restarts (not session state).
+const HELPERS = (process.env.MINER_HELPERS
+  ? process.env.MINER_HELPERS.split(',')
+  : ['https://api1.browsercoin.org', 'https://api2.browsercoin.org']
+).map((h) => h.trim().replace(/\/+$/, '')).filter(Boolean);
+
+const HALVING_INTERVAL = 210_000;
+const INITIAL_REWARD = 50n * BigInt(COIN); // 50 BRC in wei
+// Coinbase subsidy at a height — mirrors src/chain/genesis.ts blockReward().
+function blockReward(height) {
+  const h = Math.floor(height / HALVING_INTERVAL);
+  return h >= 64 ? 0n : INITIAL_REWARD >> BigInt(h);
+}
+// Block-header layout (src/chain/block.ts: fixed 148-byte header). In the hex
+// encoding (2 chars/byte): height = u32be at bytes 0..4 (hex 0..8); the 32-byte
+// `miner` coinbase pubkey is the last header field, bytes 116..148 (hex 232..296).
+const HEX_HEIGHT = [0, 8];
+const HEX_MINER = [232, 296];
+
+let pendCache = { wallet: null, brc: null, blocks: [], live: null, tip: null, at: 0, error: null };
+let refreshingPending = false;
+
+async function fetchHelperJson(pathname) {
+  for (const base of HELPERS) {
+    try {
+      const r = await fetch(base + pathname, { signal: AbortSignal.timeout(8000) });
+      if (r.ok) return await r.json();
+    } catch { /* try the next helper */ }
+  }
+  return null;
+}
+
+// Refresh pending/unconfirmed rewards OFF the request path (network I/O + decode).
+async function refreshPending() {
+  const wallet = settings.wallet;
+  if (!/^[0-9a-f]{64}$/.test(wallet)) {
+    pendCache = { wallet, brc: null, blocks: [], live: null, tip: null, at: Date.now(), error: 'bad wallet' };
+    return;
+  }
+  if (refreshingPending) return;
+  refreshingPending = true;
+  try {
+    const tipResp = await fetchHelperJson('/tip');
+    const tip = Number(tipResp && tipResp.height);
+    if (!Number.isFinite(tip)) { pendCache = { ...pendCache, wallet, at: Date.now(), error: 'tip unavailable' }; return; }
+    // Confirmed balance is finalized through balCache.anchorHeight; count wins
+    // strictly ABOVE it so we never double-count what the confirmed total includes.
+    const finalizedBrc = (balCache.wallet === wallet && balCache.brc != null) ? balCache.brc : 0;
+    const anchor = (balCache.wallet === wallet && balCache.anchorHeight != null) ? balCache.anchorHeight : Math.max(0, tip - 100);
+    let height = anchor + 1, pendingWei = 0n, blocks = [], guard = 0;
+    while (height <= tip && guard++ < 16) {
+      const resp = await fetchHelperJson(`/blocks?fromHeight=${height}&max=200`);
+      const hexes = resp && Array.isArray(resp.blocks) ? resp.blocks : [];
+      if (!hexes.length) break;
+      for (const hex of hexes) {
+        if (typeof hex !== 'string' || hex.length < HEX_MINER[1]) continue;
+        const bh = parseInt(hex.slice(HEX_HEIGHT[0], HEX_HEIGHT[1]), 16);
+        const minerHex = hex.slice(HEX_MINER[0], HEX_MINER[1]).toLowerCase();
+        if (minerHex === wallet) { pendingWei += blockReward(bh); blocks.push(bh); }
+      }
+      height += hexes.length;
+    }
+    const brc = Number(pendingWei) / COIN;
+    pendCache = { wallet, brc, blocks, live: finalizedBrc + brc, tip, at: Date.now(), error: null };
+  } catch {
+    pendCache = { ...pendCache, at: Date.now() }; // keep last good value on a transient failure
+  } finally {
+    refreshingPending = false;
+  }
+}
+
+// Synchronous, non-blocking read of the cached pending data for the status payload.
+function pendingForStatus() {
+  if (pendCache.wallet === settings.wallet && pendCache.brc != null) {
+    return { brc: pendCache.brc, blocks: pendCache.blocks, count: pendCache.blocks.length, live: pendCache.live, tip: pendCache.tip };
+  }
+  refreshPending();
+  return null;
+}
+
 function statusPayload() {
   const est = estimate();
   return {
@@ -339,6 +426,7 @@ function statusPayload() {
     poolUrl: settings.poolUrl,
     poolStats: state.pool,                 // { earned, pending, paid } in BRC (pool mode)
     balance: balanceForStatus(),           // { brc, anchorHeight } | null (refreshed off the request path)
+    pending: pendingForStatus(),           // { brc, blocks, count, live, tip } | null — unconfirmed rewards in the unfinalized tail
     cores: CORES,
     platform: process.platform,
     height: state.height,
@@ -588,7 +676,7 @@ const server = http.createServer(async (req, res) => {
     const changed = JSON.stringify(next) !== JSON.stringify(settings);
     settings = next;
     saveSettings();
-    if (walletChanged) refreshBalance(); // recompute for the new address, off the request path
+    if (walletChanged) { refreshBalance(); refreshPending(); } // recompute for the new address, off the request path
     if (changed && child) restartMiner();
     return sendJSON(res, 200, { ok: true, changed, ...statusPayload() });
   }
@@ -609,9 +697,11 @@ process.on('exit', cleanup);
 
 server.listen(PORT, HOST, () => {
   startServerCaffeinate();
-  // Keep the cached balance fresh off the request path (see refreshBalance).
+  // Keep the cached balance + pending rewards fresh off the request path.
   refreshBalance();
   setInterval(refreshBalance, 15000).unref();
+  refreshPending();
+  setInterval(refreshPending, 20000).unref();
   console.log(`[gui] FulgurMiner control panel → http://${HOST}:${PORT}`);
   console.log(`[gui] platform=${process.platform} repo=${REPO_DIR} cores=${CORES}`);
 });

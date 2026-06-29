@@ -228,6 +228,10 @@
           <span class="bal" id="walBal">—</span><span class="bu">BRC</span>
           <span class="bsub" id="walBalSub">start mining once<br>to sync balance</span>
         </div>
+        <div class="balcard pend" id="pendCard" style="display:none">
+          <span class="bal" id="pendBal" style="color:var(--amber);font-size:22px">—</span><span class="bu">BRC pending</span>
+          <span class="bsub" id="pendSub"></span>
+        </div>
         <h3 style="margin-top:16px">Payout address</h3>
         <div class="wallet">
           <input type="text" id="walletIn" class="textin mono" spellcheck="false" autocomplete="off" placeholder="64-hex BrowserCoin address" />
@@ -432,6 +436,18 @@ function ingest(s){
   } else {
     $('walBal').textContent='—';
     $('walBalSub').innerHTML='start mining once<br>to sync balance';
+  }
+
+  // pending (unconfirmed) rewards — blocks won but not yet finalized into balance
+  const pend=s.pending;
+  if(pend && pend.count>0){
+    $('pendCard').style.display='flex';
+    $('pendBal').textContent='+'+pend.brc.toLocaleString(undefined,{maximumFractionDigits:4});
+    const live=(pend.live!=null)?pend.live.toLocaleString(undefined,{maximumFractionDigits:2}):'—';
+    $('pendSub').innerHTML=pend.count+' block'+(pend.count>1?'s':'')+' finalizing<br>live ≈ '+live+' BRC';
+    $('pendCard').title='Won on-chain but not yet ~100 blocks deep. Heights: '+pend.blocks.join(', ');
+  } else {
+    $('pendCard').style.display='none';
   }
 
   // estimate / earnings card — mode-aware
