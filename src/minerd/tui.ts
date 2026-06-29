@@ -641,8 +641,13 @@ export class DashboardReporter implements MinerReporter {
     if (this.smart_) {
       const pct = `${Math.round(this.smart_.throttle * 100)}%`;
       const label = this.smart_.mode === 'considerate' ? 'Considerate' : 'Max';
-      const easing = this.smart_.clamped ? ` ${YELLOW}· easing off (leaving CPU for your work)${RESET}` : '';
-      lines.push(row(`${DIM}auto throttle${RESET} ${BOLD}${pct}${RESET} ${DIM}${label}${RESET}${easing}`));
+      let phaseLabel: string;
+      switch (this.smart_.phase) {
+        case 'ramping': phaseLabel = '↑ ramping…'; break;
+        case 'holding': phaseLabel = '· at max'; break;
+        default: phaseLabel = this.smart_.throttle <= 0.15 ? '· yielding to your apps' : '· easing off (CPU busy)'; break;
+      }
+      lines.push(row(`${DIM}auto throttle${RESET} ${BOLD}${pct}${RESET} ${DIM}${label}${RESET} ${CYAN}${phaseLabel}${RESET}`));
     } else if (s) {
       // Manual mode: confirm the configured throttle so the user can see their
       // setting is applied. Any decline below this is the OS/thermals, not the miner.
@@ -766,7 +771,7 @@ export class DashboardReporter implements MinerReporter {
 
   private jackpotText(j: JackpotInfo): string {
     const last = j.lastWinner ? ` - last ${j.lastWinner.slice(0, 12)}...@${j.lastStrikeHeight ?? '?'}` : '';
-    return `jackpot: ${Math.round(j.finderBonusPct * 100)}% finder bonus - your strikes: ${j.yourBlockStrikes}${last}`;
+    return `jackpot: ${Math.round(j.finderBonusPct * 100)}% finder bonus - blocks found: ${j.yourBlockStrikes}${last}`;
   }
 
   private updateNoticeText(n: UpdateNotice): string {
@@ -800,8 +805,13 @@ export class DashboardReporter implements MinerReporter {
     }
     if (this.smart_) {
       const pct = `${Math.round(this.smart_.throttle * 100)}%`;
-      const easing = this.smart_.clamped ? ' (easing off)' : '';
-      lines.push(this.clampVisible(`${DIM}auto ${RESET}${pct}${easing}`, cols));
+      let phaseLabel: string;
+      switch (this.smart_.phase) {
+        case 'ramping': phaseLabel = ' ↑ ramping…'; break;
+        case 'holding': phaseLabel = ' · at max'; break;
+        default: phaseLabel = this.smart_.throttle <= 0.15 ? ' · yielding to your apps' : ' · easing off (CPU busy)'; break;
+      }
+      lines.push(this.clampVisible(`${DIM}auto ${RESET}${pct}${phaseLabel}`, cols));
     } else if (s) {
       lines.push(this.clampVisible(`${DIM}thr ${RESET}${Math.round(s.throttle * 100)}% ${DIM}manual${RESET}`, cols));
     }

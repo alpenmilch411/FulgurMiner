@@ -49,6 +49,7 @@ export interface SmartInfo {
   mode: 'max' | 'considerate';
   throttle: number;
   clamped: boolean;
+  phase: 'ramping' | 'holding' | 'easing';
 }
 
 // ─── Optional KPI payloads ────────────────────────────────
@@ -207,9 +208,17 @@ export class ConsoleReporter implements MinerReporter {
   }
 
   hashrate(hps: number): void {
-    const smartSuffix = this.smart_
-      ? ` auto ${Math.round(this.smart_.throttle * 100)}%${this.smart_.clamped ? ' (easing off)' : ''}`
-      : '';
+    let smartSuffix = '';
+    if (this.smart_) {
+      const pct = Math.round(this.smart_.throttle * 100);
+      let label: string;
+      switch (this.smart_.phase) {
+        case 'ramping': label = 'ramping'; break;
+        case 'holding': label = 'max'; break;
+        default: label = this.smart_.throttle <= 0.15 ? 'yielding' : 'easing off'; break;
+      }
+      smartSuffix = ` auto ${pct}% ${label}`;
+    }
     if (this.status_?.mode === 'pool') {
       process.stdout.write(`\r[pool-miner] ${hps} H/s${smartSuffix}   `);
     } else {
@@ -288,7 +297,7 @@ export class ConsoleReporter implements MinerReporter {
 
   jackpot(j: JackpotInfo): void {
     const last = j.lastWinner ? ` - last ${j.lastWinner.slice(0, 12)}...@${j.lastStrikeHeight ?? '?'}` : '';
-    console.log(`[pool-miner] jackpot: ${Math.round(j.finderBonusPct * 100)}% finder bonus - your strikes: ${j.yourBlockStrikes}${last}`);
+    console.log(`[pool-miner] jackpot: ${Math.round(j.finderBonusPct * 100)}% finder bonus - blocks found: ${j.yourBlockStrikes}${last}`);
   }
 
   updateNotice(n: UpdateNotice): void {

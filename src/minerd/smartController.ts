@@ -51,6 +51,14 @@ export class SmartController {
   appliedThrottle(): number { return this.applied; }
   isClamped(): boolean { return this.applied < this.t - 1e-9; }
 
+  /** Coarse live phase for the UI: 'easing' = demand is holding it below the thermal
+   *  target (Considerate yielding); 'ramping' = still climbing toward the max;
+   *  'holding' = settled at the sustainable max/knee. */
+  phase(): 'ramping' | 'holding' | 'easing' {
+    if (this.applied < this.t - 1e-9) return 'easing';
+    return this.holding ? 'holding' : 'ramping';
+  }
+
   onHashrate(hps: number): void {
     if (!this.seeded) { this.ewma = hps; this.seeded = true; }
     else this.ewma = this.cfg.ewmaAlpha * hps + (1 - this.cfg.ewmaAlpha) * this.ewma;

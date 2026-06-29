@@ -26,7 +26,7 @@ import { resolveEngine } from './engine.js';
 import { currentEngine } from './selectors.js';
 import { checkForUpdate } from './updateCheck.js';
 import { assertNodeVersion } from './version.js';
-import { installCrashGuard } from './crashGuard.js';
+import { installCrashGuard, installStdioErrorSink } from './crashGuard.js';
 
 const HEX64 = /^[0-9a-f]{64}$/i;
 
@@ -215,9 +215,14 @@ async function runPlainSession(): Promise<void> {
 }
 
 async function main(): Promise<void> {
-  // Last-resort guard: turn an otherwise-silent uncaught error (e.g. a write
-  // EPIPE from a dying console, or any stray async throw) into a restored
-  // terminal + a readable message instead of a vanished window.
+  // Last-resort guard: turn an otherwise-silent uncaught error (any stray async
+  // throw) into a restored terminal + a readable message instead of a vanished
+  // window. Paired with a permanent stdout/stderr error sink so a dying console
+  // pipe (EPIPE) is absorbed at the stream level and the miner keeps grinding +
+  // submitting shares instead of crashing — its work is network-bound and needs
+  // no console. The sink must be installed BEFORE the first write so no early
+  // output can race an unguarded pipe.
+  installStdioErrorSink();
   installCrashGuard();
   assertNodeVersion();
   loadEnvLocal();

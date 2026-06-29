@@ -96,6 +96,183 @@ export function shouldRegrind(key: string, lastKey: string | null, exhaustedKey:
   return key !== exhaustedKey && key !== lastKey;
 }
 
+/** /job poll cadence (ms). Default 1000. After the pool's tip advances, a headless
+ *  miner keeps grinding the OLD job until its next /job poll — blocks found in that
+ *  window are born stale and get orphaned. Polling every ~1s (vs the old ~3s) closes
+ *  most of that window. Purely a cadence knob: the GET /job request/response shape,
+ *  the 404->re-register path, and all backoff/retry are unchanged. Env-overridable
+ *  via JOB_POLL_MS; junk/non-positive falls back to the default; clamped to
+ *  [250, 60000]ms so a typo can neither hammer the pool nor stall job refresh. */
+const DEFAULT_JOB_POLL_MS = 1000;
+const MIN_JOB_POLL_MS = 250;
+const MAX_JOB_POLL_MS = 60_000;
+export function resolveJobPollMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.JOB_POLL_MS;
+  if (raw == null || raw.trim() === '') return DEFAULT_JOB_POLL_MS;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) return DEFAULT_JOB_POLL_MS;
+  return Math.min(MAX_JOB_POLL_MS, Math.max(MIN_JOB_POLL_MS, Math.round(n)));
+}
+
+/** /job long-poll wait (seconds). Default 25, clamped [0, 30] (pool caps at 30).
+ *  0 disables long-poll (pure fast-poll). Env JOB_WAIT_S; junk/unset -> default. */
+const DEFAULT_JOB_WAIT_S = 25;
+const MAX_JOB_WAIT_S = 30;
+export function resolveJobWaitS(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.JOB_WAIT_S;
+  if (raw == null || raw.trim() === '') return DEFAULT_JOB_WAIT_S;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return DEFAULT_JOB_WAIT_S;
+  return Math.max(0, Math.min(MAX_JOB_WAIT_S, Math.floor(n)));
+}
+
+/** Extra client timeout budget over `wait` for a long-poll request (the pool holds
+ *  up to `wait`, ≤30s; we time out a bit later to absorb network latency). */
+export const LONGPOLL_TIMEOUT_MARGIN_MS = 10_000;
+
+/** Fraction of `wait` a same-job response must have been held to count as "the pool
+ *  honored ?wait" (vs a legacy pool / over-cap pool returning immediately). */
+const LONGPOLL_HONORED_FRAC = 0.8;
+
+/** A /job request that returned faster than this did NOT meaningfully block (it was
+ *  not a held long-poll — just network round-trip). Used by the loop's hot-loop guard
+ *  to tell a genuine immediate re-poll (after a held long-poll, ≥ ~1s) from a spin
+ *  (instant returns). Fixed + independent of JOB_POLL_MS on purpose: JOB_POLL_MS can
+ *  exceed JOB_WAIT_S, so the cadence is not a valid "did it block" threshold. */
+const HOT_LOOP_FAST_MS = 500;
+
+/** Build the /job URL. Long-poll params are appended ONLY when wait>0 AND a current
+ *  job is held (have) — otherwise it's a plain immediate poll, byte-identical to today. */
+export function buildJobUrl(poolUrl: string, workerId: string, opts: { waitS?: number; have?: string | null } = {}): string {
+  const base = `${poolUrl}/job?workerId=${encodeURIComponent(workerId)}`;
+  const waitS = opts.waitS ?? 0;
+  const have = opts.have ?? '';
+  if (waitS > 0 && have) return `${base}&wait=${waitS}&have=${encodeURIComponent(have)}`;
+  return base;
+}
+
+/** Pure scheduling decision: ms to sleep before the next /job poll. The confirmed
+ *  pool contract returns 200 with the SAME job body on wait-expiry, so a held-then-
+ *  expired response and a legacy-ignored response are indistinguishable by body —
+ *  elapsed time disambiguates. A pool that ignores ?wait simply yields the fast-poll
+ *  cadence (never a hot loop). */
+export function nextJobPollDelayMs(args: {
+  hadJob: boolean;        // did we send have= (were we holding a job)?
+  usedWaitS: number;      // wait seconds actually sent (0 = no long-poll this request)
+  responseJobId: string;  // jobId returned (a valid job)
+  haveJobId: string | null;
+  elapsedMs: number;
+  jobPollMs: number;
+  honoredFrac?: number;
+}): number {
+  if (!args.hadJob) return 0;                                  // plain poll got work -> long-poll next
+  // Defensive: never let a bad caller-supplied cadence collapse the fast-poll
+  // fallback into a 0ms hot loop. resolveJobPollMs already clamps, but the
+  // no-hot-loop guarantee must hold intrinsically here too.
+  const fastPollMs = Number.isFinite(args.jobPollMs) && args.jobPollMs > 0 ? args.jobPollMs : DEFAULT_JOB_POLL_MS;
+  if (args.usedWaitS <= 0) return fastPollMs;                  // long-poll disabled -> fast-poll
+  if (args.responseJobId !== args.haveJobId) return 0;         // job changed -> grab next now
+  const heldMs = (args.honoredFrac ?? LONGPOLL_HONORED_FRAC) * args.usedWaitS * 1000;
+  return args.elapsedMs >= heldMs ? 0 : fastPollMs;           // honored expiry vs early return
+}
+
+/** setTimeout that rejects with the signal's reason the moment it aborts (no leaked
+ *  listener). Used between /job polls so a teardown OR a watchdog wake interrupts the
+ *  wait. */
+export function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(signal.reason ?? new DOMException('aborted', 'AbortError'));
+    let t: ReturnType<typeof setTimeout>;
+    const onAbort = (): void => { clearTimeout(t); reject(signal!.reason ?? new DOMException('aborted', 'AbortError')); };
+    t = setTimeout(() => { signal?.removeEventListener('abort', onAbort); resolve(); }, ms);
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+export type RefreshResult =
+  | { kind: 'job'; jobId: string }   // a valid job is held (possibly same or changed)
+  | { kind: 'reregister' }           // 404 handled -> re-poll now
+  | { kind: 'stopped' }              // pool mode stopped (426/400/teardown) -> exit loop
+  | { kind: 'retry' };               // transient/fatal/invalid -> fast-poll cadence
+
+export interface JobPollLoopDeps {
+  isStopped: () => boolean;
+  getHave: () => string | null;             // current activeJobId
+  takeForcePlain: () => boolean;            // reads + clears the forcePlainPoll flag
+  waitS: number;
+  jobPollMs: number;
+  honoredFrac?: number;
+  now: () => number;
+  setCurrentCycle: (ac: AbortController | null) => void; // lets wake() reach the live request
+  teardownSignal?: AbortSignal;
+  refresh: (args: { have: string | null; waitS: number; signal: AbortSignal }) => Promise<RefreshResult>;
+  onPollError: (e: unknown) => void;
+  sleep: (ms: number, signal?: AbortSignal) => Promise<void>;
+}
+
+/** The /job poll loop. One request per iteration; the next delay comes from the
+ *  response (immediate when the pool held to ~expiry or the job changed; the fast-
+ *  poll cadence when a pool ignored ?wait or returned early). A per-iteration
+ *  AbortController (registered via setCurrentCycle) lets a teardown exit and a
+ *  watchdog wake() force an immediate plain re-poll. Grinding is independent — this
+ *  loop only triggers job swaps inside refresh(). */
+export async function runJobPollLoop(deps: JobPollLoopDeps): Promise<void> {
+  // Clamp once so the loop is self-protecting regardless of caller. Production passes
+  // the clamped resolveJobPollMs() but a direct caller with 0/negative/NaN would
+  // otherwise spin (the throttle sets delay=0 when jobPollMs is 0).
+  const jobPollMs = Number.isFinite(deps.jobPollMs) && deps.jobPollMs > 0 ? deps.jobPollMs : DEFAULT_JOB_POLL_MS;
+  // Hot-loop guard state: consecutive immediate (delay 0) iterations whose request
+  // did NOT actually block. See the guard below.
+  let consecutiveImmediate = 0;
+  while (!deps.isStopped()) {
+    const cycle = new AbortController();
+    deps.setCurrentCycle(cycle);
+    const onTeardown = (): void => cycle.abort(deps.teardownSignal?.reason ?? new DOMException('aborted', 'AbortError'));
+    if (deps.teardownSignal?.aborted) cycle.abort(deps.teardownSignal.reason);
+    else deps.teardownSignal?.addEventListener('abort', onTeardown, { once: true });
+
+    const have = deps.getHave();
+    const plain = deps.takeForcePlain();
+    const usedWaitS = have && !plain ? deps.waitS : 0;
+    const startedAt = deps.now();
+    let exit = false;
+    try {
+      const res = await deps.refresh({ have, waitS: usedWaitS, signal: cycle.signal });
+      const elapsed = deps.now() - startedAt;
+      let delay: number;
+      if (res.kind === 'stopped') { exit = true; delay = 0; }
+      else if (res.kind === 'reregister') delay = 0;
+      else if (res.kind === 'retry') delay = jobPollMs;
+      else delay = nextJobPollDelayMs({
+        hadJob: !!have, usedWaitS, responseJobId: res.jobId, haveJobId: have,
+        elapsedMs: elapsed, jobPollMs, honoredFrac: deps.honoredFrac,
+      });
+      // No-hot-loop guard. An immediate re-poll (delay 0) is correct for a genuine
+      // event: a job change, a reregister, or a long-poll that actually held to
+      // ~expiry. But if the request did NOT block (it returned faster than the
+      // fast-poll cadence) and this keeps happening, a buggy/hostile pool — rapid
+      // 404s, or an ever-changing jobId while ignoring ?wait — would spin the loop.
+      // Allow ONE fast immediate transition, then floor repeats at the fast-poll
+      // cadence. A held long-poll (large elapsed) or any non-zero delay resets it.
+      if (delay === 0 && elapsed < HOT_LOOP_FAST_MS) {
+        if (++consecutiveImmediate >= 2) delay = jobPollMs;
+      } else {
+        consecutiveImmediate = 0;
+      }
+      if (!exit && delay > 0 && !cycle.signal.aborted) await deps.sleep(delay, cycle.signal);
+    } catch (e) {
+      const name = (e as Error)?.name;
+      if (name === 'AbortError') exit = true;           // real teardown
+      else if (name === 'WakeError') { /* woken -> re-poll now (plain) */ }
+      else { deps.onPollError(e); try { await deps.sleep(jobPollMs, cycle.signal); } catch { /* aborted */ } }
+    } finally {
+      deps.teardownSignal?.removeEventListener('abort', onTeardown);
+      deps.setCurrentCycle(null);
+    }
+    if (exit || deps.isStopped()) break;
+  }
+}
+
 export interface CurrentJob { workerId: string; jobId: string; }
 export type PostShare = (s: { workerId: string; jobId: string; nonce: number }) => Promise<{ status: number; result?: string; block?: boolean; retryAfterMs?: number }>;
 
@@ -421,7 +598,6 @@ export async function runPoolClient(
   const SHARE_QUEUE_CAP = PENDING_CAP * 4;
   const SHARE_DEADLINE_MS = 120_000;
   let stopped = false;
-  let pollTimer: ReturnType<typeof setInterval> | null = null;
   let watchdogTimer: ReturnType<typeof setInterval> | null = null;
   let stopPoolMode: () => void = () => {};
 
@@ -463,7 +639,7 @@ export async function runPoolClient(
         reporter,
         onAccepted: (block) => {
           acceptedShares++;
-          if (block) reporter.event('info', '[pool-miner] BLOCK FOUND — >=50 BRC! (jackpot strike credits after maturity)');
+          if (block) reporter.event('info', '[pool-miner] BLOCK FOUND — >=50 BRC! (reward + finder bonus credit after maturity)');
         },
         deadlineMs: SHARE_DEADLINE_MS,
       },
@@ -493,13 +669,15 @@ export async function runPoolClient(
     dispatcher.offer(nonce, j.jobId, workerId, epoch);
   };
 
-  async function refresh(): Promise<void> {
-    if (stopped) return;
-    const r = await poolFetch(`${poolUrl}/job?workerId=${encodeURIComponent(workerId)}`, { signal });
-    if (stopped) return;
+  async function refresh(args: { have: string | null; waitS: number; signal: AbortSignal }): Promise<RefreshResult> {
+    if (stopped) return { kind: 'stopped' };
+    const url = buildJobUrl(poolUrl, workerId, { waitS: args.waitS, have: args.have });
+    const timeoutMs = args.waitS > 0 ? args.waitS * 1000 + LONGPOLL_TIMEOUT_MARGIN_MS : undefined;
+    const r = await poolFetch(url, { signal: args.signal }, timeoutMs);
+    if (stopped) return { kind: 'stopped' };
     if (r.status === 404) {
       await reregister();
-      return;
+      return { kind: 'reregister' };
     }
     // Actionable fatals from /job stop pool mode cleanly, mirroring register:
     // 426 = pool requires an upgrade; 400 = pool rejected the request/address.
@@ -507,19 +685,19 @@ export async function runPoolClient(
       reporter.updateNotice?.({ currentVersion: VERSION, latestVersion: undefined, mustUpdate: true });
       reporter.event('error', '[pool-miner] miner upgrade required by pool — stopping pool mode.');
       stopPoolMode();
-      return;
+      return { kind: 'stopped' };
     }
     if (r.status === 400) {
       reporter.event('error', `[pool-miner] pool rejected /job (400${(r.body as { error?: string } | null)?.error ? `: ${(r.body as { error?: string }).error}` : ''}) — stopping pool mode.`);
       stopPoolMode();
-      return;
+      return { kind: 'stopped' };
     }
     const cls = classify(r.status);
-    if (cls === 'transient') return;
+    if (cls === 'transient') return { kind: 'retry' };
     if (cls === 'fatal') {
       // Other non-2xx (e.g. 5xx) may be a passing server hiccup — keep polling.
       reporter.event('warn', `[pool-miner] /job ${r.status} — retrying`);
-      return;
+      return { kind: 'retry' };
     }
     const j = r.body as PoolJob;
     // validate the WHOLE job schema (jobId, header length, share target,
@@ -534,15 +712,15 @@ export async function runPoolClient(
     // Keep the best current assignment until a VALID replacement job arrives.
     if (!isValidJob(j)) {
       reporter.event('warn', '[pool-miner] /job: malformed/invalid job (bad header/target/slot) — ignoring, keeping current work, will re-poll');
-      return;
+      return { kind: 'retry' };
     }
     // The slot is part of the mining contract now, so a fresh slot for the SAME
     // job/target must still trigger a restart — include it in the key.
     const key = jobRestartKey(j);
-    if (key === exhaustedKey) return;
+    if (key === exhaustedKey) return { kind: 'job', jobId: j.jobId };
     exhaustedKey = null;
-    if (!shouldRegrind(key, lastKey, exhaustedKey)) return;
-    if (stopped) return;
+    if (!shouldRegrind(key, lastKey, exhaustedKey)) return { kind: 'job', jobId: j.jobId };
+    if (stopped) return { kind: 'stopped' };
     // #5: clear the active job BEFORE tearing down the old grind. If header decode
     // (hexToBytes) or pool.start throws, activeJobId stays null rather than pointing
     // at a stale job, so no in-flight share keeps submitting under a job we're no
@@ -558,7 +736,7 @@ export async function runPoolClient(
         if (hps > 0) lastNonzeroTickAt = Date.now();
         smartController?.onHashrate(hps);
         reporter.hashrate(hps);
-        if (smartController) reporter.smart?.({ mode: smart as 'max' | 'considerate', throttle: smartController.appliedThrottle(), clamped: smartController.isClamped() });
+        if (smartController) reporter.smart?.({ mode: smart as 'max' | 'considerate', throttle: smartController.appliedThrottle(), clamped: smartController.isClamped(), phase: smartController.phase() });
       },
       () => {
         reporter.event('info', '[pool-miner] nonce slot exhausted — requesting fresh work');
@@ -574,6 +752,7 @@ export async function runPoolClient(
     // nonces solved from here are valid for this job until it rolls. Set only AFTER a
     // successful pool.start (which fires onNonce asynchronously), synchronously here.
     activeJobId = j.jobId;
+    return { kind: 'job', jobId: j.jobId };
   }
 
   const stoppedPromise = new Promise<void>((resolve) => {
@@ -581,7 +760,6 @@ export async function runPoolClient(
       if (stopped) return;
       stopped = true;
       activeJobId = null;
-      if (pollTimer) clearInterval(pollTimer);
       if (watchdogTimer) clearInterval(watchdogTimer);
       smartController?.stop();
       pool.terminate();
@@ -602,13 +780,19 @@ export async function runPoolClient(
     }
   };
 
-  let refreshing = false;
-  const runRefresh = (): void => {
-    if (refreshing || stopped) return;
-    refreshing = true;
-    void refresh()
-      .catch(onPollError)
-      .finally(() => { refreshing = false; });
+  // (onPollError stays as defined above — swallows abort/stopped, warns on a real
+  // poll failure. Long-poll wait-expiry is a normal 200, not an error, so it never
+  // warns. The setInterval-based runRefresh is replaced by runJobPollLoop below.)
+
+  const waitS = resolveJobWaitS();
+  const jobPollMs = resolveJobPollMs();
+  let forcePlainPoll = false;
+  let currentCycle: AbortController | null = null;
+  // Force the next poll to be an immediate PLAIN /job (no wait/have) and interrupt any
+  // outstanding long-poll — used by the watchdog to re-apply work after a grind stall.
+  const wake = (): void => {
+    forcePlainPoll = true;
+    currentCycle?.abort(new DOMException('wake', 'WakeError'));
   };
 
   if (!stopped) {
@@ -620,15 +804,24 @@ export async function runPoolClient(
       pool.respawn();
       lastKey = null;
       lastNonzeroTickAt = Date.now();
-      runRefresh();
+      wake(); // interrupt the long-poll + force an immediate plain re-poll to re-apply work
     }, 3000);
   }
 
   if (!stopped) {
-    await refresh().catch(onPollError);
-    if (!stopped) {
-      pollTimer = setInterval(runRefresh, 3000);
-    }
+    await runJobPollLoop({
+      isStopped: () => stopped,
+      getHave: () => activeJobId,
+      takeForcePlain: () => { const f = forcePlainPoll; forcePlainPoll = false; return f; },
+      waitS,
+      jobPollMs,
+      now: Date.now,
+      setCurrentCycle: (ac) => { currentCycle = ac; },
+      teardownSignal: signal,
+      refresh,
+      onPollError,
+      sleep: abortableDelay,
+    });
   }
 
   // With no signal this Promise never resolves → runs forever, exactly like

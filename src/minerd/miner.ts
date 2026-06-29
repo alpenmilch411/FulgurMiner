@@ -6,7 +6,8 @@ import { checkPoW } from '../chain/consensus.js';
 import { bytesToHex, compareBytes } from '../util/binary.js';
 import { applyBlockTxs, cloneState, stateRoot } from '../chain/state.js';
 import type { MinerConfig } from './config.js';
-import { getTip, getBlocks, postBlock } from './http.js';
+import { postBlock } from './http.js';
+import { HelperPool } from './helperPool.js';
 import { VerifierPool, verifyBlocksParallel } from './verify.js';
 import { ChainSync } from './sync.js';
 import { buildTemplate, type Template } from './template.js';
@@ -151,8 +152,6 @@ interface GrindPoolLike {
   setThrottle(throttle: number): void;
   terminate(): void;
 }
-
-const HELPER = (cfg: MinerConfig) => cfg.helpers[0]!; // primary for reads; submit hits all
 
 // ---------------------------------------------------------------------------
 // Coordinator — testable coordination logic extracted from runMiner
@@ -323,6 +322,15 @@ export async function runMiner(
   const isWarm = !!warm?.synced;
   const debug = debugLog(reporter);
 
+  // Solo reads (tip + blocks + snapshot-confirm) fail over across all configured
+  // helpers with a rotating primary, so a single helper 525/timeout is silent
+  // (debug only) instead of an error wall; only a whole-round failure warns. Submit
+  // stays broadcast-to-all (different semantics). Solo path only.
+  const helperPool = new HelperPool(cfg.helpers, {
+    onDebug: (m) => debug?.(m),
+    onInfo: (m) => reporter.event('info', m),
+  });
+
   // the chain is only network-TRUSTED (returnable as a reusable warm handle)
   // once it was either confirmed against the helper this session (warm reuse, or a
   // confirmed snapshot restore) OR fully re-synced from the helper. A restored-but-
@@ -373,7 +381,7 @@ export async function runMiner(
   const sync = new ChainSync({
     chain,
     cores: cfg.workers,
-    getBlocks: (from, max) => getBlocks(HELPER(cfg), from, max),
+    getBlocks: (from, max) => helperPool.getBlocks(from, max),
     verifyBlocksParallel: (blocks, cores) =>
       verifierPool && !verifierTerminated ? verifierPool.verify(blocks) : verifyBlocksParallel(blocks, cores),
   });
@@ -416,9 +424,25 @@ export async function runMiner(
         anchorHeight: restore.anchorHeight,
         anchorHash: chain.tip.hash,
         fetchBlockAt: async (h) => {
-          const timeout = AbortSignal.timeout(SNAPSHOT_CONFIRM_TIMEOUT_MS);
-          const composed = signal ? AbortSignal.any([signal, timeout]) : timeout;
-          return (await getBlocks(HELPER(cfg), h, 1, composed))[0];
+          // Per-call AbortController (timeout OR caller teardown), released in
+          // finally — avoids AbortSignal.any holding a composite on the long-lived
+          // run signal (the timedFetch invariant).
+          const ac = new AbortController();
+          const t = setTimeout(
+            () => ac.abort(new DOMException(`snapshot confirm timed out after ${SNAPSHOT_CONFIRM_TIMEOUT_MS}ms`, 'TimeoutError')),
+            SNAPSHOT_CONFIRM_TIMEOUT_MS,
+          );
+          const onAbort = (): void => ac.abort(signal!.reason ?? new DOMException('aborted', 'AbortError'));
+          if (signal) {
+            if (signal.aborted) ac.abort(signal.reason);
+            else signal.addEventListener('abort', onAbort, { once: true });
+          }
+          try {
+            return await helperPool.blockAt(h, ac.signal);
+          } finally {
+            clearTimeout(t);
+            if (signal) signal.removeEventListener('abort', onAbort);
+          }
         },
         checkPoW,
       });
@@ -450,7 +474,7 @@ export async function runMiner(
     // failed tip read just yields an indeterminate target (still reported).
     let targetHeight = 0;
     try {
-      targetHeight = (await getTip(HELPER(cfg))).height;
+      targetHeight = (await helperPool.getTip()).height;
     } catch (e) {
       targetHeight = 0;
       reporter.event(
@@ -461,8 +485,8 @@ export async function runMiner(
     reporter.event(
       'info',
       targetHeight > 0
-        ? `[minerd] syncing chain from ${HELPER(cfg)} (target height ${targetHeight.toLocaleString('en-US')})…`
-        : `[minerd] syncing chain from ${HELPER(cfg)}…`,
+        ? `[minerd] syncing chain from ${helperPool.primary()} (target height ${targetHeight.toLocaleString('en-US')})…`
+        : `[minerd] syncing chain from ${helperPool.primary()}…`,
     );
     try {
       await sync.bootstrap((h) => reporter.syncProgress(h, targetHeight));
@@ -670,7 +694,7 @@ export async function runMiner(
       if (hps) {
         reporter.chain(chain.height, chain.tipDifficulty.toString(16));
         reporter.hashrate(Number(hps[1]));
-        if (smartController) reporter.smart?.({ mode: cfg.smart as 'max' | 'considerate', throttle: smartController.appliedThrottle(), clamped: smartController.isClamped() });
+        if (smartController) reporter.smart?.({ mode: cfg.smart as 'max' | 'considerate', throttle: smartController.appliedThrottle(), clamped: smartController.isClamped(), phase: smartController.phase() });
         // ~1/sec tick is a convenient debounce clock for the periodic save.
         maybeSave();
         return;
@@ -689,11 +713,17 @@ export async function runMiner(
     },
   });
 
-  // Tip poller: rebuild when the network advances past us.
+  // Tip poller: rebuild when the network advances past us. getTip fails over across
+  // helpers; only a whole-round (all helpers) failure warns. An overlap guard skips
+  // a tick whose previous round is still in flight (failover can lengthen a round
+  // when helpers time out), so we never stack concurrent rounds.
+  let tipPolling = false;
   const tipTimer = setInterval(() => {
+    if (tipPolling) return;
+    tipPolling = true;
     void (async () => {
       try {
-        const tip = await getTip(HELPER(cfg));
+        const tip = await helperPool.getTip();
         if (tip.height > chain.height || tip.tipHash !== bytesToHex(chain.tip.hash)) {
           await coord.tipAdvanced(tip);
           reporter.chain(chain.height, chain.tipDifficulty.toString(16));
@@ -702,6 +732,8 @@ export async function runMiner(
         }
       } catch (e) {
         reporter.event('warn', `[minerd] tip poll failed: ${(e as Error).message}`);
+      } finally {
+        tipPolling = false;
       }
     })();
   }, cfg.tipPollMs);

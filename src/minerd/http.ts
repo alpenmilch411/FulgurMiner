@@ -95,14 +95,20 @@ export async function getJsonWithRetry(url: string, opts: GetJsonOpts = {}): Pro
   }
 }
 
-export async function getTip(base: string): Promise<Tip> {
-  const body = (await getJsonWithRetry(`${base}/tip`)) as Tip;
+export async function getTip(base: string, opts: GetJsonOpts = {}): Promise<Tip> {
+  const body = (await getJsonWithRetry(`${base}/tip`, opts)) as Tip;
   return { height: Number(body.height), tipHash: String(body.tipHash) };
 }
 
 /** Canonical blocks from `fromHeight` (inclusive), oldest-first, up to `max` (server caps at 200). */
-export async function getBlocks(base: string, fromHeight: number, max = 200, signal?: AbortSignal): Promise<Block[]> {
-  const body = (await getJsonWithRetry(`${base}/blocks?fromHeight=${fromHeight}&max=${max}`, { signal })) as {
+export async function getBlocks(
+  base: string,
+  fromHeight: number,
+  max = 200,
+  signal?: AbortSignal,
+  opts: Omit<GetJsonOpts, 'signal'> = {},
+): Promise<Block[]> {
+  const body = (await getJsonWithRetry(`${base}/blocks?fromHeight=${fromHeight}&max=${max}`, { signal, ...opts })) as {
     blocks?: string[];
   };
   const hexes = Array.isArray(body.blocks) ? body.blocks : [];

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { classify, backoffDelay, parseRetryAfterMs, withPoolRetry, PoolError } from './poolHttp.js';
+import { classify, backoffDelay, parseRetryAfterMs, withPoolRetry, PoolError, poolFetch } from './poolHttp.js';
 
 test('classify: 200 ok; 429/503 transient; others fatal', () => {
   assert.equal(classify(200), 'ok');
@@ -69,4 +69,25 @@ test('withPoolRetry: aborts cleanly', async () => {
   await assert.rejects(
     () => withPoolRetry(async () => ({ status: 503, body: {}, headers: new Headers() }), { signal: ac.signal, sleep: async () => {} }),
     (e: unknown) => (e as Error).name === 'AbortError');
+});
+
+const okFetch = async (): Promise<Response> =>
+  ({ status: 200, ok: true, headers: new Headers(), text: async () => JSON.stringify({ jobId: 'j' }) }) as unknown as Response;
+
+// A fetch that never resolves on its own but rejects when its signal aborts.
+const hangFetch: typeof fetch = (_url, init) =>
+  new Promise<Response>((_resolve, reject) => {
+    init?.signal?.addEventListener('abort', () => reject((init!.signal as AbortSignal).reason), { once: true });
+  });
+
+test('poolFetch passes the body through with a custom timeout', async () => {
+  const r = await poolFetch('http://x/job', {}, 5_000, okFetch);
+  assert.equal(r.status, 200);
+  assert.equal(r.body.jobId, 'j');
+});
+
+test('poolFetch honors a short custom timeout (fires TimeoutError, fast)', async () => {
+  const sentinel = new Promise((_r, rej) => setTimeout(() => rej(new Error('SENTINEL: timeout not honored (>500ms)')), 500));
+  const call = poolFetch('http://x/job', {}, 20, hangFetch);
+  await assert.rejects(() => Promise.race([call, sentinel]), (e) => (e as Error).name === 'TimeoutError');
 });

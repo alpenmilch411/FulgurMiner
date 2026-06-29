@@ -61,12 +61,15 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   // addressFromHex throws "address must be 32 bytes" on the wrong length.
   const minerPubkey = addressFromHex(minerPubkeyHex);
 
-  const helpers = (env.MINER_HELPERS
+  const parsedHelpers = (env.MINER_HELPERS
     ? env.MINER_HELPERS.split(',')
     : DEFAULT_HELPERS
   )
     .map((h) => h.trim().replace(/\/+$/, ''))
     .filter((h) => h.length > 0);
+  // A malformed MINER_HELPERS (e.g. "," or all-whitespace) filters to []; fall back to
+  // the defaults so solo mode always has >=1 helper (HelperPool requires at least one).
+  const helpers = parsedHelpers.length > 0 ? parsedHelpers : DEFAULT_HELPERS;
 
   // Leave one core free by default so the machine stays responsive (and cooler).
   // A hand-set MINER_WORKERS is clamped to 1…cores so it can never exceed the

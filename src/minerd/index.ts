@@ -1,6 +1,7 @@
 // src/minerd/index.ts
 import { loadConfig } from './config.js';
 import { assertNodeVersion } from './version.js';
+import { installStdioErrorSink } from './crashGuard.js';
 import { runMiner } from './miner.js';
 import { runPoolClient } from './poolClient.js';
 import { Blockchain } from './../chain/blockchain.js';
@@ -115,6 +116,13 @@ async function main(): Promise<void> {
     await dryrun();
     process.exit(0);
   }
+  // Headless long-run `mine`: absorb a dying console/log pipe at the stream level
+  // so the miner keeps grinding + submitting shares instead of dying on an
+  // unhandled stdout error (matters for unattended/fleet runs piped to a log).
+  // Installed AFTER the dryrun branch so the consensus-gate output stays pristine,
+  // and the full crashGuard is intentionally NOT installed here (it would write
+  // terminal-restore escapes into piped logs — see crashGuard.ts).
+  installStdioErrorSink();
   const cfg = loadConfig();
   if (cfg.poolUrl) {
     await runPoolClient(cfg.poolUrl, cfg.minerPubkeyHex, cfg.workers, cfg.throttle, undefined, undefined, undefined, cfg.smart);

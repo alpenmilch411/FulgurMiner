@@ -40,18 +40,22 @@ export class PoolError extends Error {
   }
 }
 
-export async function poolFetch(url: string, init: RequestInit = {}): Promise<{ status: number; body: any; headers: Headers }> {
+export async function poolFetch(
+  url: string,
+  init: RequestInit = {},
+  timeoutMs: number = POOL_FETCH_TIMEOUT_MS,
+  doFetch: typeof fetch = fetch,
+): Promise<{ status: number; body: any; headers: Headers }> {
   const headers = new Headers(init.headers);
   headers.set('user-agent', MINER_UA);
   if (init.body && !headers.has('content-type')) headers.set('content-type', 'application/json');
-  // Bound each request — INCLUDING the response-body read — with a per-request
-  // timeout composed leak-free with the caller's teardown signal (init.signal flows
-  // through `...init`). A fired timeout OR a mid-body stall throws (TimeoutError /
-  // stream error, != AbortError), so withPoolRetry / the /share loop treat it as a
-  // retryable transient while a real teardown still cancels. (Reading the body inside
-  // the timed scope is a header-only timeout left the JSON
-  // body read unbounded and could wedge a /share submit forever, pinning a slot.)
-  const r = await fetchJsonWithTimeout(url, { ...init, headers }, POOL_FETCH_TIMEOUT_MS);
+  // Bound each request — INCLUDING the body read — with a per-request timeout
+  // composed leak-free with the caller's teardown signal (init.signal flows through
+  // ...init). A fired timeout or mid-body stall throws (TimeoutError/stream error,
+  // != AbortError) so callers treat it as a retryable transient, while a real
+  // teardown still cancels. timeoutMs is overridable for the /job long-poll (which
+  // legitimately holds ~wait seconds); doFetch is injectable for tests.
+  const r = await fetchJsonWithTimeout(url, { ...init, headers }, timeoutMs, doFetch);
   return { status: r.status, body: r.body, headers: r.headers };
 }
 

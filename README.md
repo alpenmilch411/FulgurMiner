@@ -215,9 +215,11 @@ Every option is an environment variable or a line in `.env.local` (written for y
 | `MINER_WORKERS` | cores − 1 | CPU worker threads. Clamped to `1…cores`. |
 | `MINER_THROTTLE` | `0.75` | Duty cycle (`0.05`–`1.0`): fraction of wall-time spent hashing. Lower = cooler & quieter. Ignored as a fixed value when a Smart mode is on. |
 | `MINER_NATIVE` | *(off)* | `1` uses the native Rust engine (built on demand if missing and Rust is installed). |
-| `MINER_HELPERS` | `api1`/`api2.browsercoin.org` | Comma-separated API URLs for chain sync / solo mining. |
+| `MINER_HELPERS` | `api1`/`api2.browsercoin.org` | Comma-separated API helper URLs for chain sync / solo mining. Fails over across helpers on an outage — a single dead helper is hidden and hashing continues; only warns if every helper fails a round. |
 | `FULGUR_TUI` | *(auto)* | `0` forces plain logs; otherwise the TUI is used when stdout is a terminal. |
 | `FULGUR_NO_UPDATE_CHECK` | *(off)* | `1` disables the best-effort startup update check. |
+| `JOB_POLL_MS` | `1000` | Pool mode only: fallback polling interval (ms). When the pool supports long-poll, new work arrives instantly; otherwise the miner polls `/job` at this cadence. Clamped to `250`–`60000`. |
+| `JOB_WAIT_S` | `25` | Pool mode only: `/job` long-poll hold seconds — picks up new work instantly when the pool publishes it; falls back to `JOB_POLL_MS` fast-poll against pools that don't support it. Range `0`–`30`; `0` disables long-poll. |
 
 ```bash
 # Solo-mine
@@ -267,11 +269,12 @@ The status bar shows `native` vs `wasm` so you can confirm which is active. If n
 - **Windows: hashrate drops when the window isn't focused.** Windows power-throttles background apps to save energy. Set **Power mode** to *Best Performance* (Settings → System → Power & battery), plug in a laptop, or just keep the miner window in the foreground.
 - **Windows: a "Windows protected your PC" (SmartScreen) prompt** for the native engine. The `brc-pow` binary you build locally is unsigned. It's the engine you just compiled — choose *More info → Run anyway*, or stick with the wasm engine.
 - **Windows: the menu looks garbled.** Use **Windows Terminal** or **PowerShell 7** (the arrow-key dashboard needs modern ANSI support), or run plain mode with `npm start -- --no-tui`.
+- **Windows: the dashboard won't draw on an older console.** Some legacy consoles can't sustain the full-screen dashboard. The miner now detects this and automatically switches to **plain text mode** for the rest of the run, so it keeps mining instead of stopping. If even plain output can't reach your console, the miner keeps grinding and submitting shares in the background regardless — your earnings are unaffected and visible on the pool page. To skip the dashboard up front, run `npm start -- --no-tui`.
 - **Reconfigure from scratch.** Delete `.env.local` and run `npm start` again, or open settings (**s**, or `npm run settings`).
 
 ## How it works
 
-FulgurMiner syncs BrowserCoin's chain from public API helpers, builds a block template that pays the coinbase to your address, and searches for a proof-of-work solution across your CPU cores (Argon2id hashing). In **solo** mode it submits a full block when it finds one; in **pool** mode it submits *shares*, which the pool aggregates and splits. It's the same proof-of-work the browser app uses — just running headless, on the native core, across all your cores. The native core only *proposes* nonces; every solution is independently rebuilt and re-validated before submission, so it can never get an invalid block accepted.
+FulgurMiner syncs BrowserCoin's chain from public API helpers, with automatic failover across them. A single helper outage is hidden and hashing keeps going. (If every helper is unreachable while catching up to a new tip, the miner pauses stale work and keeps retrying rather than building on an outdated chain.) It builds a block template that pays the coinbase to your address, and searches for a proof-of-work solution across your CPU cores (Argon2id hashing). In **solo** mode it submits a full block when it finds one; in **pool** mode it submits *shares*, which the pool aggregates and splits. It's the same proof-of-work the browser app uses — just running headless, on the native core, across all your cores. The native core only *proposes* nonces; every solution is independently rebuilt and re-validated before submission, so it can never get an invalid block accepted.
 
 ---
 

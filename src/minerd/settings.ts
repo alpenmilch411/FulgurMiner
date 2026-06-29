@@ -13,9 +13,10 @@ import {
   readEnvFile, persist, readExtraPools, type PoolEntry,
 } from './envLocal.js';
 import { FULGURPOOL_NAME, REPO_URL } from './config.js';
+import { SMART_THROTTLE_EXPLAIN } from './menuCopy.js';
 import {
-  THROTTLE_PRESETS, throttleLabel, clampWorkers, MAX_WORKERS, DEFAULT_WORKERS, currentEngine,
-  currentMode, modeLabel, MODE_OPTIONS, type SmartMode,
+  THROTTLE_PRESETS, throttleLabel, throttleIndex, clampWorkers, MAX_WORKERS, DEFAULT_WORKERS,
+  currentEngine, currentMode, modeLabel, MODE_OPTIONS, type SmartMode,
 } from './selectors.js';
 import { nativeEngineAvailable } from './engine.js';
 
@@ -195,7 +196,23 @@ async function editMode(rl: RL): Promise<void> {
 
 async function editThrottle(rl: RL): Promise<void> {
   if (currentMode(process.env.MINER_SMART) !== 'off') {
-    console.log('\n  Throttle is automatic in Smart mode — switch Mode to Manual to set it by hand.\n');
+    // Mirror the About-pane explanation from the arrow-key menu (menu↔settings parity).
+    // Word-wrap at 70 cols with two-space indent to match the settings menu style.
+    const words = SMART_THROTTLE_EXPLAIN.split(/\s+/);
+    const indent = '  ';
+    const maxW = 70;
+    console.log('');
+    let line = indent;
+    for (const w of words) {
+      if (line.length + (line === indent ? 0 : 1) + w.length > maxW && line !== indent) {
+        console.log(line);
+        line = indent + w;
+      } else {
+        line += (line === indent ? '' : ' ') + w;
+      }
+    }
+    if (line !== indent) console.log(line);
+    console.log('');
     return;
   }
   // Bounded selector over the sensible presets.
@@ -207,10 +224,20 @@ async function editThrottle(rl: RL): Promise<void> {
     if (v === '') return;
     const idx = Number(v) - 1;
     if (Number.isInteger(idx) && idx >= 0 && idx < THROTTLE_PRESETS.length) {
-      const value = THROTTLE_PRESETS[idx]!.value.toFixed(2);
+      const preset = THROTTLE_PRESETS[idx]!;
+      const value = preset.value.toFixed(2);
       persist({ MINER_THROTTLE: value });
       process.env.MINER_THROTTLE = value;
-      console.log(`  Throttle set to ${value} (${THROTTLE_PRESETS[idx]!.label}).\n`);
+      console.log(`  Throttle set to ${value} (${preset.label}).\n`);
+      // Caution: Manual at 100% (Max) runs every core flat-out — mirror the
+      // in-menu warning so users who prefer settings.ts get the same heads-up.
+      if (THROTTLE_PRESETS[throttleIndex(process.env.MINER_THROTTLE)]!.value >= 1) {
+        console.log('  Caution: Manual at 100% runs every CPU core flat-out. On a machine with');
+        console.log('  limited cooling this can cause instability (graphics glitches or crashes),');
+        console.log('  and sustained use keeps temperatures high — which can accelerate hardware');
+        console.log('  wear. For long or unattended mining, Smart: Considerate is safer.');
+        console.log('  (Select [4] Mode → Smart: Considerate to enable it.)\n');
+      }
       return;
     }
     console.log(`  Enter a number 1–${THROTTLE_PRESETS.length}, or Enter to cancel.\n`);
@@ -309,7 +336,8 @@ export async function runSettings(): Promise<void> {
 // load .env.local first so the menu shows the user's saved values.
 import { fileURLToPath } from 'node:url';
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  const { installCrashGuard } = await import('./crashGuard.js');
+  const { installCrashGuard, installStdioErrorSink } = await import('./crashGuard.js');
+  installStdioErrorSink();
   installCrashGuard();
   const { assertNodeVersion } = await import('./version.js');
   assertNodeVersion();

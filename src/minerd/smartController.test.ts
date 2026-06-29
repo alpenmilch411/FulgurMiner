@@ -149,3 +149,47 @@ test('demand reacts every tick, not gated by the (large) thermal dwell', () => {
   for (let i = 0; i < 20; i++) { now += 1000; sc.tick(); }
   assert.ok(applied > 0.5, `recovered after idle returned: ${applied}`);
 });
+
+// ─── phase() tests ────────────────────────────────────────────────────────────
+
+test('phase() returns ramping while still climbing toward the thermal knee', () => {
+  let now = 0;
+  const sink = { setThrottle: (_t: number) => {} };
+  // Large dwell so the slow thermal loop never fires here — isolates ramping state.
+  const sc = new SmartController(sink, { dwellMs: 300_000, start: 0.4 }, () => now);
+  // On first construction holding=false, applied==t → ramping
+  assert.equal(sc.phase(), 'ramping');
+  now += 500; sc.tick();
+  assert.equal(sc.phase(), 'ramping');
+});
+
+test('phase() returns easing when demand clamps applied below the thermal target', () => {
+  let idleFrac = 0.0; // CPU fully busy — demand will backoff hard
+  const demand = { cpuIdleFraction: () => idleFrac };
+  const sink = { setThrottle: (_t: number) => {} };
+  let now = 0;
+  // Large dwell so the slow thermal loop never fires; isolates the fast demand path.
+  const sc = new SmartController(
+    sink,
+    { dwellMs: 300_000, start: 0.9, step: 0.05 },
+    () => now,
+    { demand, headroom: 0.25 },
+  );
+  now += 1000; sc.tick(); // demand spike → demandAllowed drops well below t
+  assert.equal(sc.isClamped(), true, 'precondition: should be clamped');
+  assert.equal(sc.phase(), 'easing');
+});
+
+test('phase() returns holding after the hill-climb settles at the thermal knee', () => {
+  let now = 0; const clock = () => now;
+  let applied = 0.75;
+  const sink = { setThrottle: (t: number) => { applied = t; } };
+  const sc = new SmartController(sink, { dwellMs: 1000, step: 0.05, start: 0.4 }, clock);
+  // Drive many windows so the slow loop converges
+  for (let i = 0; i < 200; i++) {
+    for (let s = 0; s < 5; s++) { sc.onHashrate(machine()(applied)); now += 200; }
+    sc.tick();
+  }
+  // After convergence holding should be true (applied==t, holding==true)
+  assert.equal(sc.phase(), 'holding', `expected holding after convergence, applied=${applied}`);
+});

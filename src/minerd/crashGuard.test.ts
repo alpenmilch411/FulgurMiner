@@ -1,17 +1,22 @@
 // src/minerd/crashGuard.test.ts
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { isTerminalGoneError, handleFatal, installCrashGuard } from './crashGuard.js';
+import { EventEmitter } from 'node:events';
+import { isTerminalGoneError, handleFatal, installCrashGuard, installStdioErrorSink } from './crashGuard.js';
 
-test('isTerminalGoneError: console/pipe-gone codes are terminal-gone', () => {
+test('isTerminalGoneError: only unambiguous local-console-write codes are terminal-gone', () => {
   assert.equal(isTerminalGoneError({ code: 'EPIPE' }), true);
   assert.equal(isTerminalGoneError({ code: 'EIO' }), true);
   assert.equal(isTerminalGoneError({ code: 'ENXIO' }), true);
-  assert.equal(isTerminalGoneError({ code: 'ECONNRESET' }), true);
-  assert.equal(isTerminalGoneError({ code: 'ERR_STREAM_DESTROYED' }), true);
 });
 
-test('isTerminalGoneError: unrelated errors are not terminal-gone', () => {
+test('isTerminalGoneError: network-ambiguous and unrelated errors are NOT terminal-gone', () => {
+  // ECONNRESET / ERR_STREAM_DESTROYED are not console-specific (a socket reset is
+  // a real fatal). They must stay fatal at the global handler; a *console-stream*
+  // error of any code is still absorbed by the stdout/stderr sink, which is scoped
+  // to the stream rather than keyed on the code.
+  assert.equal(isTerminalGoneError({ code: 'ECONNRESET' }), false);
+  assert.equal(isTerminalGoneError({ code: 'ERR_STREAM_DESTROYED' }), false);
   assert.equal(isTerminalGoneError({ code: 'ENOENT' }), false);
   assert.equal(isTerminalGoneError(new Error('boom')), false);
   assert.equal(isTerminalGoneError(null), false);
@@ -56,6 +61,50 @@ test('handleFatal never throws even if the restore write fails', () => {
     exit: (c: number) => { exitCode = c; },
   }));
   assert.equal(exitCode, 1);
+});
+
+test('installStdioErrorSink: a stdout/stderr error is swallowed (never unhandled) and is removable', () => {
+  const out = new EventEmitter();
+  const err = new EventEmitter();
+  const uninstall = installStdioErrorSink({ out, err });
+  assert.equal(out.listenerCount('error'), 1, 'attaches an error listener to stdout');
+  assert.equal(err.listenerCount('error'), 1, 'attaches an error listener to stderr');
+  // With a listener attached, emit('error') must NOT throw. Without the sink a
+  // stream 'error' event with no listener crashes the process — that is exactly
+  // the lost-console death we are preventing (the miner keeps running instead).
+  assert.doesNotThrow(() => out.emit('error', Object.assign(new Error('write EPIPE'), { code: 'EPIPE' })));
+  assert.doesNotThrow(() => err.emit('error', new Error('stderr broke')));
+  uninstall();
+  assert.equal(out.listenerCount('error'), 0, 'uninstall removes the stdout listener');
+  assert.equal(err.listenerCount('error'), 0, 'uninstall removes the stderr listener');
+});
+
+test('installCrashGuard: a lost console does NOT exit the miner and does NOT latch out a later real crash', () => {
+  let exits = 0;
+  const before = process.listeners('uncaughtException');
+  const uninstall = installCrashGuard({ exit: () => { exits++; }, out: { write: () => true }, err: { write: () => true } });
+  const after = process.listeners('uncaughtException');
+  const onFatal = after.find((h) => !before.includes(h)) as (e: unknown) => void;
+  assert.ok(onFatal, 'captured the installed handler');
+
+  // A terminal-gone error (EPIPE et al.) is benign for a miner — grinding and
+  // share submission are network-bound, independent of stdout. Swallow + keep
+  // mining; never tear down (process.exit also trips a libuv teardown assertion
+  // on some Windows consoles).
+  onFatal(Object.assign(new Error('write EPIPE'), { code: 'EPIPE' }));
+  assert.equal(exits, 0, 'a lost console must not exit the miner');
+
+  // A network-ambiguous code (ECONNRESET) is NOT a lost console — it must stay
+  // fatal so a real socket failure is never silently swallowed.
+  onFatal(Object.assign(new Error('socket reset'), { code: 'ECONNRESET' }));
+  assert.equal(exits, 1, 'a network reset is a real fatal, not a lost console');
+
+  // The swallow must NOT consume the once-guard for the earlier EPIPE; but once a
+  // real fatal has fired, the guard latches (the process is already exiting).
+  onFatal(new Error('a later bug'));
+  assert.equal(exits, 1, 'handleFatal fires once; subsequent errors are ignored');
+
+  uninstall();
 });
 
 test('installCrashGuard wires both process handlers and can be removed', () => {

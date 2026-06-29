@@ -21,6 +21,19 @@ export const NATIVE_NEEDS_RUST =
   `Native (Rust) is faster, but the Rust toolchain isn't installed on this machine — so this stays on the portable WASM engine for now. To enable native: install Rust from https://rustup.rs, then restart FulgurMiner. Step-by-step in the repo README: ${REPO_URL}`;
 
 /**
+ * Shown (in yellow) in the right "About" pane when the user has Manual mode and
+ * Throttle at Max (100%) — the "full blast" configuration that pins every CPU
+ * core. Warns about instability and sustained heat, and recommends Considerate
+ * for long or unattended sessions.
+ */
+export const FULL_BLAST_CAUTION =
+  `Full blast: Manual at 100% runs every CPU core flat-out. On a machine with\n` +
+  `limited cooling this can cause instability (graphics glitches or crashes),\n` +
+  `and sustained use keeps temperatures high — which can accelerate hardware\n` +
+  `wear over time. For long or unattended mining, Smart: Considerate is safer:\n` +
+  `it leaves headroom and eases off when you need the CPU.`;
+
+/**
  * One short explanation per main-menu row, shown in the right "About" pane when
  * that row is highlighted (self-documenting menu). Plain sentences — the menu
  * renderer adds any styling/wrapping. Keyed by RowKind so every row is covered.
@@ -63,13 +76,24 @@ export function whereExplain(opts: { isDefault: boolean; isSolo: boolean; name: 
   return `${opts.name} is one of your configured pools. Mining here sends your shares to that pool.`;
 }
 
+/**
+ * Shown (in DIM) in the right "About" pane when the user highlights the
+ * Throttle row while Smart mode is active. Explains that the Throttle is a
+ * starting point, not a fixed value, and describes how the auto-tuner adapts.
+ */
+export const SMART_THROTTLE_EXPLAIN =
+  `In Smart mode this is the STARTING point the auto-tuner climbs from — not a fixed value. ` +
+  `The live rate floats on its own: up toward the most your machine sustains, and (Considerate) ` +
+  `down to as low as 5% when your apps need the CPU. It ramps gradually, so give it a minute. ` +
+  `To set a fixed rate instead, switch Mode to Manual.`;
+
 /** Explanation for a Smart Mode option, shown in the Mode picker's right pane. */
 export function modeExplain(mode: SmartMode): string {
   if (mode === 'off') {
     return 'You set the duty cycle by hand with the Throttle setting. No auto-tuning.';
   }
   if (mode === 'max') {
-    return 'Auto-tunes the duty cycle to the highest your machine sustains. On a well-cooled machine this is about the same as running at 100% by hand — the win is it finds that point for you and adapts to heat and load.';
+    return 'Auto-tunes to the highest level your machine sustains and stays there (no headroom reserved). Starts from your Throttle and ramps up gradually. Best for a dedicated mining machine.';
   }
-  return 'Auto-tunes like Max, but adapts to what the rest of your machine is doing — eases off when your other apps need the CPU, and ramps back up when they go quiet. You mine the spare capacity. Best everyday average.';
+  return 'Auto-tunes the throttle and eases off when your other apps need the CPU. Starts from your Throttle setting and ramps up gradually toward the most your machine sustains, backing down to as low as 5% while you\'re using the PC. Best for set-and-forget on a machine you also use. On a dedicated server or VPS, use Max or Manual instead — on shared/virtual CPUs the idle reading is unreliable and can make it oscillate.';
 }

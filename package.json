@@ -1,6 +1,6 @@
 {
   "name": "fulgurminer",
-  "version": "0.2.4",
+  "version": "0.2.6",
   "private": false,
   "type": "module",
   "description": "FulgurMiner — standalone terminal miner for BrowserCoin. Mine without a browser.",

@@ -24,7 +24,7 @@ import {
   clampWorkers, MAX_WORKERS, DEFAULT_WORKERS, workersDisplay, currentEngine, engineRowValue,
   MODE_OPTIONS, currentMode, modeIndex, modeLabel,
 } from './selectors.js';
-import { ROW_EXPLAIN, modeExplain, whereExplain, NATIVE_NEEDS_RUST } from './menuCopy.js';
+import { ROW_EXPLAIN, modeExplain, whereExplain, NATIVE_NEEDS_RUST, FULL_BLAST_CAUTION, SMART_THROTTLE_EXPLAIN } from './menuCopy.js';
 import { nativeEngineAvailable } from './engine.js';
 
 // --- ANSI helpers (kept local so the menu has no import coupling to tui.ts) --
@@ -804,8 +804,26 @@ export class StartMenu {
     // the normal dim "About" text with a RED notice explaining the wasm fallback
     // and how to enable native (rustup.rs + repo README).
     const onEngineNeedsRust = this.currentRow().kind === 'engine' && this.nativeUnavailableSelected();
-    const explain = onEngineNeedsRust ? NATIVE_NEEDS_RUST : (ROW_EXPLAIN[this.currentRow().kind] ?? '');
-    const explainStyle = onEngineNeedsRust ? RED : DIM;
+    // On the Throttle row, when Manual mode + Max throttle (full blast), show a
+    // YELLOW caution about instability and sustained heat. native-needs-rust wins
+    // if both apply (engine row and throttle row are different, so they can't
+    // both be true, but the precedence is stated explicitly for clarity).
+    const onFullBlast = !onEngineNeedsRust
+      && this.currentRow().kind === 'throttle'
+      && currentMode(process.env.MINER_SMART) === 'off'
+      && THROTTLE_PRESETS[throttleIndex(process.env.MINER_THROTTLE)]!.value >= 1;
+    // On the Throttle row in Smart mode, show a DIM explanation that the value
+    // is a starting point, not a fixed rate (can't collide with full-blast,
+    // which requires Manual; full-blast check already gates on MINER_SMART === 'off').
+    const onSmartThrottle = !onEngineNeedsRust
+      && !onFullBlast
+      && this.currentRow().kind === 'throttle'
+      && currentMode(process.env.MINER_SMART) !== 'off';
+    const explain = onEngineNeedsRust ? NATIVE_NEEDS_RUST
+      : onFullBlast ? FULL_BLAST_CAUTION
+      : onSmartThrottle ? SMART_THROTTLE_EXPLAIN
+      : (ROW_EXPLAIN[this.currentRow().kind] ?? '');
+    const explainStyle = onEngineNeedsRust ? RED : onFullBlast ? YELLOW : DIM;
     const paned = this.twoPane(cols, 'FulgurMiner', (inner) => this.buildMainRows(inner), explain, this.mainHint(), explainStyle);
     if (paned) return paned;
     const inner = this.mainWidth(cols) - 2;
