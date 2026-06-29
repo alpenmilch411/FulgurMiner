@@ -4,8 +4,16 @@
 # your browser. Mining runs as a detached child of the server, so it keeps going
 # even if you close this window.
 
-# Resolve this script's own directory so it works wherever the repo is cloned.
-REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Resolve this script's own directory, FOLLOWING SYMLINKS, so it works both when
+# run directly and via the Desktop shortcut (install-shortcut.mjs symlinks this
+# file onto the Desktop; without resolving the link, REPO would be ~/Desktop).
+SOURCE="${BASH_SOURCE[0]}"
+while [ -h "$SOURCE" ]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+REPO="$(cd -P "$(dirname "$SOURCE")" && pwd)"
 URL="http://localhost:7311"
 PORT=7311
 

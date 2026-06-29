@@ -6,8 +6,15 @@
 #
 # Make executable once:  chmod +x FulgurMiner-Linux.sh
 
-# Resolve this script's own directory so it works wherever the repo is cloned.
-REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Resolve this script's own directory, FOLLOWING SYMLINKS, so it works wherever
+# the repo is cloned and even if the launcher is reached via a symlink.
+SOURCE="${BASH_SOURCE[0]}"
+while [ -h "$SOURCE" ]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+REPO="$(cd -P "$(dirname "$SOURCE")" && pwd)"
 URL="http://localhost:7311"
 PORT=7311
 
