@@ -45,9 +45,13 @@ function installWindows() {
 function installMac() {
   const cmd = path.join(REPO, 'FulgurMiner-macOS.command');
   if (!existsSync(cmd)) return fail(`launcher not found: ${cmd}`);
-  const link = path.join(os.homedir(), 'Desktop', 'FulgurMiner.command');
+  const desktop = path.join(os.homedir(), 'Desktop');
+  const link = path.join(desktop, 'FulgurMiner.command');
   try {
-    if (existsSync(link)) rmSync(link);
+    mkdirSync(desktop, { recursive: true });
+    // force:true removes a regular file OR a dangling symlink (existsSync would
+    // follow the link and miss a dangling one), and no-ops if nothing is there.
+    rmSync(link, { force: true });
     symlinkSync(cmd, link);
     try { chmodSync(cmd, 0o755); } catch {}
     ok(`Desktop shortcut created: ${link}`);
@@ -66,7 +70,7 @@ function installLinux() {
     'Type=Application',
     'Name=FulgurMiner',
     'Comment=BrowserCoin mining control panel',
-    `Exec=${sh}`,
+    `Exec="${sh}"`,
     `Icon=${icon}`,
     `Path=${REPO}`,
     'Terminal=false',

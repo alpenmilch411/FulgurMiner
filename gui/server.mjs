@@ -21,6 +21,7 @@
 import http from 'node:http';
 import { spawn, spawnSync } from 'node:child_process';
 import { readFileSync, writeFileSync, existsSync, readdirSync, statSync } from 'node:fs';
+import { readFile as readFileAsync } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -100,8 +101,7 @@ let settings = loadSettings();
 
 // ─── Live miner state ───────────────────────────────────────────────────────
 const HASH_WINDOW = 30; // rolling-average window (~30 samples ≈ 30s)
-let child = null;
-let stopping = false;         // set while we intentionally kill the miner (stop/restart)
+let child = null;             // the current miner process (its .{_stopped} marks an intentional kill)
 let caffeinate = null;        // per-mine keep-awake handle
 let serverCaffeinate = null;  // server-lifetime keep-awake handle
 
@@ -280,24 +280,48 @@ function newestSnapshot() {
   }
 }
 
-function readBalance(wallet) {
-  if (!/^[0-9a-f]{64}$/.test(wallet)) return null;
+let refreshingBalance = false;
+
+// Refresh the cached balance OFF the request path. The snapshot is ~10 MB, so a
+// synchronous read+parse inside /api/status (polled ~1s) would stall the event
+// loop — blocking start/stop and child stdout — every time the miner rewrites the
+// snapshot (~60s). Instead this runs on a timer (and on demand) with an async read.
+async function refreshBalance() {
+  const wallet = settings.wallet;
+  if (!/^[0-9a-f]{64}$/.test(wallet)) {
+    balCache = { wallet, file: null, mtimeMs: 0, brc: null, anchorHeight: null };
+    return;
+  }
   const snap = newestSnapshot();
-  if (!snap) return null;
-  // Serve from cache unless the wallet changed or the snapshot was rewritten.
-  if (balCache.wallet === wallet && balCache.file === snap.file && balCache.mtimeMs === snap.mtimeMs) {
+  if (!snap) return;
+  // Up to date for this wallet + snapshot? Nothing to do.
+  if (balCache.wallet === wallet && balCache.file === snap.file && balCache.mtimeMs === snap.mtimeMs) return;
+  if (refreshingBalance) return; // a parse is already in flight
+  refreshingBalance = true;
+  try {
+    const j = JSON.parse(await readFileAsync(snap.file, 'utf8'));
+    const row = (j.state || []).find((r) => String(r[0]).toLowerCase() === wallet);
+    // Snapshot balances are integer wei strings; tolerate anything else without throwing.
+    let wei = 0n;
+    try { if (row) wei = BigInt(row[1]); } catch { wei = 0n; }
+    // Exact within BrowserCoin's max supply (21M BRC = 2.1e15 wei < MAX_SAFE_INTEGER).
+    balCache = { wallet, file: snap.file, mtimeMs: snap.mtimeMs, brc: Number(wei) / COIN, anchorHeight: j.anchorHeight ?? null };
+  } catch {
+    /* keep the previous cache on read/parse error */
+  } finally {
+    refreshingBalance = false;
+  }
+}
+
+// Synchronous, non-blocking read of the cached balance for the status payload.
+// Returns the cache only when it matches the current wallet; otherwise it kicks
+// off a refresh (fire-and-forget) and reports null until that completes.
+function balanceForStatus() {
+  if (balCache.wallet === settings.wallet && balCache.brc != null) {
     return { brc: balCache.brc, anchorHeight: balCache.anchorHeight };
   }
-  try {
-    const j = JSON.parse(readFileSync(snap.file, 'utf8'));
-    const row = (j.state || []).find((r) => String(r[0]).toLowerCase() === wallet);
-    const wei = row ? BigInt(row[1]) : 0n;
-    const brc = Number(wei) / COIN;
-    balCache = { wallet, file: snap.file, mtimeMs: snap.mtimeMs, brc, anchorHeight: j.anchorHeight ?? null };
-    return { brc, anchorHeight: j.anchorHeight ?? null };
-  } catch {
-    return null;
-  }
+  refreshBalance();
+  return null;
 }
 
 function statusPayload() {
@@ -314,7 +338,7 @@ function statusPayload() {
     pool: settings.pool,                   // 'solo' | 'pool'
     poolUrl: settings.poolUrl,
     poolStats: state.pool,                 // { earned, pending, paid } in BRC (pool mode)
-    balance: readBalance(settings.wallet), // { brc, anchorHeight } | null
+    balance: balanceForStatus(),           // { brc, anchorHeight } | null (refreshed off the request path)
     cores: CORES,
     platform: process.platform,
     height: state.height,
@@ -414,8 +438,9 @@ function startMiner() {
   state.startedAt = Date.now();
   pushLog(`[gui] starting miner — engine=${settings.engine} mode=${settings.mode} workers=${settings.workers} throttle=${settings.throttle}`);
 
+  let proc;
   try {
-    child = spawn(IS_WIN ? 'npm.cmd' : 'npm', ['run', 'mine'], {
+    proc = spawn(IS_WIN ? 'npm.cmd' : 'npm', ['run', 'mine'], {
       cwd: REPO_DIR,
       detached: !IS_WIN,         // POSIX: own process group → kill the whole tree
       shell: IS_WIN,             // Windows: spawning a .cmd needs a shell (else EINVAL,
@@ -430,11 +455,13 @@ function startMiner() {
     child = null;
     return { ok: false, error: state.lastError };
   }
+  child = proc;
 
-  child.stdout.on('data', (b) => handleChunk(b, 'out'));
-  child.stderr.on('data', (b) => handleChunk(b, 'err'));
+  proc.stdout.on('data', (b) => handleChunk(b, 'out'));
+  proc.stderr.on('data', (b) => handleChunk(b, 'err'));
 
-  child.on('error', (e) => {
+  proc.on('error', (e) => {
+    if (child !== proc) return;  // a newer miner already replaced this one
     state.status = 'error';
     state.lastError = `spawn failed: ${e.message}`;
     pushLog(`[gui] ERROR ${state.lastError}`);
@@ -442,24 +469,23 @@ function startMiner() {
     stopCaffeinate();
   });
 
-  child.on('exit', (code, signal) => {
+  proc.on('exit', (code, signal) => {
     pushLog(`[gui] miner exited (code=${code} signal=${signal || '-'})`);
-    // `stopping` covers Windows, where taskkill /F surfaces as a non-zero exit
-    // code (not a signal) — without it an intentional stop would look like a crash.
-    const wasIntentional = stopping || signal === 'SIGKILL' || signal === 'SIGTERM';
-    child = null;
     stopCaffeinate();
-    if (wasIntentional) {
-      state.status = 'idle';
-      state.startedAt = null;
-    } else if (code && code !== 0) {
+    // Ignore a stale exit: if a restart already swapped in a newer child, this
+    // late event must not null it out (that would orphan the running miner).
+    if (child !== proc) return;
+    child = null;
+    // `_stopped` marks an intentional kill; on Windows taskkill /F surfaces as a
+    // non-zero exit code (not a signal), so without it a stop looks like a crash.
+    const wasIntentional = proc._stopped || signal === 'SIGKILL' || signal === 'SIGTERM';
+    if (!wasIntentional && code) {
       state.status = 'error';
       if (!state.lastError) state.lastError = `miner exited with code ${code}`;
     } else {
       state.status = 'idle';
       state.startedAt = null;
     }
-    stopping = false;
   });
 
   // Per-mine keep-awake (in addition to the server-lifetime one) — belt & braces.
@@ -481,10 +507,10 @@ function stopMiner() {
     state.startedAt = null;
     return { ok: true, already: true };
   }
-  const pid = child.pid;
+  const proc = child;
   pushLog('[gui] stopping miner…');
-  stopping = true;
-  killTree(pid, child);
+  proc._stopped = true;
+  killTree(proc.pid, proc);
   child = null;
   stopCaffeinate();
   state.status = 'idle';
@@ -495,9 +521,9 @@ function stopMiner() {
 function restartMiner() {
   if (!child) return;
   pushLog('[gui] config changed — restarting miner (chain is cached, fast)…');
-  const pid = child.pid;
-  stopping = true;
-  killTree(pid, child);
+  const proc = child;
+  proc._stopped = true;
+  killTree(proc.pid, proc);
   child = null;
   stopCaffeinate();
   // Give the OS a beat to release handles, then relaunch.
@@ -558,9 +584,11 @@ const server = http.createServer(async (req, res) => {
     const body = await readBody(req);
     // Keep the current wallet if the incoming one is invalid (never silently reset).
     const next = sanitizeSettings({ ...settings, ...body }, settings.wallet);
+    const walletChanged = next.wallet !== settings.wallet;
     const changed = JSON.stringify(next) !== JSON.stringify(settings);
     settings = next;
     saveSettings();
+    if (walletChanged) refreshBalance(); // recompute for the new address, off the request path
     if (changed && child) restartMiner();
     return sendJSON(res, 200, { ok: true, changed, ...statusPayload() });
   }
@@ -581,6 +609,9 @@ process.on('exit', cleanup);
 
 server.listen(PORT, HOST, () => {
   startServerCaffeinate();
+  // Keep the cached balance fresh off the request path (see refreshBalance).
+  refreshBalance();
+  setInterval(refreshBalance, 15000).unref();
   console.log(`[gui] FulgurMiner control panel → http://${HOST}:${PORT}`);
   console.log(`[gui] platform=${process.platform} repo=${REPO_DIR} cores=${CORES}`);
 });
