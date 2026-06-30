@@ -652,7 +652,32 @@ function readBody(req) {
   });
 }
 
+// Same-origin allow-list for the loopback bind.
+const ALLOWED_HOSTS = new Set([`127.0.0.1:${PORT}`, `localhost:${PORT}`]);
+const ALLOWED_ORIGINS = new Set([`http://127.0.0.1:${PORT}`, `http://localhost:${PORT}`]);
+
 const server = http.createServer(async (req, res) => {
+  // ── CSRF / DNS-rebind guard ──────────────────────────────────────────────
+  // The panel changes state (incl. the payout wallet via POST /api/config), so a
+  // random page you have open must not be able to drive it.
+  //   • Host allow-list → blocks DNS-rebinding: a hostile domain re-pointed at
+  //     127.0.0.1 still sends ITS Host header, which won't match the loopback bind.
+  //   • POSTs must be same-origin application/json → blocks form-based CSRF: a
+  //     cross-site <form> can only send text/plain|urlencoded|multipart (never
+  //     application/json without a CORS preflight we never answer), and browsers
+  //     stamp Origin on cross-origin POSTs. CLI/curl (no Origin) is still allowed.
+  const host = String(req.headers.host || '').toLowerCase();
+  if (!ALLOWED_HOSTS.has(host)) {
+    return sendJSON(res, 403, { ok: false, error: 'forbidden: bad Host (loopback only)' });
+  }
+  if (req.method === 'POST') {
+    const ct = String(req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
+    const origin = req.headers.origin;
+    if (ct !== 'application/json' || (origin && !ALLOWED_ORIGINS.has(String(origin).toLowerCase()))) {
+      return sendJSON(res, 403, { ok: false, error: 'forbidden: same-origin application/json required' });
+    }
+  }
+
   const url = new URL(req.url, `http://${HOST}:${PORT}`);
   const p = url.pathname;
 
