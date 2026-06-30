@@ -237,6 +237,38 @@ MINER_PUBKEY=<your-address> npm run mine:dryrun
 
 The update check is quiet and best-effort: it reads the latest version from the project's [GitHub releases](https://github.com/alpenmilch411/FulgurMiner/releases) (plus the pool's notice / required-version signal) and fails silently offline. The miner runs from source, so updating is a `git pull && npm install` (or, if you installed from the ZIP, download the latest ZIP and run `npm install` again). Turn the check off with **Check for updates → off** or `FULGUR_NO_UPDATE_CHECK=1`. FulgurMiner never runs an update for you.
 
+## Docker
+
+Docker runs FulgurMiner with plain logs, persisted state, and the native engine built in. Install Docker from [docs.docker.com/get-docker](https://docs.docker.com/get-docker/).
+
+### Run with Docker
+
+If you have the repo cloned:
+
+```bash
+git checkout main
+git pull
+MINER_PUBKEY=<your-address> docker compose up --build
+```
+
+If you do not have the repo cloned:
+
+```bash
+docker pull ghcr.io/alpenmilch411/fulgurminer:v0.2.4
+docker run --rm -it --init \
+  -e MINER_PUBKEY=<your-address> \
+  -v fulgurminer-data:/data \
+  ghcr.io/alpenmilch411/fulgurminer:v0.2.4
+```
+
+Defaults: FulgurPool, native engine, full throttle, and all available CPU cores. Override with the same env vars as a normal run.
+
+### Publish image
+
+For maintainers, run the **Publish Docker Image** workflow from GitHub Actions and enter the version tag, for example `v0.2.4`.
+
+It publishes `ghcr.io/alpenmilch411/fulgurminer:<version>` and a matching `sha-...` tag.
+
 ## Native engine
 
 By default FulgurMiner uses a portable **wasm** engine that runs anywhere Node runs — zero setup. The **native** (Rust) engine is ~1.9× faster (see [Performance](#performance)). Switch via the **Engine** setting (or `MINER_NATIVE=1`). On the next start FulgurMiner:
