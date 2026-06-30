@@ -1,0 +1,11 @@
+# Keep line endings correct across OSes regardless of contributors' core.autocrlf.
+* text=auto
+
+# Unix shell launchers MUST stay LF — a CRLF in the shebang breaks execution on
+# macOS/Linux ("bad interpreter: /bin/bash^M").
+*.sh        text eol=lf
+*.command   text eol=lf
+
+# Windows batch files want CRLF.
+*.bat       text eol=crlf
+*.cmd       text eol=crlf
