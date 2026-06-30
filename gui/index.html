@@ -299,7 +299,9 @@ function applyCfgToUI(){
   [...$('segEngine').children].forEach(b=>b.classList.toggle('active',b.dataset.v===cfg.engine));
   [...$('segMode').children].forEach(b=>b.classList.toggle('active',b.dataset.v===cfg.mode));
   $('wkRange').value=cfg.workers; $('wkCur').textContent=cfg.workers; paintTicks(cfg.workers);
-  const th=Math.round(cfg.throttle*100);
+  // Smart modes own the duty cycle: Max = 100%, Considerate = 50%. Only Manual
+  // shows the user's slider value (kept in cfg.throttle, so it's restored on return).
+  const th = cfg.mode==='max' ? 100 : cfg.mode==='considerate' ? 50 : Math.round(cfg.throttle*100);
   $('thRange').value=th; $('thCur').textContent=th+'%';
   const manual = cfg.mode==='manual';
   $('thRange').disabled=!manual;

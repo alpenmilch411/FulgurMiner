@@ -44,6 +44,12 @@ const DEFAULT_WALLET = '';
 const COIN = 1e8; // 1 BRC = 1e8 wei
 // FulgurPool — the project's default pool (same value the miner uses).
 const FULGURPOOL_URL = 'https://pool.fulgurpool.xyz';
+// Smart-mode duty cycles. The miner seeds BOTH the grind pool and the SmartController
+// with MINER_THROTTLE as the STARTING duty cycle, so the mode must set it: Max starts
+// full-tilt (the controller only eases off for thermals/CPU), Considerate starts eased.
+// Manual uses the user's slider verbatim.
+const MAX_DUTY = 1;
+const CONSIDERATE_DUTY = 0.5;
 
 // ─── Persistent settings ──────────────────────────────────────────────────
 const DEFAULT_SETTINGS = {
@@ -502,7 +508,14 @@ function buildEnv() {
   env.FULGUR_TUI = '0';
   env.FULGUR_NO_UPDATE_CHECK = '1';
   env.MINER_WORKERS = String(settings.workers);
-  env.MINER_THROTTLE = String(settings.throttle);
+  // Mode owns the duty cycle (see MAX_DUTY/CONSIDERATE_DUTY): a leftover Manual
+  // throttle must NOT bleed into a Smart mode (else Max/Considerate start at the
+  // wrong level). Manual uses the slider value.
+  env.MINER_THROTTLE = String(
+    settings.mode === 'max' ? MAX_DUTY
+      : settings.mode === 'considerate' ? CONSIDERATE_DUTY
+        : settings.throttle,
+  );
 
   if (settings.engine === 'native') env.MINER_NATIVE = '1';
   else delete env.MINER_NATIVE;
