@@ -646,7 +646,9 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && (p === '/' || p === '/index.html')) {
     try {
       const html = readFileSync(INDEX_HTML);
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      // no-store: the page is a live dashboard shell; never let a browser serve a
+      // stale cached copy after the panel is updated (e.g. via git pull).
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
       res.end(html);
     } catch {
       res.writeHead(500); res.end('index.html missing');
