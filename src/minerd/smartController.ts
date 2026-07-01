@@ -16,6 +16,26 @@ interface ResolvedSmartDemandOptions {
 const CLAMP = (t: number) => Math.min(1, Math.max(0.05, t));
 const BACKOFF_GAIN = 3;
 
+/** Considerate starts eased; the demand signal yields further from there. */
+export const CONSIDERATE_START = 0.5;
+
+/**
+ * Starting duty cycle for the grind pool + SmartController, chosen by the SMART
+ * MODE — not the leftover MINER_THROTTLE. This is the fix for: lowering the manual
+ * throttle, then switching to Smart Max, made Max *start* at that low value and
+ * crawl up at step/dwell (e.g. 0.05 / 25s) instead of going full-tilt.
+ *
+ *   max         → 1   (straight to 100%; the controller then holds, only easing
+ *                      off if pushing harder doesn't actually raise H/s — thermals)
+ *   considerate → 0.5 (eased; the demand signal yields below this when the box is busy)
+ *   off         → the user's manual throttle, verbatim
+ */
+export function smartStartDuty(smart: 'off' | 'max' | 'considerate', manualThrottle: number): number {
+  if (smart === 'max') return 1;
+  if (smart === 'considerate') return CONSIDERATE_START;
+  return manualThrottle;
+}
+
 export class SmartController {
   private t: number; private bestT: number; private bestHps = 0;
   private applied: number;
