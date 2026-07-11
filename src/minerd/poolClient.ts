@@ -1,4 +1,5 @@
 // src/minerd/poolClient.ts
+import os from 'node:os';
 import { existsSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { GrindPool } from './grindPool.js';
@@ -569,6 +570,11 @@ export async function runPoolClient(
   let acceptedShares = 0;
   startPoolStats({ poolUrl, address: payoutAddress, getAcceptedShares: () => acceptedShares, pageUrl: undefined, reporter, signal });
 
+  // Grind at a lower scheduling priority so the machine stays usable — the solo path
+  // has always done this (miner.ts), the pool path never did, and pool is the DEFAULT.
+  // A dedicated miner is unaffected (nothing to lose a race to).
+  try { os.setPriority(10); } catch { /* not permitted on some platforms — ignore */ }
+
   const pool: GrindPool | NativeGrindPool = useNative
     ? new NativeGrindPool(workers, startDuty)
     : new GrindPool(workers, startDuty);
@@ -577,7 +583,12 @@ export async function runPoolClient(
       pool,
       { start: startDuty },
       undefined,
-      smart === 'considerate' ? { demand: createDemandSignal() } : undefined,
+      smart === 'considerate'
+        ? {
+          demand: createDemandSignal({ onWarn: (m) => reporter.event('warn', m) }),
+          workers,
+        }
+        : undefined,
     )
     : null;
   const post: PostShare = async (s) => {

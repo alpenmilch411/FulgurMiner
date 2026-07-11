@@ -611,7 +611,12 @@ export async function runMiner(
       pool,
       { start: startDuty },
       undefined,
-      cfg.smart === 'considerate' ? { demand: createDemandSignal() } : undefined,
+      cfg.smart === 'considerate'
+        ? {
+          demand: createDemandSignal({ onWarn: (m) => reporter.event('warn', m) }),
+          workers: cfg.workers,
+        }
+        : undefined,
     )
     : null;
 

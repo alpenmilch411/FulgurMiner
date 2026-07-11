@@ -143,7 +143,14 @@ test('demand reacts every tick, not gated by the (large) thermal dwell', () => {
 
   idleFrac = 0.0; // CPU demand spikes: backs off within one tick, not one dwell
   now += 1000; sc.tick();
-  assert.ok(applied <= 0.9 - 0.5, `fast demand back-off within 1 tick: ${applied}`);
+  // Reacts on the TICK (this is the regression this test guards). The size of the step
+  // is no longer a magic number: it used to require BACKOFF_GAIN=3, which is past the
+  // loop's stability bound (G·λ < 2) and made the throttle hunt ±5% forever on a normal
+  // desktop. The gain is now normalized by the plant slope — so assert it moves down
+  // immediately and converges quickly, not that it jumps a specific distance.
+  assert.ok(applied < 0.9, `fast demand back-off within 1 tick: ${applied}`);
+  for (let i = 0; i < 4; i++) { now += 1000; sc.tick(); }
+  assert.ok(applied <= 0.2, `converges out of the way in a few ticks: ${applied}`);
 
   idleFrac = 0.9; // CPU idle returns: recovers gently
   for (let i = 0; i < 20; i++) { now += 1000; sc.tick(); }

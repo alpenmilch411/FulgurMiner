@@ -1,4 +1,4 @@
-import type { DemandSignal } from './demand.js';
+import type { CpuReading, DemandSignal } from './demand.js';
 
 export interface ThrottleSink { setThrottle(t: number): void }
 export interface SmartConfig {
@@ -8,13 +8,36 @@ export interface SmartConfig {
 export interface SmartDemandOptions {
   demand?: DemandSignal;
   headroom?: number;
+  /** Grind workers. With the sampler's capacity this gives the plant slope λ = W/C. */
+  workers?: number;
 }
 interface ResolvedSmartDemandOptions {
   demand?: DemandSignal;
   headroom: number;
+  workers?: number;
 }
 const CLAMP = (t: number) => Math.min(1, Math.max(0.05, t));
-const BACKOFF_GAIN = 3;
+
+/**
+ * Demand-loop tuning.
+ *
+ * The plant: with W workers at duty d against C usable cores, the CPU we consume is
+ * ≈ W·d/C of the capacity, so the idle we measure moves with slope λ = W/C against
+ * our own duty. A fixed-step controller on that plant is stable only while
+ * |1 − G·λ| < 1, i.e. G·λ < 2.
+ *
+ * The old BACKOFF_GAIN of 3 ignored λ entirely: on a normal desktop (7 workers of 8
+ * cores, λ = 0.875) it ran at G·λ = 2.6 — over the bound — so the throttle hunted
+ * ±5% forever instead of settling. Normalizing by λ (which we know exactly: we chose
+ * W, and the sampler reports C) holds the loop gain at GAIN_NOM on every machine.
+ * GAIN_NOM = 1 yields a one-tick correction with a 2× stability margin.
+ */
+const GAIN_NOM = 1;
+const GAIN_MIN = 0.5;
+const GAIN_MAX = 6;
+/** Ignore an error this small: measurement noise, not a real demand change. Without
+ *  it the loop dithers around the setpoint by ±1 step forever. */
+const DEADBAND = 0.02;
 
 /** Considerate starts eased; the demand signal yields further from there. */
 export const CONSIDERATE_START = 0.5;
@@ -64,6 +87,7 @@ export class SmartController {
     this.opts = {
       demand: opts.demand,
       headroom: opts.headroom ?? 0.25,
+      workers: opts.workers,
     };
     this.t = CLAMP(this.cfg.start); this.applied = this.t; this.bestT = this.t;
     this.windowStart = this.now(); this.lastReprobe = this.now();
@@ -82,6 +106,17 @@ export class SmartController {
     return this.holding ? 'holding' : 'ramping';
   }
 
+  /**
+   * λ = workers / usable cores: how much the measured idle moves per unit of our own
+   * duty. Falls back to 1 (the gain is then GAIN_NOM) whenever we can't prove it —
+   * an unknown λ must not turn into an aggressive gain.
+   */
+  private plantSlope(reading: CpuReading | null): number {
+    const workers = this.opts.workers;
+    if (!reading || !workers || !(reading.capacityCores > 0)) return 1;
+    return Math.min(GAIN_MAX, Math.max(0.1, workers / reading.capacityCores));
+  }
+
   onHashrate(hps: number): void {
     if (!this.seeded) { this.ewma = hps; this.seeded = true; }
     else this.ewma = this.cfg.ewmaAlpha * hps + (1 - this.cfg.ewmaAlpha) * this.ewma;
@@ -92,17 +127,28 @@ export class SmartController {
 
     // ── Fast loop (EVERY tick): demand headroom. ──
     // This must react on the ~1s tick cadence, NOT the slow thermal dwell.
-    const idleFrac = this.opts.demand?.cpuIdleFraction() ?? null;
+    //
+    // The reading is scoped to OUR OWN cpu domain (our cgroup under a quota, the
+    // guest's own /proc/stat on a VM, os.cpus() on a real machine) — see demand.ts.
+    // Reading the host's idle from inside a container is what decoupled this loop
+    // from its own action and made it oscillate.
+    const reading = this.opts.demand?.read?.() ?? null;
+    const idleFrac = reading ? reading.idleShare : (this.opts.demand?.cpuIdleFraction() ?? null);
     if (idleFrac === null) this.demandAllowed = 1;                 // unknown -> don't limit (Max)
     else {
       const err = idleFrac - this.opts.headroom;                  // >0 surplus idle, <0 over budget
-      if (err >= 0) {
+      if (err > DEADBAND) {
         this.demandAllowed = CLAMP(this.demandAllowed + this.cfg.step);
-      } else {
-        // Back off fast, proportional to how far idle is below the headroom
-        // target, so a sudden CPU spike yields in ~1-2 ticks instead of ~15s.
-        this.demandAllowed = CLAMP(this.demandAllowed - Math.max(this.cfg.step, -err * BACKOFF_GAIN));
+      } else if (err < -DEADBAND) {
+        // Back off fast, proportional to how far idle is below the headroom target,
+        // so a sudden CPU spike yields in ~1 tick instead of ~15s. The gain is
+        // normalized by the plant slope λ = workers/capacity so that one constant is
+        // stable on every machine (see GAIN_NOM).
+        const lambda = this.plantSlope(reading);
+        const gain = Math.min(GAIN_MAX, Math.max(GAIN_MIN, GAIN_NOM / lambda));
+        this.demandAllowed = CLAMP(this.demandAllowed - Math.max(this.cfg.step, -err * gain));
       }
+      // else: inside the deadband — hold. This is what stops the ±step dither.
     }
 
     // ── Slow loop (every dwell window): thermal hill-climb on smoothed H/s. ──

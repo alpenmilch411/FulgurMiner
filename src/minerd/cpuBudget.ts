@@ -24,6 +24,10 @@ const CGROUP_V2_MAX = '/sys/fs/cgroup/cpu.max';
 /** cgroup v1 (`/sys/fs/cgroup/cpu/…`). */
 const CGROUP_V1_QUOTA = '/sys/fs/cgroup/cpu/cpu.cfs_quota_us';
 const CGROUP_V1_PERIOD = '/sys/fs/cgroup/cpu/cpu.cfs_period_us';
+/** Cumulative CPU consumed by everything in our cgroup. */
+const CGROUP_V2_STAT = '/sys/fs/cgroup/cpu.stat';           // usage_usec (µs)
+const CGROUP_V1_ACCT = '/sys/fs/cgroup/cpuacct/cpuacct.usage'; // ns
+const CGROUP_V1_ACCT_COMBINED = '/sys/fs/cgroup/cpu,cpuacct/cpuacct.usage'; // ns (co-mounted)
 
 /** Reads a file as text, or returns null if it isn't there / isn't readable. */
 export type ReadText = (path: string) => string | null;
@@ -78,6 +82,48 @@ export function cgroupCpuQuota(read: ReadText = defaultRead): number | null {
   const p = read(CGROUP_V1_PERIOD);
   if (q !== null && p !== null) return parseCpuQuotaV1(q, p);
 
+  return null;
+}
+
+/** cgroup v2 `cpu.stat` is `key value` lines; we want `usage_usec`. Microseconds. */
+export function parseCgroupCpuStatV2(text: string): number | null {
+  for (const line of text.split('\n')) {
+    const [key, value] = line.trim().split(/\s+/);
+    if (key === 'usage_usec') {
+      const n = Number(value);
+      return Number.isFinite(n) && n >= 0 ? n : null;
+    }
+  }
+  return null;
+}
+
+/** cgroup v1 `cpuacct.usage` is a single nanosecond counter. Returned as MICROseconds. */
+export function parseCpuacctUsageV1(text: string): number | null {
+  const n = Number(text.trim());
+  return Number.isFinite(n) && n >= 0 ? n / 1000 : null;
+}
+
+/**
+ * Cumulative CPU used by EVERYTHING in our cgroup (us + any co-tenant process in
+ * the same cgroup), in microseconds. Null when unreadable.
+ *
+ * Only ever call this when a quota exists. The cgroup-v2 ROOT `cpu.stat` uniquely
+ * includes stolen time in `usage_usec`, so reading it on a plain VM would invent a
+ * phantom competitor out of our own steal. A quota implies we are NOT the root.
+ */
+export function cgroupCpuUsageUsec(read: ReadText = defaultRead): number | null {
+  const v2 = read(CGROUP_V2_STAT);
+  if (v2 !== null) {
+    const usec = parseCgroupCpuStatV2(v2);
+    if (usec !== null) return usec;
+  }
+  for (const path of [CGROUP_V1_ACCT, CGROUP_V1_ACCT_COMBINED]) {
+    const v1 = read(path);
+    if (v1 !== null) {
+      const usec = parseCpuacctUsageV1(v1);
+      if (usec !== null) return usec;
+    }
+  }
   return null;
 }
 
