@@ -46,7 +46,7 @@ export const ROW_EXPLAIN: Record<RowKind, string> = {
   target:
     'Where your hashes go. FulgurPool (the project’s own pool) is the default; press Enter to choose Solo or one of your own pools.',
   workers:
-    'How many CPU cores grind in parallel. More is faster but hotter and louder. Use ←/→ to change; one core is left free by default.',
+    'How many CPU cores grind in parallel. More is faster but hotter and louder. Use ←/→ to change; one core is left free by default — except on a CPU-limited container, where the whole allowance is used.',
   mode:
     'Manual lets you set the duty cycle by hand; Smart auto-tunes it. Press Enter to choose.',
   throttle:

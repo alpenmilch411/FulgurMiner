@@ -6,13 +6,24 @@
 //
 // loadConfig() already clamps MINER_WORKERS / MINER_THROTTLE at runtime, so
 // these selectors only shape the UI — the underlying validation is unchanged.
-import os from 'node:os';
+import { autoWorkers, cpuBudget } from './cpuBudget.js';
 
-/** Real usable core count (≥1). The Workers selector never exceeds this. */
-export const MAX_WORKERS = Math.max(1, os.cpus().length);
+const BUDGET = cpuBudget();
 
-/** Default = leave one core free so the machine stays responsive (and cooler). */
-export const DEFAULT_WORKERS = Math.max(1, MAX_WORKERS - 1);
+/**
+ * Cores we're actually allowed to use (≥1). The Workers selector never exceeds this.
+ * Under a container CPU limit this is the allowance, NOT the host's core count —
+ * offering all 128 cores of a shared host we may only use 2 of is how the miner
+ * ended up over-spawning. (The env-var path still lets an operator hand-set more.)
+ */
+export const MAX_WORKERS = BUDGET.usableCores;
+
+/**
+ * Default: leave one core free so the machine stays responsive — except under a CPU
+ * quota, where the allowance IS the reservation and leaving one free just halves a
+ * 2-CPU container. See cpuBudget.autoWorkers().
+ */
+export const DEFAULT_WORKERS = autoWorkers(BUDGET);
 
 /** Clamp any worker count into 1…MAX_WORKERS (floored, finite-guarded). */
 export function clampWorkers(n: number): number {

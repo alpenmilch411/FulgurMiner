@@ -212,7 +212,7 @@ Every option is an environment variable or a line in `.env.local` (written for y
 | `MINER_PUBKEY` | *(required)* | Your wallet address (64 hex chars). Rewards go here. |
 | `MINER_POOL` | FulgurPool | `solo` to mine alone, or a pool URL. Unset/blank follows the default pool (FulgurPool). |
 | `MINER_SMART` | `off` | `off` (Manual) · `max` · `considerate`. When set, the mode picks the rate and `MINER_THROTTLE` is not used: Max goes straight to 100% and holds; Considerate starts at 50% and floats with your CPU load. |
-| `MINER_WORKERS` | cores − 1 | CPU worker threads. Clamped to `1…cores`. |
+| `MINER_WORKERS` | cores − 1 | CPU worker threads. Auto (unset) leaves one core free; inside a CPU-limited container it uses the whole allowance instead of the host's core count. Set it by hand to override. |
 | `MINER_THROTTLE` | `0.75` | Duty cycle (`0.05`–`1.0`): fraction of wall-time spent hashing. Lower = cooler & quieter. Ignored when a Smart mode is on (the mode sets the rate). |
 | `MINER_NATIVE` | *(off)* | `1` uses the native Rust engine (built on demand if missing and Rust is installed). |
 | `MINER_HELPERS` | `api1`/`api2.browsercoin.org` | Comma-separated API helper URLs for chain sync / solo mining. Fails over across helpers on an outage — a single dead helper is hidden and hashing continues; only warns if every helper fails a round. |

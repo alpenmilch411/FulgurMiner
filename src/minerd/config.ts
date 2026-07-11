@@ -1,6 +1,6 @@
 // src/minerd/config.ts
-import os from 'node:os';
 import { addressFromHex } from '../crypto/keys.js';
+import { cpuBudget, resolveWorkers } from './cpuBudget.js';
 
 export interface MinerConfig {
   minerPubkeyHex: string;
@@ -71,14 +71,13 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   // the defaults so solo mode always has >=1 helper (HelperPool requires at least one).
   const helpers = parsedHelpers.length > 0 ? parsedHelpers : DEFAULT_HELPERS;
 
-  // Leave one core free by default so the machine stays responsive (and cooler).
-  // A hand-set MINER_WORKERS is clamped to 1…cores so it can never exceed the
-  // machine (the menu/settings selectors already constrain the UI; this clamps
-  // the env-var path too, matching that guarantee).
-  const cores = Math.max(1, os.cpus().length);
-  const workers = env.MINER_WORKERS
-    ? Math.min(cores, Math.max(1, Math.floor(Number(env.MINER_WORKERS))))
-    : Math.max(1, cores - 1);
+  // Auto-sizing runs off what we're ACTUALLY allowed to use, not what os.cpus()
+  // claims — inside a CPU-limited container the latter is the whole host, which is
+  // how a 2-CPU allowance ended up spawning 127 workers. Unset → leave one core free
+  // on a real machine, take the full allowance under a quota. A hand-set
+  // MINER_WORKERS is still honored as written (bounded only by the host). See
+  // cpuBudget.ts.
+  const workers = resolveWorkers(env.MINER_WORKERS, cpuBudget());
 
   const tipPollMs = env.MINER_TIP_POLL_MS
     ? Math.max(500, Math.floor(Number(env.MINER_TIP_POLL_MS)))

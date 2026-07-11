@@ -140,7 +140,7 @@ async function editTarget(rl: RL, extras: PoolEntry[]): Promise<void> {
 
 async function editWorkers(rl: RL): Promise<void> {
   // Bounded selector: any number is clamped to 1…cores; blank = auto.
-  console.log(`\n  Worker threads — pick 1…${MAX_WORKERS} (your machine has ${MAX_WORKERS} cores).`);
+  console.log(`\n  Worker threads — pick 1…${MAX_WORKERS} (${MAX_WORKERS} cores available to the miner).`);
   console.log(`  Blank = auto (${DEFAULT_WORKERS}, leaves one core free).`);
   for (;;) {
     const v = (await rl.question(`  Workers [${currentWorkers()}]: `)).trim();
