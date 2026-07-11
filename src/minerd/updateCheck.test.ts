@@ -40,6 +40,15 @@ test('updateCommand: a git-pull-from-source instruction with the repo link (no n
   assert.doesNotMatch(cmd, /npm i -g|npx/); // runs from source — no npm/npx install commands
 });
 
+test('updateCommand: MUST carry --autostash, or the command we hand out cannot work', () => {
+  // `npm install` rewrites package-lock.json on any machine whose platform differs from
+  // the one the lockfile was built on (tsx/esbuild ship per-platform packages). So a user
+  // who merely installed and ran the miner has a modified lockfile, and a plain `git pull`
+  // aborts: "Your local changes to the following files would be overwritten by merge".
+  // A user hit this on all 3 of his machines while we were telling him to run exactly that.
+  assert.match(updateCommand(), /git pull --autostash/);
+});
+
 test('parseReleaseTag accepts v-prefixed and bare semver, rejects junk', () => {
   assert.equal(parseReleaseTag('v0.2.3'), '0.2.3');
   assert.equal(parseReleaseTag('0.2.3'), '0.2.3');

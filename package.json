@@ -1,6 +1,6 @@
 {
   "name": "fulgurminer",
-  "version": "0.2.7",
+  "version": "0.2.8",
   "private": false,
   "type": "module",
   "description": "FulgurMiner — standalone terminal miner for BrowserCoin. Mine without a browser.",
@@ -10,6 +10,7 @@
   },
   "scripts": {
     "start": "tsx src/minerd/start.ts",
+    "update": "git pull --autostash && npm install",
     "settings": "tsx src/minerd/settings.ts",
     "mine": "tsx src/minerd/index.ts",
     "mine:dryrun": "tsx src/minerd/index.ts dryrun",

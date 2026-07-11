@@ -236,7 +236,18 @@ MINER_PUBKEY=<your-address> MINER_POOL=https://pool.example.org npm run mine
 MINER_PUBKEY=<your-address> npm run mine:dryrun
 ```
 
-The update check is quiet and best-effort: it reads the latest version from the project's [GitHub releases](https://github.com/alpenmilch411/FulgurMiner/releases) (plus the pool's notice / required-version signal) and fails silently offline. The miner runs from source, so updating is a `git pull && npm install` (or, if you installed from the ZIP, download the latest ZIP and run `npm install` again). Turn the check off with **Check for updates → off** or `FULGUR_NO_UPDATE_CHECK=1`. FulgurMiner never runs an update for you.
+The update check is quiet and best-effort: it reads the latest version from the project's [GitHub releases](https://github.com/alpenmilch411/FulgurMiner/releases) (plus the pool's notice / required-version signal) and fails silently offline. Turn the check off with **Check for updates → off** or `FULGUR_NO_UPDATE_CHECK=1`. FulgurMiner never runs an update for you.
+
+**To update:**
+
+```bash
+npm run update     # = git pull --autostash && npm install
+npm start
+```
+
+(If you installed from the ZIP instead of cloning: download the latest ZIP and run `npm install` again.)
+
+> **Why `--autostash`?** Running `npm install` can modify `package-lock.json` on your machine — some of the build tooling ships different packages per operating system, so the file legitimately differs on Windows, Linux and macOS. That counts as a local change, so a plain `git pull` stops with *"Your local changes to the following files would be overwritten by merge: package-lock.json"*. `--autostash` sets that change aside, pulls, and puts it back. Nothing of yours is lost, and your settings (`.env.local`, `pools.json`) are never touched either way.
 
 ## Native engine
 

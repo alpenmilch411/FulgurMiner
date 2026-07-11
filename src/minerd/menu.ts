@@ -931,7 +931,7 @@ export class StartMenu {
       '',
       B('Source & updates'),
       `  ${REPO_URL}`,
-      `  Runs from source — update with ${D('git pull && npm install')}.`,
+      `  Runs from source — update with ${D('git pull --autostash && npm install')}.`,
       '',
       B('Where to mine'),
       `  Default is ${B('FulgurPool')} ${D('(the project’s own pool)')}. Pick Solo`,

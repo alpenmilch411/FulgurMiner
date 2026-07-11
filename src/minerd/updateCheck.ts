@@ -54,9 +54,19 @@ export async function fetchLatestVersion(
   }
 }
 
-/** How to update — the miner runs from source, so it's a `git pull` from the repo. */
+/**
+ * How to update — the miner runs from source, so it's a `git pull` from the repo.
+ *
+ * `--autostash` is NOT optional. `npm install` rewrites `package-lock.json` on any
+ * machine whose platform differs from the one the lockfile was generated on (tsx/esbuild
+ * ship per-platform packages), so a user who has simply INSTALLED and RUN the miner has a
+ * modified lockfile — and a plain `git pull` then refuses with "Your local changes would
+ * be overwritten by merge: package-lock.json. Aborting." Reported by a user who hit it on
+ * all 3 of his machines; we told them to run a command we knew could not work.
+ * --autostash sets the change aside, pulls, and puts it back.
+ */
 export function updateCommand(): string {
-  return `git pull && npm install   (${REPO_URL})`;
+  return `git pull --autostash && npm install   (${REPO_URL})`;
 }
 
 export async function checkForUpdate(opts: {
