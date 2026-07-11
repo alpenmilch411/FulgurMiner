@@ -1,5 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import os from 'node:os';
+import { MAX_WORKERS } from './selectors.js';
 import {
   parseCpuMaxV2,
   parseCpuQuotaV1,
@@ -133,6 +135,27 @@ test('REGRESSION: taskset on a DESKTOP keeps its free core (affinity ≠ contain
   const b = cpuBudget({ hostCores: 16, parallelism: 4, read: fs({}), exists: noMarkers });
   assert.equal(b.constrained, false);
   assert.equal(autoWorkers(b), 3, 'leaves one free — 4 would be the container rule');
+});
+
+test('REGRESSION: the UI cap and the runtime cap agree (no arrow-press can halve you)', () => {
+  // The menu and the plain settings editor both CLAMP the workers value they display and
+  // then PERSIST it to .env.local. If that clamp were bound to the detected allowance
+  // while the runtime honors the explicit value (bound by host cores), the two disagree:
+  // an operator running an explicit MINER_WORKERS=2 under a 1.5-CPU quota would see "1",
+  // and a single arrow-press would write MINER_WORKERS=1 — halving their hashrate, for
+  // good, through a setting they never meant to change. So the two bounds must be equal.
+  // selectors.ts resolves its constants from the REAL machine at import time, so this is
+  // the honest assertion available: the UI's ceiling is the HOST's cores — the same bound
+  // resolveWorkers() applies — and NOT the (possibly much smaller) detected allowance.
+  assert.equal(MAX_WORKERS, os.cpus().length, 'the UI ceiling must be the HOST, as the runtime is');
+
+  const b = cpuBudget({ hostCores: 16, parallelism: 16, read: fs({ [V2]: '150000 100000' }), exists: inDocker });
+  assert.equal(b.allowanceCores, 1.5, 'a 1.5-CPU quota…');
+  assert.equal(b.usableCores, 2);
+  // …and an operator asking for more than the allowance still gets exactly what they asked
+  // for at runtime. (Pre-fix: the UI showed 1 and one arrow-press persisted MINER_WORKERS=1.)
+  assert.equal(resolveWorkers('2', b), 2);
+  assert.equal(resolveWorkers('8', b), 8);
 });
 
 test('bare-metal auto default is unchanged for existing users', () => {

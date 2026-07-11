@@ -46,7 +46,13 @@ const CLAMP = (t: number) => Math.min(1, Math.max(0.05, t));
  * GAIN_NOM = 1 yields a one-tick correction with a 2× stability margin.
  */
 const GAIN_NOM = 1;
-const GAIN_MIN = 0.5;
+/**
+ * Only the UPPER clamp exists. A lower clamp would defeat the whole point: with
+ * G = GAIN_NOM/λ the loop gain G·λ is exactly 1 at every λ, but flooring G at (say) 0.5
+ * makes G·λ = 2 once λ ≥ 4 — at the instability bound, on precisely the oversubscribed
+ * boxes the normalization was introduced to protect. The upper clamp is a guard for a
+ * very small λ, where the plant model is least trustworthy.
+ */
 const GAIN_MAX = 6;
 /** Ignore an error this small: measurement noise, not a real demand change. Without
  *  it the loop dithers around the setpoint by ±1 step forever. */
@@ -170,7 +176,7 @@ export class SmartController {
         // the plant slope λ = workers/capacity so one constant is stable on every machine
         // (see GAIN_NOM). NO minimum step: a floor larger than the error is exactly what
         // makes the loop overshoot and hunt.
-        const gain = Math.min(GAIN_MAX, Math.max(GAIN_MIN, GAIN_NOM / lambda));
+        const gain = Math.min(GAIN_MAX, GAIN_NOM / lambda);
         this.demandAllowed = CLAMP(this.demandAllowed + err * gain); // err<0 → steps down
       }
       // else: inside the deadband — hold. This is what stops the ±step dither.

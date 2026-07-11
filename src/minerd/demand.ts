@@ -145,7 +145,7 @@ export interface DemandDeps {
   osCpus?: () => os.CpuInfo[];
   /** Affinity-aware core count (cpuset/taskset) — the other half of the allowance. */
   parallelism?: number;
-  /** Monotonic-ish milliseconds; used to turn a cgroup µs counter into cores. */
+  /** MONOTONIC milliseconds; used to turn a cgroup µs counter into cores. */
   now?: () => number;
   /** One-time note when we cannot prove a domain and fall back. */
   onWarn?: (msg: string) => void;
@@ -155,7 +155,10 @@ export function createDemandSignal(deps: DemandDeps = {}): DemandSignal {
   const read = deps.read ?? defaultRead;
   const exists = deps.exists ?? existsSync;
   const osCpus = deps.osCpus ?? (() => os.cpus());
-  const now = deps.now ?? (() => Date.now());
+  // MONOTONIC, not Date.now(): the cgroup rate is usage-microseconds over ELAPSED time,
+  // so an NTP step (or any clock adjustment) would corrupt the denominator and hand the
+  // controller a fictitious idle reading.
+  const now = deps.now ?? (() => performance.now());
   const onWarn = deps.onWarn ?? (() => {});
 
   const budget = cpuBudget({
