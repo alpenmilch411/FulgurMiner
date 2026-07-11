@@ -11,17 +11,21 @@ import { autoWorkers, cpuBudget } from './cpuBudget.js';
 const BUDGET = cpuBudget();
 
 /**
- * Cores we're actually allowed to use (≥1). The Workers selector never exceeds this.
- * Under a container CPU limit this is the allowance, NOT the host's core count —
- * offering all 128 cores of a shared host we may only use 2 of is how the miner
- * ended up over-spawning. (The env-var path still lets an operator hand-set more.)
+ * Upper bound of the Workers selector — the HOST's cores, deliberately.
+ *
+ * It is NOT the container allowance, even though the auto default now is. The UI
+ * clamps whatever it displays and PERSISTS the result to .env.local, so binding this
+ * to a detected allowance would let a single arrow-press silently rewrite an operator's
+ * explicit `MINER_WORKERS=2` down to 1 — halving a node's hashrate through a setting
+ * they never touched. The auto default is the thing that needed fixing; a hand-set
+ * value stays the user's to choose.
  */
-export const MAX_WORKERS = BUDGET.usableCores;
+export const MAX_WORKERS = BUDGET.hostCores;
 
 /**
- * Default: leave one core free so the machine stays responsive — except under a CPU
- * quota, where the allowance IS the reservation and leaving one free just halves a
- * 2-CPU container. See cpuBudget.autoWorkers().
+ * Default: leave one core free so the machine stays responsive — except inside a
+ * CPU-limited container, where the allowance IS the reservation and leaving one free
+ * just halves a 2-CPU node. See cpuBudget.autoWorkers().
  */
 export const DEFAULT_WORKERS = autoWorkers(BUDGET);
 

@@ -17,7 +17,7 @@
 // A QUOTA is treated as "constrained" but AFFINITY is not, and that distinction is
 // load-bearing: see autoWorkers().
 import os from 'node:os';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 
 /** cgroup v2 (`/sys/fs/cgroup/cpu.max`). */
 const CGROUP_V2_MAX = '/sys/fs/cgroup/cpu.max';
@@ -107,9 +107,10 @@ export function parseCpuacctUsageV1(text: string): number | null {
  * Cumulative CPU used by EVERYTHING in our cgroup (us + any co-tenant process in
  * the same cgroup), in microseconds. Null when unreadable.
  *
- * Only ever call this when a quota exists. The cgroup-v2 ROOT `cpu.stat` uniquely
- * includes stolen time in `usage_usec`, so reading it on a plain VM would invent a
- * phantom competitor out of our own steal. A quota implies we are NOT the root.
+ * Only call this when we are provably INSIDE A CONTAINER (see inContainer). On a
+ * plain VM the path resolves to the cgroup-v2 ROOT, whose `usage_usec` uniquely
+ * includes stolen time — reading it there would invent a phantom competitor out of
+ * our own steal.
  */
 export function cgroupCpuUsageUsec(read: ReadText = defaultRead): number | null {
   const v2 = read(CGROUP_V2_STAT);
@@ -127,14 +128,37 @@ export function cgroupCpuUsageUsec(read: ReadText = defaultRead): number | null 
   return null;
 }
 
+/** Docker writes /.dockerenv; podman writes /run/.containerenv. */
+const DOCKER_MARKER = '/.dockerenv';
+const PODMAN_MARKER = '/run/.containerenv';
+
+/**
+ * Are we inside a container? This is a DIFFERENT question from "are we CPU-limited",
+ * and both matter:
+ *   - it decides whether the HOST's /proc/stat and os.cpus() describe our world (in a
+ *     container they do not — they describe the whole machine we're a guest on);
+ *   - it distinguishes a cpuset-limited CONTAINER (the allowance IS our machine — take
+ *     all of it) from a `taskset`-ed process on a DESKTOP (still a desktop — leave a
+ *     core free for the human).
+ */
+export function inContainer(exists: (p: string) => boolean = existsSync): boolean {
+  return exists(DOCKER_MARKER) || exists(PODMAN_MARKER);
+}
+
 export interface CpuBudget {
   /** What os.cpus() reports: this machine, or the HOST if we're in a container. */
   hostCores: number;
-  /** What we may actually run on: affinity ∩ quota. Always ≥ 1. */
+  /** What we may actually run on: cpuset ∩ quota. Always ≥ 1 core, fractional. */
+  allowanceCores: number;
+  /** Whole workers we can usefully run within the allowance. Always ≥ 1. */
   usableCores: number;
-  /** The cgroup quota in cores (fractional), or null when unlimited. */
+  /** The cgroup quota in cores (fractional), or null when there is none. */
   quota: number | null;
-  /** True ONLY when a CPU QUOTA limits us — never for mere affinity. */
+  /** Cores our CPU affinity (cpuset/taskset) permits. */
+  affinityCores: number;
+  /** Inside a container image (docker/podman/k8s/RunPod). */
+  container: boolean;
+  /** A limit smaller than the host is being enforced on us BY a container. */
   constrained: boolean;
 }
 
@@ -143,36 +167,56 @@ export interface CpuBudgetDeps {
   /** Affinity-aware core count (cpuset/taskset). */
   parallelism?: number;
   read?: ReadText;
+  exists?: (path: string) => boolean;
 }
 
+/**
+ * What CPU we are actually allowed to use — whichever way the platform chose to limit
+ * us. There is no single mechanism, and keying off only one of them is how the first
+ * cut of this missed the very platform our own fleet runs on:
+ *
+ *   docker --cpus=N, k8s limits.cpu, Fargate, systemd CPUQuota → a CFS QUOTA
+ *   RunPod, k8s static CPU manager, LXC pinning, taskset       → a CPUSET (affinity)
+ *   a plain VPS (Hetzner/DO/Vultr)                             → NEITHER (steal instead)
+ *
+ * So the allowance is the tighter of the two: min(quota, cpuset). RunPod, for example,
+ * publishes NO quota at all (`cpu.max` = "max") and instead pins the container to 2 of
+ * the host's 256 CPUs — a quota-only reading sees "unlimited" and a 256-core host.
+ */
 export function cpuBudget(deps: CpuBudgetDeps = {}): CpuBudget {
+  const read = deps.read ?? defaultRead;
   const hostCores = Math.max(1, deps.hostCores ?? os.cpus().length);
-  // availableParallelism() honors cpuset/affinity on every Node we support (it
-  // landed in 18.14; our floor is 20.6). It just can't see the quota — hence below.
-  const parallelism = Math.max(1, deps.parallelism ?? os.availableParallelism());
-  const quota = cgroupCpuQuota(deps.read ?? defaultRead);
+  // availableParallelism() honors cpuset/affinity on every Node we support (it landed
+  // in 18.14; our floor is 20.6). It just can't see the quota — hence cgroupCpuQuota.
+  const affinityCores = Math.max(1, deps.parallelism ?? os.availableParallelism());
+  const quota = cgroupCpuQuota(read);
+  const container = inContainer(deps.exists ?? existsSync);
 
-  // Floor the quota: 1.5 CPUs of allowance cannot usefully run 2 grinding workers,
-  // and over-spawning is the bug we're fixing. Never below 1.
-  const quotaCores = quota === null ? null : Math.max(1, Math.floor(quota));
-  const usableCores = quotaCores === null
-    ? parallelism
-    : Math.max(1, Math.min(parallelism, quotaCores));
+  const allowanceCores = Math.min(quota ?? Number.POSITIVE_INFINITY, affinityCores);
 
-  return { hostCores, usableCores, quota, constrained: quota !== null };
+  // Round, don't floor: an allowance of 1.9 cores that floors to 1 worker strands
+  // nearly half of what was paid for. Duty-cycling and the scheduler absorb the
+  // fractional overshoot; stranded capacity is never recovered.
+  const usableCores = Math.max(1, Math.min(affinityCores, Math.round(allowanceCores)));
+
+  // "Constrained" = a container is holding us BELOW the host. A non-binding quota
+  // (16 CPUs on an 8-core host) constrains nothing and must not flip this on, or a
+  // desktop would lose its free core. A taskset on a bare-metal desktop is not a
+  // container and must not either — that box still has a human in front of it.
+  const constrained = container && allowanceCores < hostCores;
+
+  return { hostCores, allowanceCores, usableCores, quota, affinityCores, container, constrained };
 }
 
 /**
  * Workers to run when MINER_WORKERS is unset.
  *
- * On a real machine we leave one core free so the box stays responsive — that is the
- * long-standing default and it does not change.
+ * On a real machine we leave one core free so the box stays responsive — the
+ * long-standing default, unchanged.
  *
- * Under a CPU QUOTA we take the whole allowance instead. A 2-vCPU container that
+ * Inside a CPU-limited container we take the whole allowance. A 2-CPU container that
  * "leaves one free" runs a single worker and mines at half speed, and there is no
- * desktop to keep responsive in there — the quota IS the reservation. (Affinity is
- * deliberately not treated this way: `taskset`-ing the miner onto 4 cores of a
- * 16-core desktop is still a desktop, and it keeps its free core.)
+ * desktop in there to keep responsive: the limit IS the reservation.
  */
 export function autoWorkers(b: CpuBudget): number {
   return b.constrained ? b.usableCores : Math.max(1, b.usableCores - 1);

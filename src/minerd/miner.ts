@@ -609,12 +609,16 @@ export async function runMiner(
   const smartController = cfg.smart !== 'off'
     ? new SmartController(
       pool,
-      { start: startDuty },
+      // Considerate leaves the THERMAL ceiling open and eases in via the demand
+      // allowance instead (see SmartDemandOptions.demandStart) — capping the ceiling at
+      // the eased start strands the demand loop below its own target.
+      { start: cfg.smart === 'considerate' ? 1 : startDuty },
       undefined,
       cfg.smart === 'considerate'
         ? {
           demand: createDemandSignal({ onWarn: (m) => reporter.event('warn', m) }),
           workers: cfg.workers,
+          demandStart: startDuty,
         }
         : undefined,
     )

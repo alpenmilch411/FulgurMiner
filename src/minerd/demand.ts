@@ -30,7 +30,7 @@
 // fall back to os.cpus() (today's behavior) instead: over-polite, never wedged.
 import os from 'node:os';
 import { existsSync, readFileSync } from 'node:fs';
-import { cgroupCpuQuota, cgroupCpuUsageUsec, type ReadText } from './cpuBudget.js';
+import { cgroupCpuUsageUsec, cpuBudget, type ReadText } from './cpuBudget.js';
 
 /** Where the reading came from, and what it is relative to. */
 export type CpuSource = 'cgroup' | 'procstat' | 'oscpus';
@@ -92,6 +92,11 @@ export function parseProcStat(text: string): ProcStat | null {
 export function idleShareFromProcStat(prev: ProcStat, next: ProcStat): number | null {
   const busy = next.busy - prev.busy;
   const idle = next.idle - prev.idle;
+  // A counter that went BACKWARDS is a broken sample, not a busy machine. The kernel's
+  // `iowait` is explicitly documented as able to decrease, so this is reachable in
+  // normal operation — and treating it as "zero idle" would slam the throttle down for
+  // no reason. Reject the sample; the caller holds.
+  if (busy < 0 || idle < 0) return null;
   const available = busy + idle;
   if (!(available > 0)) return null;
   return clamp01(idle / available);
@@ -138,20 +143,12 @@ export interface DemandDeps {
   read?: ReadText;
   exists?: (path: string) => boolean;
   osCpus?: () => os.CpuInfo[];
+  /** Affinity-aware core count (cpuset/taskset) — the other half of the allowance. */
+  parallelism?: number;
   /** Monotonic-ish milliseconds; used to turn a cgroup µs counter into cores. */
   now?: () => number;
   /** One-time note when we cannot prove a domain and fall back. */
   onWarn?: (msg: string) => void;
-}
-
-/**
- * A container's /proc/stat is the HOST's. `/.dockerenv` (docker) and
- * `/run/.containerenv` (podman) are the conventional markers; a CPU quota is itself
- * proof. Anything we can't prove is treated as "possibly a container" only when a
- * quota says so — a false negative here just leaves us on the old law.
- */
-function inContainer(exists: (p: string) => boolean, quota: number | null): boolean {
-  return quota !== null || exists('/.dockerenv') || exists('/run/.containerenv');
 }
 
 export function createDemandSignal(deps: DemandDeps = {}): DemandSignal {
@@ -161,22 +158,34 @@ export function createDemandSignal(deps: DemandDeps = {}): DemandSignal {
   const now = deps.now ?? (() => Date.now());
   const onWarn = deps.onWarn ?? (() => {});
 
-  const quota = cgroupCpuQuota(read);
-  const contained = inContainer(exists, quota);
+  const budget = cpuBudget({
+    read,
+    exists,
+    ...(deps.osCpus ? { hostCores: osCpus().length } : {}),
+    ...(deps.parallelism !== undefined ? { parallelism: deps.parallelism } : {}),
+  });
+  const contained = budget.container;
 
   // Resolve the domain ONCE: these facts don't change while the process lives.
+  //
+  // Note what gates the cgroup rung: BEING IN A CONTAINER, not having a quota. RunPod
+  // (and k8s' static CPU manager, and LXC pinning) limit by CPUSET and publish no quota
+  // at all — a quota-gated check falls straight through to a host-wide reading of a
+  // 256-core machine, which is the very bug this is meant to fix. Conversely a plain VM
+  // is NOT a container, so we never read its cgroup root (whose usage_usec would fold in
+  // steal and invent a phantom competitor).
   let source: CpuSource;
-  if (quota !== null && cgroupCpuUsageUsec(read) !== null) {
+  if (contained && cgroupCpuUsageUsec(read) !== null) {
     source = 'cgroup';
   } else if (!contained && parseProcStat(read(PROC_STAT) ?? '') !== null) {
     source = 'procstat';
   } else {
     source = 'oscpus';
     if (contained) {
-      // We know we're boxed in but can't read our own usage — so we cannot tell our
-      // load from the host's. Stay on the old law rather than mis-scope the signal.
+      // Boxed in, but we cannot read our own usage — so we cannot separate our load
+      // from the host's. Stay on the old law rather than mis-scope the signal.
       onWarn(
-        '[minerd] CPU limit detected but this container\'s CPU usage is unreadable; '
+        '[minerd] running in a container whose CPU usage is unreadable; '
         + 'Smart: Considerate falls back to host-wide CPU readings and may be imprecise. '
         + 'Use Smart: Max or Manual for a steady rate.',
       );
@@ -193,12 +202,17 @@ export function createDemandSignal(deps: DemandDeps = {}): DemandSignal {
   function readCgroup(): CpuReading | null {
     const usage = cgroupCpuUsageUsec(read);
     const at = now();
-    const capacity = Math.max(0.01, quota ?? 1);
+    // The capacity is the EFFECTIVE allowance — the tighter of the quota and the cpuset.
+    // Using the quota alone reads a cpuset-limited container (RunPod: 2 of 256 CPUs, no
+    // quota) as unlimited; using the cpuset alone misses `docker --cpus=1.5`.
+    const capacity = Math.max(0.01, Math.min(budget.allowanceCores, hostCores));
     if (usage === null || prevUsage === null) { prevUsage = usage; prevAt = at; return null; }
     const elapsedUsec = (at - prevAt) * 1000;
     const usedUsec = usage - prevUsage;
     prevUsage = usage;
     prevAt = at;
+    // A counter that went backwards (cgroup migration, reset) is a broken sample, not
+    // an idle machine: return null so the loop HOLDS instead of lurching.
     if (!(elapsedUsec > 0) || usedUsec < 0) return null;
     // Cores consumed by EVERYTHING in our cgroup — us, plus any co-tenant beside us.
     const usedCores = usedUsec / elapsedUsec;

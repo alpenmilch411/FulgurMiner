@@ -43,8 +43,13 @@ test('poolClient seeds the grind pool from the mode-derived duty, not the raw th
   assert.doesNotMatch(SRC, /new GrindPool\(workers, throttle\)/);
 });
 
-test('poolClient seeds the SmartController from the mode-derived duty', () => {
-  assert.match(SRC, /\{ start: startDuty \}/);
+test('poolClient seeds the SmartController from the mode-derived duty, never the raw throttle', () => {
+  // Considerate deliberately opens the THERMAL ceiling (start: 1) and eases in through
+  // the demand allowance instead — seeding the ceiling at 0.5 caps the demand loop below
+  // its own target, so it can only crawl up at 5%/25s. Max/Manual seed the ceiling with
+  // the mode-derived duty as usual.
+  assert.match(SRC, /start: smart === 'considerate' \? 1 : startDuty/);
+  assert.match(SRC, /demandStart: startDuty/);
   assert.doesNotMatch(SRC, /\{ start: throttle \}/);
 });
 

@@ -570,10 +570,13 @@ export async function runPoolClient(
   let acceptedShares = 0;
   startPoolStats({ poolUrl, address: payoutAddress, getAcceptedShares: () => acceptedShares, pageUrl: undefined, reporter, signal });
 
-  // Grind at a lower scheduling priority so the machine stays usable — the solo path
-  // has always done this (miner.ts), the pool path never did, and pool is the DEFAULT.
-  // A dedicated miner is unaffected (nothing to lose a race to).
-  try { os.setPriority(10); } catch { /* not permitted on some platforms — ignore */ }
+  // Considerate's whole job is to get out of your way, so it also grinds at a lower
+  // scheduling priority (solo has always done this). Manual and Max are NOT niced: a
+  // user who asked for a fixed rate or for full tilt did not ask to lose scheduler
+  // races, and quietly costing them hashrate would be a regression.
+  if (smart === 'considerate') {
+    try { os.setPriority(10); } catch { /* not permitted on some platforms — ignore */ }
+  }
 
   const pool: GrindPool | NativeGrindPool = useNative
     ? new NativeGrindPool(workers, startDuty)
@@ -581,12 +584,16 @@ export async function runPoolClient(
   const smartController = smart !== 'off'
     ? new SmartController(
       pool,
-      { start: startDuty },
+      // Considerate leaves the THERMAL ceiling open and eases in via the demand
+      // allowance instead; capping the ceiling at the eased start would strand the
+      // demand loop below its own target (see SmartDemandOptions.demandStart).
+      { start: smart === 'considerate' ? 1 : startDuty },
       undefined,
       smart === 'considerate'
         ? {
           demand: createDemandSignal({ onWarn: (m) => reporter.event('warn', m) }),
           workers,
+          demandStart: startDuty,
         }
         : undefined,
     )

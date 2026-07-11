@@ -76,7 +76,7 @@ const cpus = (n: number) => {
   };
 };
 
-test('quota + readable cgroup usage → cgroup domain, capacity = the quota', () => {
+test('container + quota → cgroup domain, capacity = the quota', () => {
   let usec = 0;
   const read: ReadText = (p) => {
     if (p === V2_MAX) return '200000 100000';            // 2 CPUs
@@ -84,7 +84,7 @@ test('quota + readable cgroup usage → cgroup domain, capacity = the quota', ()
     return null;
   };
   let t = 0;
-  const d = createDemandSignal({ read, exists: () => false, osCpus: cpus(64), now: () => t });
+  const d = createDemandSignal({ read, exists: (p) => p === '/.dockerenv', osCpus: cpus(64), now: () => t });
 
   // One second passes; the cgroup burned 1 CPU-second of its 2-core allowance.
   t = 1000; usec = 1_000_000;
@@ -94,7 +94,34 @@ test('quota + readable cgroup usage → cgroup domain, capacity = the quota', ()
   assert.ok(Math.abs(r.idleShare - 0.5) < 1e-6, `half the allowance idle, got ${r.idleShare}`);
 });
 
-test('FAIL-SAFE: quota present but cgroup usage UNREADABLE → old law, never host-wide /proc/stat', () => {
+test('CPUSET container, NO quota (RunPod — measured on a real pod) → cgroup domain', () => {
+  // The case the first cut missed entirely. cpu.max says "max" (no quota), the container
+  // is pinned to 2 of 256 host CPUs, and /sys/fs/cgroup/cpu.stat DOES carry our own
+  // usage. Gating the cgroup rung on "has a quota" fell through to a host-wide reading
+  // of a 256-core machine — i.e. the original bug, unfixed, on our own fleet's platform.
+  let usec = 0;
+  let t = 0;
+  const read: ReadText = (p) => {
+    if (p === V2_MAX) return 'max 100000';               // NO quota — RunPod's real value
+    if (p === V2_STAT) return `usage_usec ${usec}\nuser_usec 0\n`;
+    if (p === PROC_STAT) return 'cpu 999999 0 999999 10 0 0 0 0\n'; // the HOST's, meaningless here
+    return null;
+  };
+  const d = createDemandSignal({
+    read,
+    exists: (p) => p === '/.dockerenv',
+    osCpus: cpus(256),                 // os.cpus() reports the HOST
+    parallelism: 2,                    // the cpuset is what we actually have
+    now: () => t,
+  });
+  t = 1000; usec = 1_500_000;          // burned 1.5 CPU-seconds of our 2-core allowance
+  const r = d.read!()!;
+  assert.equal(r.source, 'cgroup', 'must NOT fall back to the host-wide signal');
+  assert.equal(r.capacityCores, 2, 'capacity is the cpuset, not the 256-core host');
+  assert.ok(Math.abs(r.idleShare - 0.25) < 1e-6, `1.5 of 2 cores used → 25% idle, got ${r.idleShare}`);
+});
+
+test('FAIL-SAFE: container but cgroup usage UNREADABLE → old law, never host-wide /proc/stat', () => {
   // cgroup v1 with a split cpuacct mount, gVisor, and friends. If we paired the HOST's
   // busy time (from /proc/stat, which inside a container describes the whole host) with
   // our 2-core capacity, we would conclude "someone else is using 30 of my 2 cores" and
@@ -106,11 +133,16 @@ test('FAIL-SAFE: quota present but cgroup usage UNREADABLE → old law, never ho
     return null;                                               // …but cpu.stat is unreadable
   };
   const warns: string[] = [];
-  const d = createDemandSignal({ read, exists: () => false, osCpus: cpus(64), onWarn: (m) => warns.push(m) });
+  const d = createDemandSignal({
+    read,
+    exists: (p) => p === '/.dockerenv',
+    osCpus: cpus(64),
+    onWarn: (m) => warns.push(m),
+  });
   const r = d.read!();
   assert.equal(r?.source, 'oscpus', 'must NOT be procstat — that would cross scheduling domains');
   assert.equal(warns.length, 1, 'and it must say so once, rather than silently mis-steer');
-  assert.match(warns[0], /CPU limit detected/);
+  assert.match(warns[0], /container/);
 });
 
 test('bare-metal Linux (no quota, not a container) → /proc/stat, steal-aware', () => {

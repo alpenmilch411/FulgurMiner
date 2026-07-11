@@ -10,11 +10,24 @@ export interface SmartDemandOptions {
   headroom?: number;
   /** Grind workers. With the sampler's capacity this gives the plant slope λ = W/C. */
   workers?: number;
+  /**
+   * Where the DEMAND allowance starts (Considerate: eased, at CONSIDERATE_START).
+   *
+   * This is separate from SmartConfig.start (the thermal ceiling) on purpose. The
+   * applied duty is min(thermal, demand), so seeding the THERMAL ceiling at 0.5 for
+   * Considerate — as the first cut did — caps the demand loop at 0.5 and leaves it
+   * unable to climb: only the thermal hill-climb can lift the ceiling, at 5% per 25s,
+   * so an idle machine took ~2 minutes to reach the duty it should have found in a few
+   * seconds (and, if no hashrate arrived in the first window, it latched there until the
+   * 4-minute reprobe). Considerate's authority is the demand loop; give it the room.
+   */
+  demandStart?: number;
 }
 interface ResolvedSmartDemandOptions {
   demand?: DemandSignal;
   headroom: number;
   workers?: number;
+  demandStart?: number;
 }
 const CLAMP = (t: number) => Math.min(1, Math.max(0.05, t));
 
@@ -88,10 +101,15 @@ export class SmartController {
       demand: opts.demand,
       headroom: opts.headroom ?? 0.25,
       workers: opts.workers,
+      demandStart: opts.demandStart,
     };
-    this.t = CLAMP(this.cfg.start); this.applied = this.t; this.bestT = this.t;
+    this.t = CLAMP(this.cfg.start); this.bestT = this.t;
+    this.demandAllowed = opts.demandStart !== undefined ? CLAMP(opts.demandStart) : 1;
+    // Apply min(thermal, demand) from the very first moment — seeding the sink with the
+    // raw thermal ceiling would run a Considerate miner at full tilt for the first tick.
+    this.applied = Math.min(this.t, this.demandAllowed);
     this.windowStart = this.now(); this.lastReprobe = this.now();
-    this.sink.setThrottle(this.t);
+    this.sink.setThrottle(this.applied);
   }
 
   currentThrottle(): number { return this.t; }
@@ -134,19 +152,26 @@ export class SmartController {
     // from its own action and made it oscillate.
     const reading = this.opts.demand?.read?.() ?? null;
     const idleFrac = reading ? reading.idleShare : (this.opts.demand?.cpuIdleFraction() ?? null);
-    if (idleFrac === null) this.demandAllowed = 1;                 // unknown -> don't limit (Max)
-    else {
+    // A missing reading means we don't KNOW — which is not the same as "the box is free".
+    // Holding is the safe response: a broken sample (counter reset, unreadable file) used
+    // to reset demandAllowed to 1, i.e. jump from a polite 10% straight to full tilt for
+    // a tick, right on top of whatever the user was doing.
+    if (idleFrac !== null) {
       const err = idleFrac - this.opts.headroom;                  // >0 surplus idle, <0 over budget
+      const lambda = this.plantSlope(reading);
       if (err > DEADBAND) {
-        this.demandAllowed = CLAMP(this.demandAllowed + this.cfg.step);
+        // Ramp back up gently. Scaled by λ for the same reason as the down-step: on an
+        // oversubscribed box (λ≫1) a fixed 5% duty step swings the measured idle far
+        // past the deadband and the loop cycles up-down forever.
+        this.demandAllowed = CLAMP(this.demandAllowed + this.cfg.step / Math.max(1, lambda));
       } else if (err < -DEADBAND) {
-        // Back off fast, proportional to how far idle is below the headroom target,
-        // so a sudden CPU spike yields in ~1 tick instead of ~15s. The gain is
-        // normalized by the plant slope λ = workers/capacity so that one constant is
-        // stable on every machine (see GAIN_NOM).
-        const lambda = this.plantSlope(reading);
+        // Back off fast, proportional to how far idle is below the headroom target, so a
+        // sudden CPU spike yields in ~1 tick instead of ~15s. The gain is normalized by
+        // the plant slope λ = workers/capacity so one constant is stable on every machine
+        // (see GAIN_NOM). NO minimum step: a floor larger than the error is exactly what
+        // makes the loop overshoot and hunt.
         const gain = Math.min(GAIN_MAX, Math.max(GAIN_MIN, GAIN_NOM / lambda));
-        this.demandAllowed = CLAMP(this.demandAllowed - Math.max(this.cfg.step, -err * gain));
+        this.demandAllowed = CLAMP(this.demandAllowed + err * gain); // err<0 → steps down
       }
       // else: inside the deadband — hold. This is what stops the ±step dither.
     }
