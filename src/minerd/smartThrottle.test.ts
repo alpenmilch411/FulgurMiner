@@ -50,8 +50,8 @@ test('SMART_THROTTLE_EXPLAIN shown on Throttle row in Smart (Considerate) mode',
     navigateToThrottleRow(menu);
     const text = menu.buildLines(100).map(visible).join('\n');
     assert.ok(
-      text.includes('STARTING point') || text.includes('starting point'),
-      `Expected SMART_THROTTLE_EXPLAIN (starting point) in output. Got:\n${text}`,
+      text.includes('auto-tuner'),
+      `Expected SMART_THROTTLE_EXPLAIN (auto-tuner sets the rate) in output. Got:\n${text}`,
     );
   } finally {
     if (oldSmart === undefined) delete process.env.MINER_SMART;
@@ -70,7 +70,7 @@ test('SMART_THROTTLE_EXPLAIN shown on Throttle row in Smart (Max) mode', () => {
     navigateToThrottleRow(menu);
     const text = menu.buildLines(100).map(visible).join('\n');
     assert.ok(
-      text.includes('STARTING point') || text.includes('starting point'),
+      text.includes('auto-tuner'),
       `Expected SMART_THROTTLE_EXPLAIN in Smart/Max output. Got:\n${text}`,
     );
   } finally {
@@ -90,7 +90,7 @@ test('SMART_THROTTLE_EXPLAIN NOT shown on Throttle row in Manual mode', () => {
     navigateToThrottleRow(menu);
     const text = menu.buildLines(80).map(visible).join('\n');
     assert.ok(
-      !text.includes('STARTING point') && !text.includes('starting point'),
+      !text.includes('auto-tuner'),
       `Expected no SMART_THROTTLE_EXPLAIN in Manual mode. Got:\n${text}`,
     );
   } finally {
@@ -150,8 +150,12 @@ test('SMART_THROTTLE_EXPLAIN fits within all common terminal widths (100/80/64/5
 test('SMART_THROTTLE_EXPLAIN export contains key informational terms', () => {
   assert.ok(typeof SMART_THROTTLE_EXPLAIN === 'string' && SMART_THROTTLE_EXPLAIN.length > 0);
   assert.ok(
-    SMART_THROTTLE_EXPLAIN.toLowerCase().includes('starting'),
-    'should mention starting point',
+    SMART_THROTTLE_EXPLAIN.toLowerCase().includes('auto-tuner'),
+    'should say the auto-tuner sets the rate',
+  );
+  assert.ok(
+    SMART_THROTTLE_EXPLAIN.toLowerCase().includes('not used'),
+    'should say the Throttle value is not used under Smart',
   );
   assert.ok(
     SMART_THROTTLE_EXPLAIN.toLowerCase().includes('manual'),

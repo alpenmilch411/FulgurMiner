@@ -78,14 +78,14 @@ export function whereExplain(opts: { isDefault: boolean; isSolo: boolean; name: 
 
 /**
  * Shown (in DIM) in the right "About" pane when the user highlights the
- * Throttle row while Smart mode is active. Explains that the Throttle is a
- * starting point, not a fixed value, and describes how the auto-tuner adapts.
+ * Throttle row while Smart mode is active. Explains that the auto-tuner — not
+ * this value — sets the rate, and where each mode starts.
  */
 export const SMART_THROTTLE_EXPLAIN =
-  `In Smart mode this is the STARTING point the auto-tuner climbs from — not a fixed value. ` +
-  `The live rate floats on its own: up toward the most your machine sustains, and (Considerate) ` +
-  `down to as low as 5% when your apps need the CPU. It ramps gradually, so give it a minute. ` +
-  `To set a fixed rate instead, switch Mode to Manual.`;
+  `In Smart mode the auto-tuner sets the rate and this Throttle value is not used. ` +
+  `Max goes straight to 100% and stays there. Considerate starts at 50%, then floats: ` +
+  `up toward the most your machine sustains, down to as low as 5% when your apps need ` +
+  `the CPU. To set a fixed rate yourself, switch Mode to Manual.`;
 
 /** Explanation for a Smart Mode option, shown in the Mode picker's right pane. */
 export function modeExplain(mode: SmartMode): string {
@@ -93,7 +93,7 @@ export function modeExplain(mode: SmartMode): string {
     return 'You set the duty cycle by hand with the Throttle setting. No auto-tuning.';
   }
   if (mode === 'max') {
-    return 'Auto-tunes to the highest level your machine sustains and stays there (no headroom reserved). Starts from your Throttle and ramps up gradually. Best for a dedicated mining machine.';
+    return 'Goes straight to 100% and stays there — no headroom reserved, no ramp-up. Your Throttle setting is not used. Best for a dedicated mining machine.';
   }
-  return 'Auto-tunes the throttle and eases off when your other apps need the CPU. Starts from your Throttle setting and ramps up gradually toward the most your machine sustains, backing down to as low as 5% while you\'re using the PC. Best for set-and-forget on a machine you also use. On a dedicated server or VPS, use Max or Manual instead — on shared/virtual CPUs the idle reading is unreliable and can make it oscillate.';
+  return 'Starts at 50% and adapts: eases off — down to as low as 5% — when your other apps need the CPU, and climbs back toward the most your machine sustains when they go quiet. Your Throttle setting is not used. Best for set-and-forget on a machine you also use. On a dedicated server or VPS, use Max or Manual instead — on shared/virtual CPUs the idle reading is unreliable and can make it oscillate.';
 }

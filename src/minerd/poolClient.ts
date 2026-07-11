@@ -12,7 +12,7 @@ import { startPoolStats } from './poolStats.js';
 import { checkForUpdate } from './updateCheck.js';
 import { NONCE_SPACE } from './partition.js';
 import { currentEngine } from './selectors.js';
-import { SmartController } from './smartController.js';
+import { SmartController, smartStartDuty } from './smartController.js';
 import { createDemandSignal } from './demand.js';
 
 /** One-time probe: does the installed native binary accept the `continuous` grind
@@ -536,12 +536,22 @@ export async function runPoolClient(
       ? 'native engine outdated — rebuild: cd native/brc-pow && cargo build --release; using wasm'
       : 'native engine not built — install Rust (https://rustup.rs) and build it; using wasm';
   }
+  // The duty cycle the grind actually STARTS at. Under a Smart mode the controller
+  // owns the throttle and `throttle` (MINER_THROTTLE) is only a manual leftover —
+  // starting from it made Max crawl up from a previously-lowered manual value
+  // instead of going straight to full tilt. Declared before the status block below
+  // because both the status line and the grind pool need it.
+  const startDuty = smartStartDuty(smart, throttle);
+
   if (status) {
     // Correct the passed-in status to what the pool gate actually resolved: the
     // launcher set backend from the engine selection, but nativeContinuousOk() can
     // demote a present-but-stale binary to wasm here.
     status.backend = useNative ? 'native' : 'wasm';
     status.backendNote = backendNote;
+    // …and to the duty we actually start at, not the manual throttle the launcher
+    // baked in (start.ts builds status from cfg.throttle before the mode is applied).
+    status.throttle = startDuty;
   }
 
   reporter.status(status ?? {
@@ -550,7 +560,7 @@ export async function runPoolClient(
     backend: useNative ? 'native' : 'wasm',
     backendNote,
     workers,
-    throttle,
+    throttle: startDuty,
     address: payoutAddress,
   });
   reporter.event('info', `[pool-miner] registered worker ${workerId} at ${poolUrl}`);
@@ -560,12 +570,12 @@ export async function runPoolClient(
   startPoolStats({ poolUrl, address: payoutAddress, getAcceptedShares: () => acceptedShares, pageUrl: undefined, reporter, signal });
 
   const pool: GrindPool | NativeGrindPool = useNative
-    ? new NativeGrindPool(workers, throttle)
-    : new GrindPool(workers, throttle);
+    ? new NativeGrindPool(workers, startDuty)
+    : new GrindPool(workers, startDuty);
   const smartController = smart !== 'off'
     ? new SmartController(
       pool,
-      { start: throttle },
+      { start: startDuty },
       undefined,
       smart === 'considerate' ? { demand: createDemandSignal() } : undefined,
     )

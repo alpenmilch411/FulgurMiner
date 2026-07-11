@@ -165,8 +165,8 @@ async function editWorkers(rl: RL): Promise<void> {
 function modeLine(mode: SmartMode): string {
   switch (mode) {
     case 'off': return 'set duty cycle by hand';
-    case 'max': return 'auto-tunes to sustained max, ~same as full-blast on a well-cooled machine';
-    case 'considerate': return 'auto-tunes but adapts to your other apps — eases off when they need the CPU, ramps back when they go quiet';
+    case 'max': return 'goes straight to 100% and holds — your Throttle setting is not used';
+    case 'considerate': return 'starts at 50%, then adapts to your other apps — eases off when they need the CPU, climbs back when they go quiet (Throttle not used)';
   }
 }
 

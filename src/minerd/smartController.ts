@@ -25,9 +25,12 @@ export const CONSIDERATE_START = 0.5;
  * throttle, then switching to Smart Max, made Max *start* at that low value and
  * crawl up at step/dwell (e.g. 0.05 / 25s) instead of going full-tilt.
  *
- *   max         → 1   (straight to 100%; the controller then holds, only easing
- *                      off if pushing harder doesn't actually raise H/s — thermals)
- *   considerate → 0.5 (eased; the demand signal yields below this when the box is busy)
+ *   max         → 1   (straight to 100%, and it STAYS there: the hill-climb only
+ *                      ever steps UP and 1 is the ceiling, so Max holds full tilt.
+ *                      It does not hunt for a lower, cooler-but-faster setpoint —
+ *                      use Considerate, or Manual, if you want less than everything.)
+ *   considerate → 0.5 (eased; the demand loop — not the climb — is what yields
+ *                      below this when the box is busy)
  *   off         → the user's manual throttle, verbatim
  */
 export function smartStartDuty(smart: 'off' | 'max' | 'considerate', manualThrottle: number): number {
