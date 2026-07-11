@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { SmartController } from './smartController.js';
+import { SmartController, smartStartDuty } from './smartController.js';
 
 // synthetic machine: H/s rises with throttle up to a knee, then flattens/dips (throttle).
 function machine(knee = 0.7) {
@@ -192,4 +192,26 @@ test('phase() returns holding after the hill-climb settles at the thermal knee',
   }
   // After convergence holding should be true (applied==t, holding==true)
   assert.equal(sc.phase(), 'holding', `expected holding after convergence, applied=${applied}`);
+});
+
+test('smartStartDuty: the start comes from the mode, not the leftover manual throttle', () => {
+  // A lowered manual throttle must NOT seed a Smart run.
+  assert.equal(smartStartDuty('max', 0.3), 1);
+  assert.equal(smartStartDuty('considerate', 0.3), 0.5);
+  // Manual passes the user's value through unchanged.
+  assert.equal(smartStartDuty('off', 0.3), 0.3);
+  assert.equal(smartStartDuty('off', 0.85), 0.85);
+});
+
+test('Smart Max starts full-tilt and holds (no slow ramp from a low manual throttle)', () => {
+  let now = 0; const clock = () => now;
+  let applied = 0;
+  const sink = { setThrottle: (t: number) => { applied = t; } };
+  // Max = no demand signal; start derived from the mode despite a low manual 0.3.
+  const sc = new SmartController(sink, { dwellMs: 1000, step: 0.05, start: smartStartDuty('max', 0.3) }, clock);
+  assert.equal(applied, 1, 'starts at 100% immediately, not the 0.3 manual leftover');
+  // Flat machine (no thermal knee): it must stay pinned at full, never ramp.
+  for (let i = 0; i < 50; i++) { for (let s = 0; s < 5; s++) { sc.onHashrate(700); now += 200; } sc.tick(); }
+  assert.equal(applied, 1, 'holds at 100%');
+  assert.equal(sc.phase(), 'holding');
 });

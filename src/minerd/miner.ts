@@ -16,7 +16,7 @@ import { NativeGrindPool } from './nativeGrindPool.js';
 import { submitSoloBlock } from './submitSolo.js';
 import { ConsoleReporter, type MinerReporter, type ReporterStatus } from './reporter.js';
 import { restoreSnapshot, saveSnapshot, deleteSnapshot } from './persistence.js';
-import { SmartController } from './smartController.js';
+import { SmartController, smartStartDuty } from './smartController.js';
 import { createDemandSignal } from './demand.js';
 
 /**
@@ -598,13 +598,18 @@ export async function runMiner(
   // Set MINER_NATIVE to use the native Rust grind processes instead (same
   // interface, parity-equivalent solutions, one OS process per nonce range).
   const useNative = !!process.env.MINER_NATIVE;
+  // Smart modes set their OWN starting duty cycle from the mode (Max=100%,
+  // Considerate=50%); only Manual uses cfg.throttle. Seeding from cfg.throttle made
+  // Smart Max start at a lowered manual throttle and ramp up slowly instead of
+  // going straight to full — see smartStartDuty().
+  const startDuty = smartStartDuty(cfg.smart, cfg.throttle);
   const pool: GrindPoolLike = useNative
-    ? new NativeGrindPool(cfg.workers, cfg.throttle)
-    : new GrindPool(cfg.workers, cfg.throttle);
+    ? new NativeGrindPool(cfg.workers, startDuty)
+    : new GrindPool(cfg.workers, startDuty);
   const smartController = cfg.smart !== 'off'
     ? new SmartController(
       pool,
-      { start: cfg.throttle },
+      { start: startDuty },
       undefined,
       cfg.smart === 'considerate' ? { demand: createDemandSignal() } : undefined,
     )
@@ -615,7 +620,10 @@ export async function runMiner(
     target: 'solo',
     backend: useNative ? 'native' : 'wasm',
     workers: cfg.workers,
-    throttle: cfg.throttle,
+    // The effective starting duty cycle: mode-derived in Smart, the manual value in
+    // 'off'. (Not cfg.throttle — that would print the leftover manual throttle while
+    // Smart Max actually starts at 100%.)
+    throttle: startDuty,
     address: cfg.minerPubkeyHex,
   };
   // Startup output. The pre-reporter code printed the synced height + the
