@@ -21,18 +21,26 @@
 // ONLY way a user learns their file was rejected, now that envLocal.ts's
 // console.warn (which the alt-screen redraw wiped before anyone could read
 // it) is gone.
+//
+// "Throttle" is a picker too, not a ←/→ cycle: cycleThrottle() used to take
+// whatever MINER_THROTTLE held, snap it to the nearest preset, and PERSIST that
+// — so a user who hand-set 0.77 in .env.local lost it the moment they merely
+// touched the row (same shape as 0.2.7's MINER_WORKERS clamp-and-persist
+// blocker). No navigation key writes MINER_THROTTLE now; only an explicit
+// Enter on a picker row, or a committed Custom... entry, does.
 import * as readline from 'node:readline';
 import { persist } from './envLocal.js';
 import { REPO_URL } from './config.js';
 import { link, STRIP_OSC8 } from './link.js';
 import {
-  THROTTLE_PRESETS, throttleLabel, throttleIndex, throttleNum,
+  THROTTLE_PRESETS, throttleLabel, throttleAmount, throttleNum, parseThrottle,
   clampWorkers, MAX_WORKERS, DEFAULT_WORKERS, workersDisplay, currentEngine, engineRowValue,
   MODE_OPTIONS, currentMode, modeIndex, modeLabel,
+  type ThrottlePreset,
 } from './selectors.js';
 import {
   ROW_EXPLAIN, modeExplain, whereExplain, NATIVE_NEEDS_RUST, FULL_BLAST_CAUTION, SMART_THROTTLE_EXPLAIN,
-  ADD_POOL_EXPLAIN, POOL_ISSUES_EXPLAIN,
+  ADD_POOL_EXPLAIN, POOL_ISSUES_EXPLAIN, throttlePresetExplain, throttleCustomExplain, THROTTLE_CUSTOM_EDIT_EXPLAIN,
 } from './menuCopy.js';
 import { nativeEngineAvailable } from './engine.js';
 import {
@@ -96,14 +104,14 @@ const ROWS: Row[] = [
 ];
 
 /**
- * The wallet row's inline text edit, and the "+ Add a pool..." form's two
- * steps, share one buffer mechanism. `name` carries the pool name across the
- * pool-name → pool-url step. NOTE for a later task: a 'throttle' arm is
- * planned for this same union — every switch over `kind` below is written to
- * make that an additive case, not a restructure.
+ * The wallet row's inline text edit, the "+ Add a pool..." form's two steps,
+ * and the Throttle picker's "Custom..." editor share one buffer mechanism.
+ * `name` carries the pool name across the pool-name → pool-url step. Every
+ * switch over `kind` below (editCap, commitEdit) is written so each new kind
+ * is one additive case, never a restructure.
  */
 type Editing = {
-  kind: 'wallet' | 'pool-name' | 'pool-url';
+  kind: 'wallet' | 'pool-name' | 'pool-url' | 'throttle';
   buffer: string;
   error: string;
   truncated: boolean;
@@ -117,6 +125,14 @@ type WhereRow =
   | { kind: 'issues' }
   | { kind: 'back' };
 
+/** One row of the Throttle picker: a preset, the current hand-set value (only
+ *  when it matches no preset), the "Custom..." row that opens the editor, or Back. */
+type ThrottleRow =
+  | { kind: 'preset'; preset: ThrottlePreset }
+  | { kind: 'custom'; value: number }
+  | { kind: 'edit' }
+  | { kind: 'back' };
+
 /**
  * StartMenu — owns the terminal while open. Construct it, await `run()`, and it
  * resolves to 'start' or 'quit' AFTER it has fully restored the terminal and
@@ -127,7 +143,7 @@ type WhereRow =
  */
 export class StartMenu {
   /** Which screen is visible. The main menu, a picker, or the full-screen help overlay. */
-  private screen: 'main' | 'where' | 'mode' | 'help' = 'main';
+  private screen: 'main' | 'where' | 'mode' | 'throttle' | 'help' = 'main';
   private selected = 0;
   /** The one inline text-edit buffer, shared by the wallet row and the add-a-pool form. */
   private editing: Editing | null = null;
@@ -149,6 +165,11 @@ export class StartMenu {
   // --- Mode picker state --------------------------------------------------
   /** Highlighted row in the picker (0..MODE_OPTIONS.length-1 = modes, then Back). */
   private modeCursor = 0;
+
+  // --- Throttle picker state -----------------------------------------------
+  /** Highlighted row in the picker (presets, then — only when MINER_THROTTLE
+   *  holds a non-preset value — that value's own row, then Custom..., then Back). */
+  private throttleCursor = 0;
 
   private rawModeOn = false;
   private closed = false;
@@ -259,6 +280,7 @@ export class StartMenu {
     if (this.screen === 'help') { this.handleHelpKey(k); return !this.closed; }
     if (this.screen === 'where') { this.handleWhereKey(k); return !this.closed; }
     if (this.screen === 'mode') { this.handleModeKey(k); return !this.closed; }
+    if (this.screen === 'throttle') { this.handleThrottleKey(k); return !this.closed; }
 
     // --- main screen ---
     switch (k.name) {
@@ -291,14 +313,14 @@ export class StartMenu {
     return !this.closed;
   }
 
-  /** ←/→ on a selectable row cycles its value (workers/throttle/engine). */
+  /** ←/→ on a selectable row cycles its value (workers/engine/update-check).
+   *  'target' (Where to mine), 'mode', and 'throttle' are NOT a ←/→ cycle —
+   *  Enter opens their picker. Throttle used to be a ←/→ cycle over the presets
+   *  that SNAPPED the current value and PERSISTED the snap on every press — see
+   *  the file header for why that was a blocker-class bug and why it is gone. */
   private cycleRow(delta: number): void {
     switch (this.currentRow().kind) {
-      // 'target' (Where to mine) is not a ←/→ cycle — Enter opens the picker.
       case 'workers': this.cycleWorkers(delta); break;
-      case 'throttle':
-        if (currentMode(process.env.MINER_SMART) === 'off') this.cycleThrottle(delta);
-        break;
       case 'engine': this.cycleEngine(); break;
       case 'update-check': this.cycleUpdateCheck(); break;
       default: break;
@@ -307,12 +329,14 @@ export class StartMenu {
 
   /** The character cap for the field currently being edited. Caps for the pool
    *  form come from targets.ts, so the TUI and `npm run settings` never accept
-   *  different lengths. Adding the planned 'throttle' arm is one more case. */
+   *  different lengths. The throttle cap is generous (well past any valid 0.05–1
+   *  value) — parseThrottle, not truncation, is what rejects a bad number. */
   private editCap(kind: Editing['kind']): number {
     switch (kind) {
       case 'wallet': return 64; // wallet is exactly 64 hex
       case 'pool-name': return NAME_MAX;
       case 'pool-url': return URL_MAX;
+      case 'throttle': return 16;
     }
   }
 
@@ -389,7 +413,7 @@ export class StartMenu {
         return;
       case 'throttle':
         if (currentMode(process.env.MINER_SMART) !== 'off') return;
-        this.cycleThrottle(1);
+        this.openThrottle();
         return;
       case 'engine':
         this.cycleEngine();
@@ -423,21 +447,6 @@ export class StartMenu {
     const next = clampWorkers(cur + delta);
     persist({ MINER_WORKERS: String(next) });
     process.env.MINER_WORKERS = String(next);
-    this.render();
-  }
-
-  private cycleThrottle(delta: number): void {
-    if (currentMode(process.env.MINER_SMART) !== 'off') return;
-    // Throttle is a short, closed preset cycle (Quiet…Max), so ←/→ WRAPS around
-    // the presets (unlike Workers, which clamps at the real core count because
-    // exceeding the machine is meaningless). Wrapping a 5-item preset ring is the
-    // expected stepper behaviour and keeps every preset reachable in one direction.
-    const idx = throttleIndex(process.env.MINER_THROTTLE);
-    const n = THROTTLE_PRESETS.length;
-    const next = (idx + delta + n) % n;
-    const v = throttleNum(THROTTLE_PRESETS[next]!.value);
-    persist({ MINER_THROTTLE: v });
-    process.env.MINER_THROTTLE = v;
     this.render();
   }
 
@@ -675,8 +684,87 @@ export class StartMenu {
     }
   }
 
-  /** Dispatch the in-progress edit's commit (Enter) by kind. Adding the planned
-   *  'throttle' arm later is one more case here, not a restructure. */
+  // ==================== Throttle picker =====================================
+  private openThrottle(): void {
+    const rows = this.throttleRows();
+    const value = throttleAmount(process.env.MINER_THROTTLE);
+    const idx = rows.findIndex((r) =>
+      (r.kind === 'preset' && r.preset.value === value) || (r.kind === 'custom' && r.value === value));
+    this.throttleCursor = idx >= 0 ? idx : 0;
+    this.editing = null;
+    this.screen = 'throttle';
+    this.render();
+  }
+
+  /** Picker rows: each preset, then — ONLY when the current MINER_THROTTLE is a
+   *  hand-set value that matches none of them — that value gets its own row (the
+   *  same "don't silently fold an unrecognised value into a row it isn't" pattern
+   *  targets.ts's 'unknown' row uses for MINER_POOL) — then "Custom...", then Back. */
+  private throttleRows(): ThrottleRow[] {
+    const rows: ThrottleRow[] = THROTTLE_PRESETS.map((preset): ThrottleRow => ({ kind: 'preset', preset }));
+    const value = throttleAmount(process.env.MINER_THROTTLE);
+    if (!THROTTLE_PRESETS.some((p) => p.value === value)) rows.push({ kind: 'custom', value });
+    rows.push({ kind: 'edit' });
+    rows.push({ kind: 'back' });
+    return rows;
+  }
+
+  private throttleRowCount(): number {
+    return this.throttleRows().length;
+  }
+
+  private handleThrottleKey(k: readline.Key): void {
+    switch (k.name) {
+      case 'up': case 'k': this.moveThrottle(-1); break;
+      case 'down': case 'j': this.moveThrottle(1); break;
+      case 'escape': case 'q': case 'left': this.backToMain(); break;
+      case 'return': case 'space': this.activateThrottleRow(); break;
+      default: break;
+    }
+  }
+
+  private moveThrottle(delta: number): void {
+    const n = this.throttleRowCount();
+    this.throttleCursor = (this.throttleCursor + delta + n) % n;
+    this.render();
+  }
+
+  private activateThrottleRow(): void {
+    const rows = this.throttleRows();
+    const row = rows[this.throttleCursor];
+    if (!row) { this.backToMain(); return; }
+    if (row.kind === 'preset') {
+      this.selectThrottle(row.preset.value);
+      this.backToMain();
+      return;
+    }
+    if (row.kind === 'custom') {
+      // Already the active value — re-confirming it is an explicit commit like any
+      // other row (mirrors the "Where to mine" picker re-selecting the active pool).
+      this.selectThrottle(row.value);
+      this.backToMain();
+      return;
+    }
+    if (row.kind === 'edit') {
+      const cur = throttleAmount(process.env.MINER_THROTTLE);
+      this.editing = { kind: 'throttle', buffer: String(cur), error: '', truncated: false };
+      this.render();
+      return;
+    }
+    this.backToMain(); // 'back'
+  }
+
+  /** The ONLY MINER_THROTTLE writer. Only ever reached from an explicit commit —
+   *  Enter on a picker row, or a validated Custom... entry — never from ←/→ or
+   *  merely opening/navigating the picker (that clamp-and-persist shape is the
+   *  bug this picker replaces; see the file header). */
+  private selectThrottle(value: number): void {
+    const v = String(value);
+    persist({ MINER_THROTTLE: v });
+    process.env.MINER_THROTTLE = v;
+  }
+
+  /** Dispatch the in-progress edit's commit (Enter) by kind. */
   private commitEdit(): void {
     const ed = this.editing;
     if (!ed) return;
@@ -684,7 +772,24 @@ export class StartMenu {
       case 'wallet': this.commitWalletEdit(ed); return;
       case 'pool-name': this.commitPoolNameEdit(ed); return;
       case 'pool-url': this.commitPoolUrlEdit(ed); return;
+      case 'throttle': this.commitThrottleEdit(ed); return;
     }
+  }
+
+  /** Validate + persist the in-progress Custom... throttle edit through the ONE
+   *  shared validator (selectors.ts's parseThrottle) — an out-of-range or
+   *  non-numeric entry is refused with a reason and persists nothing, exactly
+   *  like the wallet and pool-url edits refuse bad input. */
+  private commitThrottleEdit(ed: Editing): void {
+    const r = parseThrottle(ed.buffer);
+    if (!r.ok) {
+      ed.error = r.reason;
+      this.render();
+      return;
+    }
+    this.selectThrottle(r.value);
+    this.editing = null;
+    this.backToMain();
   }
 
   /** Validate + persist the in-progress wallet edit, or set an error and re-prompt. */
@@ -821,6 +926,7 @@ export class StartMenu {
     switch (this.screen) {
       case 'where': return this.buildWhere(cols);
       case 'mode': return this.buildMode(cols);
+      case 'throttle': return this.buildThrottle(cols);
       case 'help': return this.buildHelp(cols);
       default: return this.buildMain(cols);
     }
@@ -975,10 +1081,14 @@ export class StartMenu {
     // YELLOW caution about instability and sustained heat. native-needs-rust wins
     // if both apply (engine row and throttle row are different, so they can't
     // both be true, but the precedence is stated explicitly for clarity).
+    // Read the raw duty cycle directly, not via the nearest preset: now that a
+    // hand-set value (via Custom...) can land anywhere in 0.05–1, snapping a
+    // 0.90 to "nearest preset is Max" would falsely fire this caution for a rate
+    // that never asked for full blast.
     const onFullBlast = !onEngineNeedsRust
       && this.currentRow().kind === 'throttle'
       && currentMode(process.env.MINER_SMART) === 'off'
-      && THROTTLE_PRESETS[throttleIndex(process.env.MINER_THROTTLE)]!.value >= 1;
+      && throttleAmount(process.env.MINER_THROTTLE) >= 1;
     // On the Throttle row in Smart mode, show a DIM explanation that the value
     // is a starting point, not a fixed rate (can't collide with full-blast,
     // which requires Manual; full-blast check already gates on MINER_SMART === 'off').
@@ -1167,6 +1277,91 @@ export class StartMenu {
     const back = backSel ? `${BOLD}← Back${RESET}` : `${DIM}← Back${RESET}`;
     body.push(`${marker}${back}`);
     return body;
+  }
+
+  // --- Throttle picker body: the preset/custom radio list, or the Custom...
+  //     numeric editor — same "one box, no hint-line risk" rule as whereBody. ---
+  private buildThrottleEditForm(inner: number): string[] {
+    const ed = this.editing!;
+    const body: string[] = [`${BOLD}Custom throttle${RESET}`, ''];
+    body.push(this.editFieldLine('Value', ed.buffer, true, inner));
+    if (ed.error) {
+      body.push('');
+      for (const ln of this.wrap(ed.error, Math.max(10, inner - 1))) body.push(`${RED}${ln}${RESET}`);
+    }
+    return body;
+  }
+
+  /** Picker radio-list rows: each preset (• marks an exact match), the current
+   *  hand-set value's own row when it matches no preset, "Custom...", then Back. */
+  private buildThrottleRows(): string[] {
+    const rows = this.throttleRows();
+    const body: string[] = [];
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i]!;
+      const isSel = i === this.throttleCursor;
+      const marker = isSel ? `${CYAN}▶${RESET} ` : '  ';
+      if (row.kind === 'preset') {
+        const isActive = row.preset.value === throttleAmount(process.env.MINER_THROTTLE);
+        const radio = isActive ? `${GREEN}(•)${RESET}` : `${DIM}( )${RESET}`;
+        const label = `${throttleNum(row.preset.value)}  ${row.preset.label}`;
+        const name = isSel ? `${BOLD}${label}${RESET}` : label;
+        body.push(`${marker}${radio} ${name}`);
+      } else if (row.kind === 'custom') {
+        // This row only exists when it IS the active value (throttleRows only adds
+        // it for a non-preset current MINER_THROTTLE) — the radio is always filled.
+        const label = `${throttleNum(row.value)}  custom`;
+        const name = isSel ? `${BOLD}${label}${RESET}` : label;
+        body.push(`${marker}${GREEN}(•)${RESET} ${name}`);
+      } else if (row.kind === 'edit') {
+        const label = isSel ? `${BOLD}Custom...${RESET}` : `${DIM}Custom...${RESET}`;
+        body.push(`${marker}${label}`);
+      } else {
+        const label = isSel ? `${BOLD}← Back${RESET}` : `${DIM}← Back${RESET}`;
+        body.push(`${marker}${label}`);
+      }
+    }
+    return body;
+  }
+
+  private throttleBody(inner: number): string[] {
+    if (this.editing && this.editing.kind === 'throttle') return this.buildThrottleEditForm(inner);
+    return this.buildThrottleRows();
+  }
+
+  private throttleExplainText(row: ThrottleRow | undefined): string {
+    if (!row) return 'Go back without changing the throttle.';
+    if (row.kind === 'preset') return throttlePresetExplain(row.preset);
+    if (row.kind === 'custom') return throttleCustomExplain(row.value);
+    if (row.kind === 'edit') return THROTTLE_CUSTOM_EDIT_EXPLAIN;
+    return 'Go back without changing the throttle.';
+  }
+
+  private throttleHint(): string {
+    if (this.editing && this.editing.kind === 'throttle') return `${DIM}type · Enter save · Esc cancel${RESET}`;
+    return `${DIM}↑/↓ move · Enter choose · Esc back${RESET}`;
+  }
+
+  /** Throttle picker — radio list (presets + the honest "custom" row) plus the
+   *  Custom... numeric editor, per-row explanation. */
+  private buildThrottle(cols: number): string[] {
+    const rows = this.throttleRows();
+    // While editing, the cursor stays on the 'edit' row throughout (no move key
+    // reaches moveThrottle while this.editing is set — see handleKey), so this
+    // already resolves to THROTTLE_CUSTOM_EDIT_EXPLAIN without a special case.
+    const sel = rows[this.throttleCursor];
+    const explain = this.throttleExplainText(sel);
+    const hint = this.throttleHint();
+    const buildRows = (inner: number): string[] => this.throttleBody(inner);
+    const paned = this.twoPane(cols, 'Throttle', buildRows, explain, hint);
+    if (paned) return paned;
+    // Same narrow-fallback as buildWhere/buildMode: append the wrapped
+    // explanation instead of dropping it below TWO_PANE_MIN.
+    const inner = this.mainWidth(cols) - 2;
+    const body = buildRows(inner);
+    body.push('');
+    for (const ln of this.wrap(explain, inner - 1)) body.push(`${DIM}${ln}${RESET}`);
+    return this.frame(inner, 'Throttle', body, hint);
   }
 
   /** Full-screen help overlay. */

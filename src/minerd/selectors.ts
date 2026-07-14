@@ -69,21 +69,48 @@ export function throttleNum(value: number): string {
 }
 
 /**
- * Human label for a throttle value, snapped to the nearest preset for the word.
- * E.g. 0.75 → "0.75  Default"; a custom env value → "<v>  Default" (nearest).
+ * Parse a MINER_THROTTLE-shaped string into a number: unset/blank/non-numeric
+ * defaults to the balanced 0.75 preset. Does NOT clamp to [0.05, 1] — config.ts
+ * owns that at mine time; this only tells the UI what is actually set. Shared by
+ * throttleLabel, the picker's active-row lookup (menu.ts), and the full-blast
+ * check, so all three agree on the exact same number.
  */
-export function throttleLabel(raw: string | undefined): string {
+export function throttleAmount(raw: string | undefined): number {
   const v = (raw ?? '').trim();
   const num = v === '' ? 0.75 : Number(v);
-  const value = Number.isFinite(num) ? num : 0.75;
-  // Snap to nearest preset for the word.
-  let best = THROTTLE_PRESETS[DEFAULT_THROTTLE_INDEX]!;
-  let bestD = Infinity;
-  for (const p of THROTTLE_PRESETS) {
-    const d = Math.abs(p.value - value);
-    if (d < bestD) { bestD = d; best = p; }
+  return Number.isFinite(num) ? num : 0.75;
+}
+
+/**
+ * Human label for a throttle value. A value that matches a preset EXACTLY shows
+ * that preset's name; anything else — a hand-set value the UI does not own —
+ * shows "custom" rather than the nearest preset's name. Snapping the WORD to the
+ * nearest preset (the old behavior) is how a manually-set 0.77 used to render as
+ * "0.77  Default", which is what let cycleThrottle's snap-and-persist bug hide in
+ * plain sight: the label already looked like a preset before anything wrote it.
+ */
+export function throttleLabel(raw: string | undefined): string {
+  const value = throttleAmount(raw);
+  const preset = THROTTLE_PRESETS.find((p) => p.value === value);
+  return `${throttleNum(value)}  ${preset ? preset.label : 'custom'}`;
+}
+
+/**
+ * The one throttle-input validator, shared by the TUI's Custom... editor and (in
+ * a later task) `npm run settings`' own custom prompt — so the two UIs can never
+ * accept different numbers. Accepts 0.05–1 inclusive (config.ts's own runtime
+ * clamp range). An out-of-range or non-numeric value is an ERROR WITH A REASON —
+ * never silently clamped to the nearest bound or preset. A silent clamp-and-persist
+ * is the exact bug class this validator exists to end (see cycleThrottle's removal,
+ * and 0.2.7's MINER_WORKERS clamp-and-persist before it).
+ */
+export function parseThrottle(raw: string): { ok: true; value: number } | { ok: false; reason: string } {
+  const v = raw.trim();
+  const n = Number(v);
+  if (v === '' || !Number.isFinite(n) || n < 0.05 || n > 1) {
+    return { ok: false, reason: 'Enter a number from 0.05 to 1 (5%-100%).' };
   }
-  return `${throttleNum(value)}  ${best.label}`;
+  return { ok: true, value: n };
 }
 
 /** Index of the preset matching the current MINER_THROTTLE, else the default. */

@@ -150,6 +150,35 @@ test('full-blast caution NOT shown on non-throttle rows', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Test 4b: FULL_BLAST_CAUTION NOT falsely triggered by a custom rate merely
+//          near 100% — regression for the nearest-preset snap this check used
+//          to run through (0.90 is nearest to Max under that old logic, but a
+//          hand-set 0.90 is not "at Max" and must not show the caution).
+// ---------------------------------------------------------------------------
+test('full-blast caution is NOT falsely triggered by a custom rate merely near 100%', () => {
+  const oldSmart = process.env.MINER_SMART;
+  const oldThrottle = process.env.MINER_THROTTLE;
+  try {
+    delete process.env.MINER_SMART;
+    process.env.MINER_THROTTLE = '0.90'; // hand-set, not a preset, not "at Max"
+
+    const menu = new StartMenu();
+    navigateToThrottleRow(menu);
+    const text = menu.buildLines(80).map(visible).join('\n');
+
+    assert.ok(
+      !text.includes('Full blast'),
+      `Expected no "Full blast" caution at a custom 0.90 throttle. Got:\n${text}`,
+    );
+  } finally {
+    if (oldSmart === undefined) delete process.env.MINER_SMART;
+    else process.env.MINER_SMART = oldSmart;
+    if (oldThrottle === undefined) delete process.env.MINER_THROTTLE;
+    else process.env.MINER_THROTTLE = oldThrottle;
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Test 5: Width probe — no visible line exceeds cols at 100/80/64/50/40
 //         when full-blast caution is active
 // ---------------------------------------------------------------------------

@@ -28,6 +28,7 @@ const WIDTHS = [100, 80, 64, 50, 40];
 beforeEach(() => {
   for (const f of [ENV_LOCAL, `${ENV_LOCAL}.bak`, POOLS, `${POOLS}.bak`]) if (existsSync(f)) rmSync(f);
   delete process.env.MINER_POOL;
+  delete process.env.MINER_THROTTLE;
 });
 
 function visible(s: string): string {
@@ -111,6 +112,15 @@ function openWhere(menu: InstanceType<typeof StartMenu>): void {
 function openMode(menu: InstanceType<typeof StartMenu>): void {
   withMutedStdout(() => {
     for (let i = 0; i < 4; i++) menu.handleKey(undefined, { name: 'down' });
+    menu.handleKey('\r', { name: 'return' });
+  });
+}
+
+/** ROWS: action-start, wallet, target, workers, mode, throttle — 5 downs from the
+ *  top lands on Throttle; Enter (only valid in Manual mode) opens its picker. */
+function openThrottle(menu: InstanceType<typeof StartMenu>): void {
+  withMutedStdout(() => {
+    for (let i = 0; i < 5; i++) menu.handleKey(undefined, { name: 'down' });
     menu.handleKey('\r', { name: 'return' });
   });
 }
@@ -329,4 +339,150 @@ test('where picker fits within common terminal widths — list, add-pool form, a
   moveToRow(menu, 100, /MyPool/);
   pressKey(menu, 'd');
   for (const cols of WIDTHS) assertFits(menu.buildLines(cols), cols);
+});
+
+// -- the Throttle picker -------------------------------------------------------
+// cycleThrottle() used to take whatever MINER_THROTTLE held, snap it to the
+// nearest preset, and PERSIST that on every ←/→ press or Enter — so a user who
+// hand-set 0.77 lost it the moment they merely touched the row (same shape as
+// 0.2.7's MINER_WORKERS clamp-and-persist blocker). These tests pin: no
+// navigation key writes MINER_THROTTLE, only an explicit commit does; a typed
+// custom value persists exactly as entered; an invalid one persists nothing;
+// and the picker honestly labels a hand-set value "custom" instead of folding
+// it into whichever preset happens to be nearest.
+
+test('the throttle regression: wandering the menu and the picker never writes; only an explicit commit does', () => {
+  process.env.MINER_THROTTLE = '0.77';
+  try {
+    const menu = new StartMenu();
+    // Wander the main menu first — ←/→ must never touch throttle again, even
+    // when the Throttle row happens to be highlighted.
+    withMutedStdout(() => {
+      for (let i = 0; i < 5; i++) menu.handleKey(undefined, { name: 'down' }); // land on Throttle
+      menu.handleKey(undefined, { name: 'left' });
+      menu.handleKey(undefined, { name: 'right' });
+      menu.handleKey(undefined, { name: 'left' });
+      menu.handleKey(undefined, { name: 'up' });
+      menu.handleKey(undefined, { name: 'down' });
+    });
+    assert.ok(!existsSync(ENV_LOCAL), '.env.local must not exist after mere navigation on the main menu');
+
+    // Open the picker and wander INSIDE it too — up/down over every row,
+    // including the "0.77  custom" row and "Custom..." — without ever pressing
+    // Enter to commit anything.
+    openThrottle(menu);
+    withMutedStdout(() => {
+      for (let i = 0; i < 8; i++) menu.handleKey(undefined, { name: 'down' });
+      for (let i = 0; i < 8; i++) menu.handleKey(undefined, { name: 'up' });
+    });
+    pressEscape(menu); // back to main WITHOUT choosing anything
+
+    assert.ok(!existsSync(ENV_LOCAL), '.env.local must still not exist — opening/navigating the picker wrote nothing');
+    assert.equal(process.env.MINER_THROTTLE, '0.77', 'the hand-set value must survive untouched');
+  } finally {
+    delete process.env.MINER_THROTTLE;
+  }
+});
+
+test('the throttle picker shows the hand-set value as its own "custom" row, not folded into a preset', () => {
+  process.env.MINER_THROTTLE = '0.77';
+  try {
+    const menu = new StartMenu();
+    openThrottle(menu);
+    const text = menu.buildLines(100).map(visible).join('\n');
+    assert.match(text, /0\.77\s+custom/, `expected a "0.77  custom" row, got:\n${text}`);
+    // It must be the ACTIVE (filled) radio, and the picker must open already
+    // highlighting it (openThrottle lands the cursor on the active row).
+    const customLine = text.split('\n').find((l) => l.includes('0.77') && l.includes('custom'));
+    assert.ok(customLine && customLine.includes('▶'), 'the custom row should be the highlighted row on open');
+    assert.ok(customLine && customLine.includes('(•)'), 'the custom row must show a filled (active) radio');
+  } finally {
+    delete process.env.MINER_THROTTLE;
+  }
+});
+
+test('selecting a preset row persists that preset and returns to the main menu', () => {
+  const menu = new StartMenu();
+  openThrottle(menu);
+  moveToRow(menu, 100, /Quiet/);
+  pressReturn(menu);
+
+  assert.equal(process.env.MINER_THROTTLE, '0.25');
+  assert.ok(existsSync(ENV_LOCAL));
+  assert.match(readFileSync(ENV_LOCAL, 'utf8'), /MINER_THROTTLE=0\.25/);
+  const text = menu.buildLines(100).map(visible).join('\n');
+  assert.match(text, /Throttle\s+0\.25\s+Quiet/, 'back on the main menu, showing the newly-selected preset');
+});
+
+test('Custom... opens an editor pre-filled with the current value; a valid entry persists exactly as typed', () => {
+  const menu = new StartMenu();
+  openThrottle(menu);
+  moveToRow(menu, 100, /Custom\.\.\./);
+  pressReturn(menu); // -> editing, pre-filled with the current value (default 0.75)
+
+  for (let i = 0; i < 20; i++) pressKey(menu, 'backspace'); // clear the pre-fill
+  type(menu, '0.77');
+  pressReturn(menu); // commit
+
+  assert.equal(process.env.MINER_THROTTLE, '0.77', 'persisted exactly as typed — not reformatted to 0.77.00 or similar');
+  assert.ok(existsSync(ENV_LOCAL));
+  assert.match(readFileSync(ENV_LOCAL, 'utf8'), /MINER_THROTTLE=0\.77/);
+
+  // Back on the main menu, the row now tells the truth: "custom", not "Default".
+  const text = menu.buildLines(100).map(visible).join('\n');
+  assert.match(text, /Throttle\s+0\.77\s+custom/);
+});
+
+test('an out-of-range or non-numeric custom value is refused with a reason, and persists nothing', () => {
+  for (const bad of ['2', '0', 'abc']) {
+    const menu = new StartMenu();
+    openThrottle(menu);
+    moveToRow(menu, 100, /Custom\.\.\./);
+    pressReturn(menu);
+    for (let i = 0; i < 20; i++) pressKey(menu, 'backspace');
+    type(menu, bad);
+    pressReturn(menu);
+
+    const text = narrowText(menu, 50);
+    assert.ok(/0\.05|enter a number/i.test(text), `expected a range/format error for ${JSON.stringify(bad)}, got: ${text}`);
+    assert.ok(!existsSync(ENV_LOCAL), `${JSON.stringify(bad)} must persist nothing`);
+    assert.equal(process.env.MINER_THROTTLE, undefined, `${JSON.stringify(bad)} must not touch process.env either`);
+  }
+});
+
+test('the Smart gate still blocks the throttle row: (auto) shown, and Enter does not open the picker', () => {
+  const oldSmart = process.env.MINER_SMART;
+  try {
+    process.env.MINER_SMART = 'max';
+    const menu = new StartMenu();
+    withMutedStdout(() => {
+      for (let i = 0; i < 5; i++) menu.handleKey(undefined, { name: 'down' }); // land on Throttle
+      menu.handleKey(undefined, { name: 'left' });
+      menu.handleKey(undefined, { name: 'right' });
+      menu.handleKey('\r', { name: 'return' }); // must NOT open the picker
+    });
+    const text = menu.buildLines(100).map(visible).join('\n');
+    assert.match(text, /Throttle\s+\(auto\)/);
+    assert.ok(!text.includes('Custom...'), 'Enter must not open the throttle picker while Smart mode is active');
+    assert.ok(!existsSync(ENV_LOCAL), 'none of this may write .env.local');
+  } finally {
+    if (oldSmart === undefined) delete process.env.MINER_SMART;
+    else process.env.MINER_SMART = oldSmart;
+  }
+});
+
+test('throttle picker fits within common terminal widths — presets, the custom row, and the editor', () => {
+  process.env.MINER_THROTTLE = '0.77';
+  try {
+    const menu = new StartMenu();
+    openThrottle(menu);
+    for (const cols of WIDTHS) assertFits(menu.buildLines(cols), cols);
+
+    moveToRow(menu, 100, /Custom\.\.\./);
+    pressReturn(menu);
+    type(menu, 'x'.repeat(20)); // exercise the clamped inline field too (item A pattern)
+    for (const cols of WIDTHS) assertFits(menu.buildLines(cols), cols);
+  } finally {
+    delete process.env.MINER_THROTTLE;
+  }
 });

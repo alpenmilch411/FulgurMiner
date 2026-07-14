@@ -8,9 +8,10 @@
 // This module imports NOTHING from menu.ts at runtime — the `RowKind` import is
 // type-only (erased by the compiler), so there is no import cycle.
 import type { RowKind } from './menu.js';
-import type { SmartMode } from './selectors.js';
+import type { SmartMode, ThrottlePreset } from './selectors.js';
 import type { Target } from './targets.js';
 import { REPO_URL } from './config.js';
+import { throttleNum } from './selectors.js';
 
 /**
  * Shown (in red) in the right "About" pane when Native is selected but the Rust
@@ -51,7 +52,7 @@ export const ROW_EXPLAIN: Record<RowKind, string> = {
   mode:
     'Manual lets you set the duty cycle by hand; Smart auto-tunes it. Press Enter to choose.',
   throttle:
-    'How hard each worker pushes the CPU. Balanced stays cool and quiet; Max is fastest but runs hot. Use ←/→ to change.',
+    'How hard each worker pushes the CPU. Balanced stays cool and quiet; Max is fastest but runs hot. Press Enter to choose, or set an exact rate with Custom...',
   engine:
     'wasm runs anywhere Node runs; native (Rust) is faster but is built on first use. Use ←/→ to switch.',
   'update-check':
@@ -119,3 +120,19 @@ export function modeExplain(mode: SmartMode): string {
   }
   return 'Starts at 50% and adapts: eases off — down to as low as 5% — when your other apps need the CPU, and climbs back toward the most your machine sustains when they go quiet. Your Throttle setting is not used. Best for set-and-forget on a machine you also use. On a dedicated server or VPS, use Max or Manual instead — on shared/virtual CPUs the idle reading is unreliable and can make it oscillate.';
 }
+
+/** Explanation for a Throttle preset row, shown in the Throttle picker's right pane. */
+export function throttlePresetExplain(preset: ThrottlePreset): string {
+  return `${preset.label} runs at ${throttleNum(preset.value)} — ${Math.round(preset.value * 100)}% of the time spent hashing, the rest idle.`;
+}
+
+/** Explanation for the "your current rate" row that appears in the Throttle picker
+ *  only when MINER_THROTTLE holds a value that is not one of the presets — a
+ *  hand-set rate the picker must show honestly, not fold into the nearest preset. */
+export function throttleCustomExplain(value: number): string {
+  return `Your current rate, set by hand: ${throttleNum(value)} — ${Math.round(value * 100)}%. It is not one of the presets below.`;
+}
+
+/** Shown in the Throttle picker's right pane when the "Custom..." row is highlighted. */
+export const THROTTLE_CUSTOM_EDIT_EXPLAIN =
+  'Type an exact rate from 0.05 to 1 (5%-100%). Saved exactly as entered — never rounded to the nearest preset.';
