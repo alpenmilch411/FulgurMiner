@@ -95,6 +95,38 @@ export function loadEnvLocal(path: string = ENV_FILE): void {
 }
 
 /**
+ * Merge ONLY these keys from .env.local into process.env, and only where the real
+ * environment has not already spoken. `npm run mine` uses this instead of loadEnvLocal:
+ * a headless miner must see the destination the user chose in the menu (MINER_POOL) and
+ * their wallet (MINER_PUBKEY) - and nothing else. Every other setting stays env-var-only,
+ * so a stale .env.local line can never change how a headless miner runs (D9).
+ */
+export function loadEnvLocalKeys(keys: readonly string[], path: string = ENV_FILE): void {
+  const file = readEnvFile(path);
+  for (const k of keys) {
+    if (process.env[k] !== undefined) continue;                       // a real env var wins
+    if (!Object.prototype.hasOwnProperty.call(file, k)) continue;     // never read a key off Object.prototype
+    process.env[k] = file[k];
+  }
+}
+
+/**
+ * Delete MINER_POOL from the environment when it is DEFINED BUT BLANK.
+ *
+ * Both loaders only fill keys that are `undefined`, so an exported `MINER_POOL=` (an
+ * empty value, not an absent one) shadows .env.local forever: the miner would decode
+ * 'unset' and refuse to start while .env.local plainly says `solo`. A blank value has
+ * never meant anything, so dropping it loses nothing.
+ *
+ * It lives HERE, not in start.ts, so index.ts and settings.ts can call it without
+ * importing the launcher. Call it BEFORE the loader.
+ */
+export function dropBlankPoolEnv(env: NodeJS.ProcessEnv = process.env): void {
+  const v = env.MINER_POOL;
+  if (typeof v === 'string' && v.trim() === '') delete env.MINER_POOL;
+}
+
+/**
  * Persist updates back to .env.local by SPLICING THE RAW TEXT - never by
  * regenerating the file from parsed keys (that is what deleted every comment and
  * every blank line up to 0.2.8, from a file .env.example tells people to hand-write).

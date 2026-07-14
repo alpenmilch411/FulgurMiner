@@ -22,6 +22,8 @@ import {
   writePoolsFile,
   isValidPoolUrl,
   POOLS_FILE_ISSUE,
+  loadEnvLocalKeys,
+  dropBlankPoolEnv,
 } from './envLocal.js';
 
 /** A fresh temp dir per call, with the paths of the two files envLocal manages. */
@@ -263,4 +265,85 @@ test('writePoolsFile: a bare-array file is written back in the { pools: [...] } 
   const raw = JSON.parse(readFileSync(pools, 'utf8')) as { pools: Record<string, unknown>[] };
   assert.equal(raw.pools.length, 3);
   assert.deepEqual(raw.pools[1], { nope: 1 });           // still there, untouched
+});
+
+// -- the env loaders ----------------------------------------------------------
+
+/** Put process.env back exactly as it was (undefined means: the key was not there). */
+function restoreEnv(saved: Record<string, string | undefined>): void {
+  for (const [k, v] of Object.entries(saved)) {
+    if (v === undefined) delete process.env[k];
+    else process.env[k] = v;
+  }
+}
+
+test('loadEnvLocalKeys fills ONLY the keys it was given, and never overrides a real environment variable', () => {
+  const { env } = tmpFiles();
+  writeFileSync(env, [
+    'MINER_POOL=https://pool.beta.example',
+    `MINER_PUBKEY=${'bb'.repeat(32)}`,
+    'MINER_WORKERS=8',
+    'FULGUR_TUI=0',
+  ].join('\n') + '\n');
+
+  const saved = {
+    MINER_POOL: process.env.MINER_POOL,
+    MINER_PUBKEY: process.env.MINER_PUBKEY,
+    MINER_WORKERS: process.env.MINER_WORKERS,
+    FULGUR_TUI: process.env.FULGUR_TUI,
+  };
+  try {
+    delete process.env.MINER_POOL;
+    delete process.env.MINER_WORKERS;
+    delete process.env.FULGUR_TUI;
+    process.env.MINER_PUBKEY = 'cc'.repeat(32);        // a REAL env var still wins
+
+    loadEnvLocalKeys(['MINER_POOL', 'MINER_PUBKEY'], env);
+
+    assert.equal(process.env.MINER_POOL, 'https://pool.beta.example');  // filled from .env.local
+    assert.equal(process.env.MINER_PUBKEY, 'cc'.repeat(32));            // NOT overridden
+    assert.equal(process.env.MINER_WORKERS, undefined);                 // not on the allowlist: env-var-only (D9)
+    assert.equal(process.env.FULGUR_TUI, undefined);                    // ditto
+  } finally {
+    restoreEnv(saved);
+  }
+});
+
+test('dropBlankPoolEnv deletes a defined-but-blank MINER_POOL, and leaves a real answer alone', () => {
+  const blank: NodeJS.ProcessEnv = { MINER_POOL: '' };
+  dropBlankPoolEnv(blank);
+  assert.equal('MINER_POOL' in blank, false);
+
+  const spaces: NodeJS.ProcessEnv = { MINER_POOL: '   ' };
+  dropBlankPoolEnv(spaces);
+  assert.equal('MINER_POOL' in spaces, false);
+
+  const solo: NodeJS.ProcessEnv = { MINER_POOL: 'solo' };
+  dropBlankPoolEnv(solo);
+  assert.equal(solo.MINER_POOL, 'solo');
+
+  const none: NodeJS.ProcessEnv = {};
+  dropBlankPoolEnv(none);                              // absent stays absent - it must not invent the key
+  assert.equal('MINER_POOL' in none, false);
+});
+
+test('a blank MINER_POOL= in the real environment no longer shadows .env.local (dropBlankPoolEnv, then loadEnvLocalKeys)', () => {
+  const { env } = tmpFiles();
+  writeFileSync(env, `MINER_POOL=solo\nMINER_PUBKEY=${'aa'.repeat(32)}\n`);
+
+  const saved = { MINER_POOL: process.env.MINER_POOL, MINER_PUBKEY: process.env.MINER_PUBKEY };
+  try {
+    process.env.MINER_POOL = '';                       // e.g. an exported empty var, or `MINER_POOL= npm run mine`
+    delete process.env.MINER_PUBKEY;
+
+    // Without the drop, the loader sees a DEFINED (blank) value and skips it, the
+    // miner decodes 'unset', and it refuses to start while .env.local says solo.
+    dropBlankPoolEnv();
+    loadEnvLocalKeys(['MINER_POOL', 'MINER_PUBKEY'], env);
+
+    assert.equal(process.env.MINER_POOL, 'solo');
+    assert.equal(process.env.MINER_PUBKEY, 'aa'.repeat(32));
+  } finally {
+    restoreEnv(saved);
+  }
 });
