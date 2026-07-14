@@ -94,6 +94,17 @@ test('persist() creates the file 0600 when there is none, with a trailing newlin
   assert.equal(statSync(env).mode & 0o777, 0o600);
 });
 
+test('persist() enforces 0600 on an existing file, not just when created', () => {
+  const { env } = tmpFiles();
+  writeFileSync(env, 'MINER_POOL=https://old.example\n', { mode: 0o644 });
+  assert.equal(statSync(env).mode & 0o777, 0o644);
+
+  persist({ MINER_POOL: 'solo' }, env);
+
+  assert.equal(readFileSync(env, 'utf8'), 'MINER_POOL=solo\n');
+  assert.equal(statSync(env).mode & 0o777, 0o600);
+});
+
 test('persist() collapses duplicate lines for the key it writes (readEnvFile is last-wins - a stale duplicate would shadow the new value)', () => {
   const { env } = tmpFiles();
   writeFileSync(env, 'MINER_POOL=https://old.example\n# note\nMINER_POOL=https://older.example\n');

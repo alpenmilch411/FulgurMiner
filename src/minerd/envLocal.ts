@@ -138,8 +138,11 @@ export function dropBlankPoolEnv(env: NodeJS.ProcessEnv = process.env): void {
  *
  * A duplicate line for a key we are writing is dropped, so exactly one line for it
  * remains: readEnvFile is last-wins, and leaving a stale duplicate behind would
- * silently shadow the value we just wrote. Mode 0600 as before (it applies when the
- * file is created); a missing file is created.
+ * silently shadow the value we just wrote. Mode 0600 is enforced with an explicit
+ * chmod, not just the writeFileSync `mode` option: that option only applies when the
+ * underlying file is newly created, so a pre-existing file (e.g. hand-written at the
+ * shell's default 0644) would otherwise keep its looser mode across every write.
+ * A missing file is created.
  */
 export function persist(updates: Record<string, string | undefined>, path: string = ENV_FILE): void {
   const before = existsSync(path) ? readFileSync(path, 'utf8') : '';
@@ -176,6 +179,7 @@ export function persist(updates: Record<string, string | undefined>, path: strin
 
   const body = out.length ? out.join('\n') + (trailingNewline ? '\n' : '') : '';
   writeFileSync(path, body, { mode: 0o600 });
+  chmodSync(path, 0o600);
 }
 
 /** How an issue names the offending entry: its name, or its position when it has none. */
