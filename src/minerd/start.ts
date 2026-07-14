@@ -14,14 +14,15 @@
 // default. Solo is also always reachable via `MINER_POOL=solo` in `.env.local`.
 import { createInterface } from 'node:readline/promises';
 import { stdin as input, stdout as output } from 'node:process';
-import { loadConfig, DEFAULT_POOL, FULGURPOOL_NAME, FULGURPOOL_URL, FULGURPOOL_PAGE } from './config.js';
+import { loadConfig } from './config.js';
 import { runMiner, type WarmChain } from './miner.js';
 import { runPoolClient } from './poolClient.js';
 import { ConsoleReporter, type MinerReporter, type ReporterStatus } from './reporter.js';
 import { DashboardReporter } from './tui.js';
 import { runStartMenu } from './menu.js';
 import { runSettings } from './settings.js';
-import { loadEnvLocal, persist, readExtraPools, type PoolEntry } from './envLocal.js';
+import { loadEnvLocal, persist } from './envLocal.js';
+import { buildTargetModel, persistTarget, type Target, type TargetModel } from './targets.js';
 import { resolveEngine } from './engine.js';
 import { currentEngine } from './selectors.js';
 import { checkForUpdate } from './updateCheck.js';
@@ -30,7 +31,18 @@ import { installCrashGuard, installStdioErrorSink } from './crashGuard.js';
 
 const HEX64 = /^[0-9a-f]{64}$/i;
 
-async function promptWallet(rl: ReturnType<typeof createInterface>): Promise<string> {
+/**
+ * The one method these prompts need from a readline interface. A plain object
+ * with just `question` satisfies this too (structurally) — that is what
+ * start.test.ts uses to drive firstRunSetup() without a real TTY (via the
+ * `customInput` Readable it feeds into createInterface), mirroring the same
+ * narrow-interface trick settings.ts uses for its own editors.
+ */
+interface RL {
+  question(prompt: string): Promise<string>;
+}
+
+async function promptWallet(rl: RL): Promise<string> {
   console.log('\n  FulgurMiner — first-time setup');
   console.log('  Open the BrowserCoin app → Wallet → Copy, then paste your address below.');
   console.log('  (Your address is where mining rewards are paid. No password or key is needed.)\n');
@@ -41,46 +53,63 @@ async function promptWallet(rl: ReturnType<typeof createInterface>): Promise<str
   }
 }
 
-/** Show the pool chooser. Only called when the user has registered extra pools. */
-async function promptPool(rl: ReturnType<typeof createInterface>, extras: PoolEntry[]): Promise<string | undefined> {
+/**
+ * Show the pool chooser. Only called when the shared model (targets.ts) has at
+ * least one custom pool. Renders the SAME rows as before the migration —
+ * FulgurPool, the custom pools from pools.json, then Solo — just sourced from
+ * buildTargetModel() instead of a hand-built list. brcpool (a built-in like
+ * FulgurPool) is deliberately NOT offered here: this first-run chooser has
+ * never listed it, and this migration is a pure sourcing change, not a new
+ * menu item — `npm run settings` / the arrow menu are where brcpool is picked.
+ */
+async function promptPool(rl: RL, model: TargetModel): Promise<Target> {
+  const fulgurpool = model.targets.find((t) => t.kind === 'builtin' && t.key === 'fulgurpool')!;
+  const solo = model.targets.find((t) => t.kind === 'solo')!;
+  const customs = model.targets.filter((t) => t.kind === 'custom');
+
   console.log('\n  Where do you want to mine?');
-  console.log(`    [1] ${FULGURPOOL_NAME} — the default`);
-  extras.forEach((p, i) => console.log(`    [${i + 2}] ${p.name} — ${p.url}`));
+  console.log(`    [1] ${fulgurpool.label} — the default`);
+  customs.forEach((t, i) => console.log(`    [${i + 2}] ${t.label} — ${t.value}`));
   console.log('    [s] Solo — mine on your own\n');
 
   for (;;) {
     const ans = (await rl.question('  Choose [1]: ')).trim().toLowerCase() || '1';
-    if (ans === '1') return undefined;            // FulgurPool default → no override
-    if (ans === 's') return 'solo';
+    if (ans === '1') return fulgurpool;
+    if (ans === 's') return solo;
     const idx = Number(ans) - 2;
-    if (Number.isInteger(idx) && idx >= 0 && idx < extras.length) return extras[idx]!.url;
+    if (Number.isInteger(idx) && idx >= 0 && idx < customs.length) return customs[idx]!;
     console.log('  Please enter one of the numbers above, or "s" for solo.\n');
   }
 }
 
-/** First-run setup: ensure a wallet is set (+ pool chooser if pools.json exists). */
-async function firstRunSetup(): Promise<void> {
+/**
+ * First-run setup: ensure a wallet is set (+ pool chooser if the shared model
+ * has a custom pool to offer). `customInput` defaults to the real
+ * process.stdin; start.test.ts passes a scripted Readable instead so this can
+ * be driven end to end without a real TTY (same trick settings.ts's
+ * runSettings uses).
+ */
+export async function firstRunSetup(customInput: NodeJS.ReadableStream = input): Promise<void> {
   const needWallet = !HEX64.test((process.env.MINER_PUBKEY ?? '').trim().toLowerCase());
   const poolUnset = (process.env.MINER_POOL ?? '').trim() === '';
-  const extras = poolUnset ? readExtraPools() : [];
-  const needPoolMenu = poolUnset && extras.length > 0;
+  const model = poolUnset ? buildTargetModel() : undefined;
+  const needPoolMenu = !!model && model.targets.some((t) => t.kind === 'custom');
   if (!needWallet && !needPoolMenu) return;
 
-  const rl = createInterface({ input, output });
-  const updates: Record<string, string> = {};
+  const rl = createInterface({ input: customInput, output });
   if (needWallet) {
     const pubkey = await promptWallet(rl);
-    updates.MINER_PUBKEY = pubkey;
+    persist({ MINER_PUBKEY: pubkey });
     process.env.MINER_PUBKEY = pubkey;
   }
-  if (needPoolMenu) {
-    const choice = await promptPool(rl, extras);
-    if (choice) { updates.MINER_POOL = choice; process.env.MINER_POOL = choice; }
-    // FulgurPool default writes no MINER_POOL, so the miner follows the
-    // built-in default pool.
+  if (needPoolMenu && model) {
+    const target = await promptPool(rl, model);
+    // The ONE MINER_POOL writer (targets.ts). FulgurPool's Target.value is
+    // undefined, and persistTarget deletes the key on undefined — so choosing
+    // FulgurPool still writes NO MINER_POOL, exactly as before this migration.
+    persistTarget(target);
   }
   rl.close();
-  if (Object.keys(updates).length) persist(updates);
   console.log('  Saved to .env.local — edit that file (or pools.json) to change settings.\n');
 }
 
@@ -102,34 +131,25 @@ function wantTui(argv: string[]): boolean {
   return true;
 }
 
-/** Build the reporter status from config (target label + canonical URL). */
-function buildStatus(cfg: ReturnType<typeof loadConfig>): ReporterStatus {
+/**
+ * Build the reporter status from config (target label + canonical URL).
+ * Solo aside, the label/page come from the shared model's matching target —
+ * the same row menu.ts/settings.ts would show as active for this MINER_POOL —
+ * so the "mining at ..." line can never name a different destination than the
+ * pickers do.
+ */
+export function buildStatus(cfg: ReturnType<typeof loadConfig>): ReporterStatus {
   const backend: 'wasm' | 'native' = currentEngine(process.env.MINER_NATIVE);
   if (!cfg.poolUrl) {
     return { mode: 'solo', target: 'solo', backend, workers: cfg.workers, throttle: cfg.throttle, address: cfg.minerPubkeyHex };
   }
-  const isDefault = !!DEFAULT_POOL && cfg.poolUrl === DEFAULT_POOL;
-  if (isDefault) {
-    return {
-      mode: 'pool',
-      target: FULGURPOOL_NAME,
-      targetUrl: FULGURPOOL_URL || FULGURPOOL_PAGE,
-      targetPage: FULGURPOOL_PAGE,
-      backend,
-      workers: cfg.workers,
-      throttle: cfg.throttle,
-      address: cfg.minerPubkeyHex,
-    };
-  }
-  // A configured custom pool: show its label and host; hyperlink the host to the
-  // pool's optional `page` (from pools.json) when one is set.
-  const norm = cfg.poolUrl.replace(/\/+$/, '');
-  const match = readExtraPools().find((p) => p.url.replace(/\/+$/, '') === norm);
+  const model = buildTargetModel();
+  const target = model.targets[model.activeIndex]!;
   return {
     mode: 'pool',
-    target: match?.name ?? cfg.poolUrl,
+    target: target.label,
     targetUrl: cfg.poolUrl,
-    targetPage: match?.page,
+    targetPage: target.page,
     backend,
     workers: cfg.workers,
     throttle: cfg.throttle,
@@ -313,4 +333,11 @@ async function main(): Promise<void> {
   await runPlainSession();
 }
 
-void main();
+// Allow this file to be imported (e.g. by start.test.ts) without launching the
+// miner: only run main() when invoked directly, exactly as `npm start`
+// (`tsx src/minerd/start.ts`) does — the same guard settings.ts and index.ts
+// use for the same reason.
+import { fileURLToPath } from 'node:url';
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  void main();
+}

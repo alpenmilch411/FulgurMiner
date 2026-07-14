@@ -258,16 +258,6 @@ export function readPoolsFile(path: string = POOLS_FILE): PoolsFile {
 }
 
 /**
- * TEMPORARY BRIDGE - DELETE IN TASK 10 (settings.ts is the last caller).
- * menu.ts / settings.ts / start.ts still read a flat PoolEntry[]; they move to
- * targets.ts (buildTargetModel) in Tasks 5 / 7 / 10, and this dies with the last of
- * them. It reports nothing, so it must never gain a new caller.
- */
-export function readExtraPools(path: string = POOLS_FILE): PoolEntry[] {
-  return readPoolsFile(path).pools.map((p) => p.entry);
-}
-
-/**
  * Write pools.json back. The caller owns the splice: it pushes onto file.rawList to
  * add, or splices file.rawList by `rawIndex` to remove. We emit rawList verbatim, so
  * an element we could not parse - and any per-entry key we do not know about - is
