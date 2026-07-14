@@ -156,6 +156,11 @@ export class ConsoleReporter implements MinerReporter {
   private soloBlocks: { height: number; hash: string }[] = [];
   private orphanedSoloHashes = new Set<string>();
   private smart_: SmartInfo | null = null;
+  // Session-end guard for the jackpot panel: once a session has ended, a late
+  // jackpot() call (e.g. a /jackpot response that was already in flight when the
+  // pool stopped) must not print a stale finder-bonus line into what now reads as
+  // a new session's log.
+  private closed_ = false;
 
   private canonicalSolo(): { heights: number[]; earnedBrc: number; count: number } {
     const heights = this.soloBlocks
@@ -296,8 +301,16 @@ export class ConsoleReporter implements MinerReporter {
   }
 
   jackpot(j: JackpotInfo): void {
+    if (this.closed_) return; // the session has ended — never print a stale panel
     const last = j.lastWinner ? ` - last ${j.lastWinner.slice(0, 12)}...@${j.lastStrikeHeight ?? '?'}` : '';
     console.log(`[pool-miner] jackpot: ${Math.round(j.finderBonusPct * 100)}% finder bonus - blocks found: ${j.yourBlockStrikes}${last}`);
+  }
+
+  /** Session end. Plain mode has no persistent panel to erase, but this closes
+   *  the door on any late jackpot() call (e.g. from an in-flight /jackpot request
+   *  that was already underway when the session stopped) — TUI/plain parity. */
+  close(): void {
+    this.closed_ = true;
   }
 
   updateNotice(n: UpdateNotice): void {

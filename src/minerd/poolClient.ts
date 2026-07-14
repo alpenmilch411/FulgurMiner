@@ -11,6 +11,7 @@ import { VERSION } from './version.js';
 import { backoffDelay, classify, parseRetryAfterMs, PoolError, poolFetch, withPoolRetry } from './poolHttp.js';
 import { startPoolStats } from './poolStats.js';
 import { checkForUpdate } from './updateCheck.js';
+import { isFulgurPool } from './pools.js';
 import { NONCE_SPACE } from './partition.js';
 import { currentEngine } from './selectors.js';
 import { SmartController, smartStartDuty } from './smartController.js';
@@ -463,6 +464,9 @@ export async function runPoolClient(
   signal?: AbortSignal,
   status?: ReporterStatus,
   smart: 'off' | 'max' | 'considerate' = 'off',
+  /** Injectable fetch for tests; defaults to the global fetch. Never changes the
+   *  wire protocol — only which fetch implementation performs the request. */
+  doFetch: typeof fetch = fetch,
 ): Promise<void> {
   // Show "connecting to pool…" as bootstrapping activity before the first job
   // arrives. Pools need no chain sync, but registration + the first job poll
@@ -480,7 +484,7 @@ export async function runPoolClient(
       () => poolFetch(`${poolUrl}/register`, {
         method: 'POST',
         body: JSON.stringify({ payoutAddress, minerVersion: VERSION }),
-      }),
+      }, undefined, doFetch),
       {
         signal,
         onWait: () => {
@@ -568,7 +572,17 @@ export async function runPoolClient(
   reporter.event('info', `[pool-miner] grind engine: ${useNative ? 'native' : 'wasm'}`);
   reporter.synced(0);
   let acceptedShares = 0;
-  startPoolStats({ poolUrl, address: payoutAddress, getAcceptedShares: () => acceptedShares, pageUrl: undefined, reporter, signal });
+  // Jackpot is a FulgurPool-only feature. Gate on pool IDENTITY (isFulgurPool),
+  // not on whether a /jackpot response happens to parse — a third-party pool
+  // must never be asked for an endpoint it doesn't have, and must never be able
+  // to paint the FulgurPool-branded panel by returning a jackpot-shaped body.
+  // Derived here, once, from the canonical poolUrl this function was called with,
+  // so the gate is identical on the TUI path and the headless `npm run mine` path
+  // — both funnel through this one runPoolClient implementation.
+  const poolStats = startPoolStats({
+    poolUrl, address: payoutAddress, getAcceptedShares: () => acceptedShares, pageUrl: undefined,
+    reporter, signal, wantJackpot: isFulgurPool(poolUrl), doFetch,
+  });
 
   // Considerate's whole job is to get out of your way, so it also grinds at a lower
   // scheduling priority (solo has always done this). Manual and Max are NOT niced: a
@@ -599,7 +613,7 @@ export async function runPoolClient(
     )
     : null;
   const post: PostShare = async (s) => {
-    const r = await poolFetch(`${poolUrl}/share`, { method: 'POST', body: JSON.stringify(s), signal });
+    const r = await poolFetch(`${poolUrl}/share`, { method: 'POST', body: JSON.stringify(s), signal }, undefined, doFetch);
     // Spread the pool body FIRST so the authoritative HTTP status + the parsed
     // Retry-After (from headers) always win, even if the body carries its own
     // `status`/`retryAfterMs` field.
@@ -701,7 +715,7 @@ export async function runPoolClient(
     if (stopped) return { kind: 'stopped' };
     const url = buildJobUrl(poolUrl, workerId, { waitS: args.waitS, have: args.have });
     const timeoutMs = args.waitS > 0 ? args.waitS * 1000 + LONGPOLL_TIMEOUT_MARGIN_MS : undefined;
-    const r = await poolFetch(url, { signal: args.signal }, timeoutMs);
+    const r = await poolFetch(url, { signal: args.signal }, timeoutMs, doFetch);
     if (stopped) return { kind: 'stopped' };
     if (r.status === 404) {
       await reregister();
@@ -788,6 +802,12 @@ export async function runPoolClient(
       if (stopped) return;
       stopped = true;
       activeJobId = null;
+      // Every pool-mode exit path (abort, 426, 400, a failed reregister) funnels
+      // through here via stopPoolMode = done, so stopping the stats poller here
+      // covers all of them — not just the abort listener the old code relied on
+      // (which never fired in headless mode, since both headless call sites pass
+      // signal===undefined).
+      poolStats.stop();
       if (watchdogTimer) clearInterval(watchdogTimer);
       smartController?.stop();
       pool.terminate();

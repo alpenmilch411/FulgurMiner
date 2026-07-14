@@ -6,7 +6,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { ConsoleReporter } from './reporter.js';
-import type { SmartInfo } from './reporter.js';
+import type { JackpotInfo, SmartInfo } from './reporter.js';
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
@@ -67,6 +67,23 @@ test('ConsoleReporter.smart(easing, throttle<=15%) appends "yielding" ASCII labe
   const out = captureStdout(() => r.hashrate(10));
   assert.ok(out.includes('auto 10% yielding'), `expected "auto 10% yielding" in: ${JSON.stringify(out)}`);
   assert.ok(isAsciiOnly(out), `status line must be ASCII-only, got: ${JSON.stringify(out)}`);
+});
+
+// ─── jackpot / session-end parity (FIX 3) ────────────────────────────────────
+
+const jp = (): JackpotInfo => ({ finderBonusPct: 0.03, yourBlockStrikes: 1 });
+
+test('ConsoleReporter: jackpot() renders a line while the session is open', () => {
+  const r = new ConsoleReporter();
+  const out = captureStdout(() => r.jackpot(jp()));
+  assert.match(out, /jackpot: 3% finder bonus - blocks found: 1/);
+});
+
+test('ConsoleReporter: jackpot() after close() prints nothing — a stale panel must not survive session end', () => {
+  const r = new ConsoleReporter();
+  r.close?.();
+  const out = captureStdout(() => r.jackpot(jp()));
+  assert.equal(out, '', `expected no output after close(), got: ${JSON.stringify(out)}`);
 });
 
 test('ConsoleReporter status line is always ASCII-only (no SGR/unicode) in smart mode', () => {

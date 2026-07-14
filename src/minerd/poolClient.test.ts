@@ -3,8 +3,9 @@ import assert from 'node:assert/strict';
 import {
   isValidSlot, isValidJob, jobRestartKey, shouldRegrind, resolveJobPollMs,
   resolveJobWaitS, buildJobUrl, nextJobPollDelayMs, abortableDelay,
-  runJobPollLoop, type RefreshResult,
+  runJobPollLoop, runPoolClient, type RefreshResult,
 } from './poolClient.js';
+import type { MinerReporter } from './reporter.js';
 
 test('resolveJobWaitS: default, clamp, junk', () => {
   assert.equal(resolveJobWaitS({}), 25);
@@ -237,4 +238,138 @@ test('loop: a teardown signal abort exits the loop', async () => {
   ac.abort(new DOMException('teardown', 'AbortError'));
   await p; // resolves (loop exits) — would hang/throw if teardown were mishandled
   assert.ok(true);
+});
+
+// ─── runPoolClient: the jackpot gate (FIX 1) + the ghost-interval fix (FIX 2) ──
+// runPoolClient is otherwise "not unit-tested (network)"; these tests drive it
+// with an injected doFetch so the /jackpot gate and the stats-poller teardown —
+// which live INSIDE runPoolClient's own wiring — are pinned at the boundary that
+// actually shipped the bugs, not just at the pure-helper level.
+
+const resp = (status: number, body: unknown): Response => new Response(JSON.stringify(body), { status });
+
+/** Poll `check` until it's true or `timeoutMs` elapses. The stats poller's
+ *  immediate first tick is a fire-and-forget promise chain (/balance then,
+ *  gated, /jackpot) that races runPoolClient's own resolution (426 short-
+ *  circuits the job-poll loop) — a fixed sleep after `await runPoolClient(...)`
+ *  is not guaranteed to outlast it, so tests that assert the tick DID complete
+ *  poll instead of sleeping a fixed amount. */
+async function waitUntil(check: () => boolean, timeoutMs = 500, stepMs = 5): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!check() && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, stepMs));
+  }
+}
+
+/** `state` is a mutable box (NOT destructured into a primitive) so callers observe
+ *  live updates — destructuring a snapshotted `jackpotCalls: number` would freeze
+ *  it at 0 forever, since jackpot() resolves asynchronously after this returns. */
+function makeReporter(): { state: { events: string[]; jackpotCalls: number }; reporter: MinerReporter } {
+  const state = { events: [] as string[], jackpotCalls: 0 };
+  const reporter: MinerReporter = {
+    status: () => {},
+    syncProgress: () => {},
+    synced: () => {},
+    hashrate: () => {},
+    chain: () => {},
+    found: () => {},
+    share: () => {},
+    event: (_level, msg) => { state.events.push(msg); },
+    jackpot: () => { state.jackpotCalls++; },
+    close: () => {},
+  };
+  return { state, reporter };
+}
+
+test('runPoolClient: mining at a non-FulgurPool url never requests /jackpot (gate derived from the canonical poolUrl)', async () => {
+  process.env.FULGUR_NO_UPDATE_CHECK = '1';
+  try {
+    const urls: string[] = [];
+    const doFetch: typeof fetch = (async (url: unknown) => {
+      const u = String(url);
+      urls.push(u);
+      if (u.includes('/jackpot')) throw new Error('TEST FAILURE: /jackpot requested for a non-FulgurPool pool');
+      if (u.includes('/register')) return resp(200, { workerId: 'w1' });
+      if (u.includes('/job')) return resp(426, { error: 'upgrade required' }); // end the session promptly
+      if (u.includes('/balance')) return resp(200, { earnedBrc: 1, pendingBrc: 0, paidBrc: 0 });
+      return resp(404, {});
+    }) as unknown as typeof fetch;
+    const { state, reporter } = makeReporter();
+    await runPoolClient('https://brcpool.cryptec.tech', 'a'.repeat(64), 1, 1, reporter, undefined, undefined, 'off', doFetch);
+    await waitUntil(() => urls.some((u) => u.includes('/balance'))); // let the immediate stats tick settle
+    assert.ok(urls.some((u) => u.includes('/balance')), 'sanity: the stats poller ran (/balance requested)');
+    assert.ok(!urls.some((u) => u.includes('/jackpot')), '/jackpot was never requested');
+    assert.equal(state.jackpotCalls, 0, 'reporter.jackpot was never called');
+  } finally {
+    delete process.env.FULGUR_NO_UPDATE_CHECK;
+  }
+});
+
+test('runPoolClient: mining at FulgurPool (canonical URL or the legacy alias) requests /jackpot and the panel renders', async () => {
+  process.env.FULGUR_NO_UPDATE_CHECK = '1';
+  try {
+    for (const poolUrl of ['https://pool.fulgurpool.xyz', 'https://fulgurpool-core.onrender.com']) {
+      const urls: string[] = [];
+      const doFetch: typeof fetch = (async (url: unknown) => {
+        const u = String(url);
+        urls.push(u);
+        if (u.includes('/register')) return resp(200, { workerId: 'w1' });
+        if (u.includes('/job')) return resp(426, { error: 'upgrade required' });
+        if (u.includes('/balance')) return resp(200, { earnedBrc: 1, pendingBrc: 0, paidBrc: 0 });
+        if (u.includes('/jackpot')) return resp(200, { finderBonusPct: 0.03, yourBlockStrikes: 1 });
+        return resp(404, {});
+      }) as unknown as typeof fetch;
+      const { state, reporter } = makeReporter();
+      await runPoolClient(poolUrl, 'a'.repeat(64), 1, 1, reporter, undefined, undefined, 'off', doFetch);
+      await waitUntil(() => state.jackpotCalls === 1);
+      assert.ok(urls.some((u) => u.includes('/jackpot')), `/jackpot WAS requested for ${poolUrl}`);
+      assert.equal(state.jackpotCalls, 1, `reporter.jackpot rendered for ${poolUrl}`);
+    }
+  } finally {
+    delete process.env.FULGUR_NO_UPDATE_CHECK;
+  }
+});
+
+test('runPoolClient: a 426 on /job (headless shape — signal===undefined) stops pool mode AND clears every interval it created (the shipped ghost-process bug)', async () => {
+  process.env.FULGUR_NO_UPDATE_CHECK = '1';
+  const origSetInterval = global.setInterval;
+  const origClearInterval = global.clearInterval;
+  const created = new Set<ReturnType<typeof setInterval>>();
+  const cleared = new Set<ReturnType<typeof setInterval>>();
+  // Spy on the global timer functions (restored in `finally`) rather than waiting
+  // out real intervals — the stats poller's default cadence is 25s, and the point
+  // of this test is that NOTHING should still be scheduled after runPoolClient
+  // resolves, however long the interval is.
+  (global as any).setInterval = ((...args: any[]) => {
+    const h = (origSetInterval as any)(...args);
+    created.add(h);
+    return h;
+  }) as any;
+  (global as any).clearInterval = ((h: any) => {
+    cleared.add(h);
+    return (origClearInterval as any)(h);
+  }) as any;
+  try {
+    const doFetch: typeof fetch = (async (url: unknown) => {
+      const u = String(url);
+      if (u.includes('/register')) return resp(200, { workerId: 'w1' });
+      if (u.includes('/job')) return resp(426, { error: 'upgrade required' });
+      if (u.includes('/balance')) return resp(200, { earnedBrc: 1, pendingBrc: 0, paidBrc: 0 });
+      if (u.includes('/jackpot')) return resp(200, { finderBonusPct: 0.03, yourBlockStrikes: 1 });
+      return resp(404, {});
+    }) as unknown as typeof fetch;
+    const { reporter } = makeReporter();
+    // signal is intentionally omitted (undefined) — the exact shape BOTH headless
+    // call sites (`npm run mine` in index.ts, plain `npm start` in start.ts) use.
+    await runPoolClient('https://pool.fulgurpool.xyz', 'a'.repeat(64), 1, 1, reporter, undefined, undefined, 'off', doFetch);
+    await new Promise((r) => setTimeout(r, 20));
+    assert.ok(created.size > 0, 'sanity: at least one interval (stats poller and/or watchdog) was created');
+    for (const h of created) {
+      assert.ok(cleared.has(h), 'every interval created during pool mode must be cleared once pool mode stops — no ghost keeping the process alive');
+    }
+  } finally {
+    global.setInterval = origSetInterval;
+    global.clearInterval = origClearInterval;
+    delete process.env.FULGUR_NO_UPDATE_CHECK;
+  }
 });

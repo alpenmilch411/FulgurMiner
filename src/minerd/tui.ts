@@ -363,6 +363,7 @@ export class DashboardReporter implements MinerReporter {
   }
 
   jackpot(j: JackpotInfo): void {
+    if (this.closed) return; // the session has ended — never repaint a stale panel
     this.jackpot_ = j;
     this.render();
   }
@@ -384,6 +385,10 @@ export class DashboardReporter implements MinerReporter {
     // stopping the timer up front means an already-queued tick can't even start
     // a render pass (and wastes no CPU rebuilding lines we'd discard).
     if (this.renderTimer) { clearInterval(this.renderTimer); this.renderTimer = null; }
+    // Drop the jackpot panel's data at session end — it's FulgurPool-only and
+    // must never bleed into whatever this reporter instance renders next (the
+    // jackpot() guard above also refuses any late update once closed).
+    this.jackpot_ = null;
     this.closed = true;
     // Order matters: timer cleared, then `closed` set, THEN listeners removed.
     // A resize event firing between here and removeListener fires onResize →
@@ -403,9 +408,13 @@ export class DashboardReporter implements MinerReporter {
     this.restoreTerminal();
   }
 
-  /** Restore cursor + leave the alternate screen. Idempotent; safe on exit. */
+  /** Wipe the alternate screen, restore the cursor, then leave it. Idempotent;
+   *  safe on exit. The wipe (HOME + CLEAR_DOWN) matters because some terminals
+   *  preserve the alt-screen buffer's last frame across an ALT_OFF/ALT_ON cycle —
+   *  without it, a KPI panel (e.g. jackpot) from THIS session could still be
+   *  sitting in the buffer when the next session re-enters it, however briefly. */
   private restoreTerminal(): void {
-    try { this.out.write(CURSOR_SHOW + ALT_OFF); } catch { /* ignore */ }
+    try { this.out.write(HOME + CLEAR_DOWN + CURSOR_SHOW + ALT_OFF); } catch { /* ignore */ }
   }
 
   private pushEvent(level: 'info' | 'warn' | 'error', msg: string): void {
