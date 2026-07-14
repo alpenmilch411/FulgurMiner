@@ -109,7 +109,7 @@ Use **↑/↓** to move and **Enter** to select. On a value row, **←/→** cyc
 
 The first time, set your **Wallet** (paste your address — see below), then highlight **Start mining** and press **Enter**. Your settings are remembered, so next time you can just start. On a narrow terminal the menu folds into a single column with the explanation inline.
 
-By default FulgurMiner mines to **[FulgurPool](https://fulgurpool.xyz)**, the project's own pool — just set your wallet and start. Other pools can be added in `pools.json` and will then show up in the **Where to mine** picker.
+By default FulgurMiner mines to **[FulgurPool](https://fulgurpool.xyz)**, the project's own pool — just set your wallet and start. The **Where to mine** picker includes **FulgurPool**, **Solo**, and a built-in **brcpool**. Custom pools can be added or removed directly inside the picker (in both `npm start` and `npm run settings`), or by editing `pools.json` for advanced users. Pool URLs can be written with or without the `https://` scheme; a malformed entry is shown in the picker so you can fix it.
 
 ## 3. Pick a Mining mode
 
@@ -213,7 +213,7 @@ Every option is an environment variable or a line in `.env.local` (written for y
 | `MINER_POOL` | FulgurPool | `solo` to mine alone, or a pool URL. Unset/blank follows the default pool (FulgurPool). |
 | `MINER_SMART` | `off` | `off` (Manual) · `max` · `considerate`. When set, the mode picks the rate and `MINER_THROTTLE` is not used: Max goes straight to 100% and holds; Considerate starts at 50% and floats with your CPU load. |
 | `MINER_WORKERS` | cores − 1 | CPU worker threads. Auto (unset) leaves one core free; inside a CPU-limited container it uses the whole allowance instead of the host's core count. Set it by hand to override. |
-| `MINER_THROTTLE` | `0.75` | Duty cycle (`0.05`–`1.0`): fraction of wall-time spent hashing. Lower = cooler & quieter. Ignored when a Smart mode is on (the mode sets the rate). |
+| `MINER_THROTTLE` | `0.75` | Duty cycle (`0.05`–`1.0`): fraction of wall-time spent hashing. Lower = cooler & quieter. Ignored when a Smart mode is on (the mode sets the rate). Any value in the range can be set from the Throttle picker's Custom option, not just the presets. |
 | `MINER_NATIVE` | *(off)* | `1` uses the native Rust engine (built on demand if missing and Rust is installed). |
 | `MINER_HELPERS` | `api1`/`api2.browsercoin.org` | Comma-separated API helper URLs for chain sync / solo mining. Each read tries them in turn and takes the first that answers, so one dead helper doesn't stop the miner tracking the tip. A helper that keeps failing gets demoted so reads stop leading with it; you get a warning when *every* helper fails a round. A blank or comma-only value falls back to the defaults. |
 | `MINER_DEBUG` | *(off)* | `MINER_DEBUG=1` adds debug lines — the per-helper read failures the miner recovered from on its own, plus snapshot notes. Env var only (`npm run mine` doesn't read `.env.local`). |

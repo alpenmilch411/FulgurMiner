@@ -1,5 +1,5 @@
 {
-  "_comment": "Advanced: register extra mining pools here, or add them in-app via the menu's Pools screen (or `[6] Pools` in `npm run settings`). Copy this file to pools.json and edit. `url` is the mining endpoint; `page` (optional) is the pool's website — its host is shown as a clickable link next to the pool name. Once pools.json has at least one valid entry, that pool appears in the Target cycle. With no pools.json the miner just uses FulgurPool.",
+  "_comment": "Advanced: custom pools can be added or removed directly in the Where to mine picker in `npm start` (and in `npm run settings`), or by editing this file. Copy this file to pools.json and edit. `url` is the mining endpoint (may omit the https:// scheme); `page` (optional) is the pool's website — its host is shown as a clickable link next to the pool name. Once pools.json has at least one valid entry, that pool appears in the picker. With no pools.json the miner uses FulgurPool and the built-in brcpool.",
   "pools": [
     { "name": "ExamplePool", "url": "https://pool.example.org", "page": "https://example.org" }
   ]
