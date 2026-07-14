@@ -1,6 +1,7 @@
 node_modules/
 .env.local
 pools.json
+*.bak
 native/brc-pow/target/
 .fulgurminer/
 *.log
