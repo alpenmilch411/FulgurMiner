@@ -12,8 +12,11 @@ export type CanonResult = { ok: true; url: string } | { ok: false; reason: strin
 /** Requires `://` - so `localhost:3000` is not read as the protocol `localhost:`. */
 const SCHEME_RE = /^[a-z][a-z0-9+.-]*:\/\//i;
 
+// C0 control chars (0x00-0x1f), DEL (0x7f), and C1 control chars (0x80-0x9f).
+// C1 includes OSC introducer (0x9D) and String Terminator (0x9C).
+const CONTROL_CHAR_CLASS = '\\x00-\\x1f\\x7f-\\x9f';
 // eslint-disable-next-line no-control-regex
-const CONTROL_RE = /[\x00-\x1f\x7f]/;
+const CONTROL_RE = new RegExp(`[${CONTROL_CHAR_CLASS}]`);
 /** A typo'd solo (solo1, offf, ...) gets a did-you-mean instead of https://solo1. */
 const SOLOISH_RE = /^(solo|off|none)/i;
 
@@ -162,7 +165,7 @@ export type PoolChoice =
 /** MINER_POOL values meaning "mine on my own". off/none are legacy spellings we still read. */
 const SOLO_RE = /^(solo|off|none)$/i;
 // eslint-disable-next-line no-control-regex
-const CONTROL_RE_G = /[\x00-\x1f\x7f]/g;
+const CONTROL_RE_G = new RegExp(`[${CONTROL_CHAR_CLASS}]`, 'g');
 
 /**
  * Strip control characters before ANY terminal render. A raw MINER_POOL value is

@@ -77,6 +77,16 @@ test('canonicalisePoolUrl rejects control characters and spaces (the OSC 8 hole)
   assert.equal(reason('https://pool foo.org'), 'contains spaces');
 });
 
+test('canonicalisePoolUrl rejects C1 control bytes (0x80-0x9f), not just C0', () => {
+  // 0x9D is the OSC (Operating System Command) introducer in the C1 range
+  // 0x9C is the String Terminator in the C1 range
+  assert.equal(reason('https://pool.foo.org\x9d'), 'contains control characters');
+  assert.equal(reason('pool.foo.org\x9d'), 'contains control characters');
+  assert.equal(reason('pool.foo.org\x9c'), 'contains control characters');
+  // Verify the full OSC injection is blocked
+  assert.equal(reason('https://pool.foo.org\x9d8;;http://evil\x9cclick'), 'contains control characters');
+});
+
 test('canonicalisePoolUrl rejects a non-http(s) scheme, credentials, and an empty value', () => {
   assert.equal(reason('ftp://pool.foo.org'), 'only http:// and https:// pool URLs are supported');
   assert.equal(reason('file:///etc/passwd'), 'only http:// and https:// pool URLs are supported');
@@ -195,4 +205,17 @@ test('sanitiseForDisplay strips control chars so a raw value cannot inject an es
   assert.equal(osc8, ']8;;http://xclick');
   // eslint-disable-next-line no-control-regex
   assert.doesNotMatch(osc8, /[\x00-\x1f\x7f]/);
+});
+
+test('sanitiseForDisplay strips C1 control bytes (0x80-0x9f), not just C0', () => {
+  // 0x9D is the OSC introducer; 0x9C is the String Terminator
+  // A C1-based injection payload should be stripped inert
+  const c1Payload = 'https://pool.foo.org\x9d8;;http://evil\x9cclick';
+  const result = sanitiseForDisplay(c1Payload);
+  assert.equal(result, 'https://pool.foo.org8;;http://evilclick');
+  // Verify no C1 bytes remain
+  for (let i = 0; i < result.length; i++) {
+    const code = result.charCodeAt(i);
+    assert.ok(!(code >= 0x80 && code <= 0x9f), `found C1 byte at ${i}: 0x${code.toString(16)}`);
+  }
 });
