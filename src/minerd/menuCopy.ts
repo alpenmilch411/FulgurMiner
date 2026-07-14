@@ -9,6 +9,7 @@
 // type-only (erased by the compiler), so there is no import cycle.
 import type { RowKind } from './menu.js';
 import type { SmartMode } from './selectors.js';
+import type { Target } from './targets.js';
 import { REPO_URL } from './config.js';
 
 /**
@@ -63,18 +64,39 @@ export const ROW_EXPLAIN: Record<RowKind, string> = {
 
 /**
  * Explanation for a "Where to mine" destination, shown in the picker's right
- * pane. `isDefault` marks the FulgurPool default row; `isSolo` marks Solo;
- * otherwise it is a user-configured custom pool.
+ * pane. Reads straight off the Target row so every kind the shared model can
+ * produce — the default pool, a non-default built-in (e.g. brcpool), Solo, a
+ * custom pool, or an unrecognised MINER_POOL value — gets its own accurate
+ * sentence instead of the old isDefault/isSolo guesswork.
  */
-export function whereExplain(opts: { isDefault: boolean; isSolo: boolean; name: string }): string {
-  if (opts.isDefault) {
-    return `${opts.name} is the project’s own pool and the default. Pooled mining smooths out rewards into steady, smaller payouts instead of rare whole blocks.`;
+export function whereExplain(t: Target): string {
+  if (t.kind === 'builtin' && t.value === undefined) {
+    return `${t.label} is the project’s own pool and the default. Pooled mining smooths out rewards into steady, smaller payouts instead of rare whole blocks.`;
   }
-  if (opts.isSolo) {
+  if (t.kind === 'solo') {
     return 'Solo mining builds blocks on your own — no pool. You keep the full block reward when you find one, but finds are rare and irregular.';
   }
-  return `${opts.name} is one of your configured pools. Mining here sends your shares to that pool.`;
+  if (t.kind === 'unknown') {
+    return `${t.description}. Pick a different destination, or add this pool properly if it is one you trust.`;
+  }
+  if (t.kind === 'builtin') {
+    return `${t.label} — ${t.description}. Mining here sends your shares to that pool.`;
+  }
+  return `${t.label} is one of your configured pools. Mining here sends your shares to that pool.`;
 }
+
+/** Shown in the picker's right pane when the "+ Add a pool..." row is highlighted. */
+export const ADD_POOL_EXPLAIN =
+  'Add a pool by its name and its mining endpoint URL (e.g. pool.example.org). It is saved to pools.json and appears in this list from then on.';
+
+/**
+ * Shown in the picker's right pane when the "! pools.json: N problem(s)" row
+ * is highlighted — the only place a user learns pools.json was rejected, now
+ * that the console.warn envLocal.ts used to print is gone (the alt-screen
+ * wiped it before anyone could read it).
+ */
+export const POOL_ISSUES_EXPLAIN =
+  'pools.json has one or more entries FulgurMiner could not use — a bad URL, a missing field, or a name that collides with another pool. Press Enter to see each one and why.';
 
 /**
  * Shown (in DIM) in the right "About" pane when the user highlights the

@@ -11,21 +11,35 @@
 // start.ts construct the dashboard, and vice-versa. start.ts alternates:
 //   menu → (Start) → dashboard → (`s`) → menu → …
 //
-// Persistence goes through the shared envLocal helpers and also updates
-// process.env so the next control-loop iteration re-reads the new config.
+// Persistence goes through the shared envLocal/targets helpers and also
+// updates process.env so the next control-loop iteration re-reads the new
+// config.
+//
+// "Where to mine" is now a full picker: it renders targets.ts's shared
+// TargetModel (never re-sorted here), can add and remove custom pools inline,
+// and surfaces pools.json parse problems as a picker row — that row is the
+// ONLY way a user learns their file was rejected, now that envLocal.ts's
+// console.warn (which the alt-screen redraw wiped before anyone could read
+// it) is gone.
 import * as readline from 'node:readline';
-import {
-  persist, readExtraPools, type PoolEntry,
-} from './envLocal.js';
-import { FULGURPOOL_NAME, FULGURPOOL_PAGE, REPO_URL } from './config.js';
+import { persist } from './envLocal.js';
+import { REPO_URL } from './config.js';
 import { link, STRIP_OSC8 } from './link.js';
 import {
   THROTTLE_PRESETS, throttleLabel, throttleIndex, throttleNum,
   clampWorkers, MAX_WORKERS, DEFAULT_WORKERS, workersDisplay, currentEngine, engineRowValue,
   MODE_OPTIONS, currentMode, modeIndex, modeLabel,
 } from './selectors.js';
-import { ROW_EXPLAIN, modeExplain, whereExplain, NATIVE_NEEDS_RUST, FULL_BLAST_CAUTION, SMART_THROTTLE_EXPLAIN } from './menuCopy.js';
+import {
+  ROW_EXPLAIN, modeExplain, whereExplain, NATIVE_NEEDS_RUST, FULL_BLAST_CAUTION, SMART_THROTTLE_EXPLAIN,
+  ADD_POOL_EXPLAIN, POOL_ISSUES_EXPLAIN,
+} from './menuCopy.js';
 import { nativeEngineAvailable } from './engine.js';
+import {
+  buildTargetModel, persistTarget, validateNewPool, addCustomPool, removeCustomPool,
+  NAME_MAX, URL_MAX,
+  type Target, type TargetModel,
+} from './targets.js';
 
 // --- ANSI helpers (kept local so the menu has no import coupling to tui.ts) --
 const ESC = '\x1b[';
@@ -81,15 +95,27 @@ const ROWS: Row[] = [
   { kind: 'action-quit', label: 'Quit', editable: false },
 ];
 
-/** A target option the Target row cycles through. */
-interface TargetOption {
-  /** Display label. */
-  label: string;
-  /** MINER_POOL value to persist; undefined = unset (follow the default pool). */
-  value: string | undefined;
-  /** Optional website for the clickable host link (FulgurPool / custom pools). */
-  page?: string;
-}
+/**
+ * The wallet row's inline text edit, and the "+ Add a pool..." form's two
+ * steps, share one buffer mechanism. `name` carries the pool name across the
+ * pool-name → pool-url step. NOTE for a later task: a 'throttle' arm is
+ * planned for this same union — every switch over `kind` below is written to
+ * make that an additive case, not a restructure.
+ */
+type Editing = {
+  kind: 'wallet' | 'pool-name' | 'pool-url';
+  buffer: string;
+  error: string;
+  truncated: boolean;
+  name?: string;
+};
+
+/** One row of the "Where to mine" picker, beyond the model's own destinations. */
+type WhereRow =
+  | { kind: 'target'; target: Target }
+  | { kind: 'add' }
+  | { kind: 'issues' }
+  | { kind: 'back' };
 
 /**
  * StartMenu — owns the terminal while open. Construct it, await `run()`, and it
@@ -103,17 +129,22 @@ export class StartMenu {
   /** Which screen is visible. The main menu, a picker, or the full-screen help overlay. */
   private screen: 'main' | 'where' | 'mode' | 'help' = 'main';
   private selected = 0;
-  /** Inline wallet edit only (workers/throttle/engine are now selectors, not text). */
-  private editing: { kind: 'wallet'; buffer: string; error: string } | null = null;
+  /** The one inline text-edit buffer, shared by the wallet row and the add-a-pool form. */
+  private editing: Editing | null = null;
   /** A transient notice shown under the menu (e.g. "set a wallet first"). */
   private notice = '';
-  private targets: TargetOption[] = [];
-  private targetIndex = 0;
-  private extras: PoolEntry[] = [];
+  /** The shared "where to mine" model (targets.ts). Never re-sorted here. */
+  private model!: TargetModel;
 
   // --- "Where to mine" picker state ---------------------------------------
-  /** Highlighted row in the picker (0..targets.length-1 = destinations, then Back). */
+  /** Highlighted row in the picker (0..targets.length-1 = destinations, then + Add, [issues], Back). */
   private whereCursor = 0;
+  /** Set while a highlighted custom pool's removal awaits an explicit confirm. */
+  private removeConfirm: Target | null = null;
+  /** The reason the last remove attempt was refused (or ''). Always a BODY row, never the hint. */
+  private removeError = '';
+  /** True while the "! pools.json: N problem(s)" row is showing its detail view. */
+  private whereIssuesOpen = false;
 
   // --- Mode picker state --------------------------------------------------
   /** Highlighted row in the picker (0..MODE_OPTIONS.length-1 = modes, then Back). */
@@ -136,24 +167,9 @@ export class StartMenu {
     this.refreshTargets();
   }
 
-  /** Re-read pools.json + current MINER_POOL and rebuild the Target cycle list. */
+  /** Re-read pools.json + current MINER_POOL and rebuild the shared target model. */
   private refreshTargets(): void {
-    this.extras = readExtraPools();
-    const opts: TargetOption[] = [
-      { label: FULGURPOOL_NAME, value: undefined, page: FULGURPOOL_PAGE },
-      { label: 'Solo', value: 'solo' },
-    ];
-    for (const p of this.extras) opts.push({ label: p.name, value: p.url, page: p.page });
-    this.targets = opts;
-    // Sync targetIndex to the current MINER_POOL so the row shows the live value.
-    const raw = (process.env.MINER_POOL ?? '').trim();
-    if (raw === '') this.targetIndex = 0;
-    else if (/^(solo|off|none)$/i.test(raw)) this.targetIndex = 1;
-    else {
-      const norm = raw.replace(/\/+$/, '');
-      const i = this.targets.findIndex((t) => t.value && t.value.replace(/\/+$/, '') === norm);
-      this.targetIndex = i >= 0 ? i : 0;
-    }
+    this.model = buildTargetModel();
   }
 
   // --- lifecycle ----------------------------------------------------------
@@ -230,6 +246,14 @@ export class StartMenu {
     // Ctrl+C always quits, from any screen, even mid-edit.
     if (k.ctrl && k.name === 'c') { this.finish('quit'); return false; }
 
+    // An inline edit (wallet, or the add-a-pool form) consumes its own keys
+    // regardless of which screen it is open on — the wallet edit lives on
+    // 'main', the pool form on 'where'.
+    if (this.editing) {
+      this.handleEditKey(str, k);
+      return !this.closed;
+    }
+
     // Route by screen. Sub-screens consume their own keys and never fall through
     // to the main menu's start/quit handling.
     if (this.screen === 'help') { this.handleHelpKey(k); return !this.closed; }
@@ -237,11 +261,6 @@ export class StartMenu {
     if (this.screen === 'mode') { this.handleModeKey(k); return !this.closed; }
 
     // --- main screen ---
-    if (this.editing) {
-      this.handleEditKey(str, k);
-      return !this.closed;
-    }
-
     switch (k.name) {
       case 'up':
       case 'k':
@@ -272,10 +291,10 @@ export class StartMenu {
     return !this.closed;
   }
 
-  /** ←/→ on a selectable row cycles its value (target/workers/throttle/engine). */
+  /** ←/→ on a selectable row cycles its value (workers/throttle/engine). */
   private cycleRow(delta: number): void {
     switch (this.currentRow().kind) {
-      // 'target' (Where to mine) is no longer a ←/→ cycle — Enter opens the picker.
+      // 'target' (Where to mine) is not a ←/→ cycle — Enter opens the picker.
       case 'workers': this.cycleWorkers(delta); break;
       case 'throttle':
         if (currentMode(process.env.MINER_SMART) === 'off') this.cycleThrottle(delta);
@@ -286,9 +305,15 @@ export class StartMenu {
     }
   }
 
-  /** Wallet is the only free-text field now; this stays scoped to it. */
-  private editCap(_kind: 'wallet'): number {
-    return 64; // wallet is exactly 64 hex
+  /** The character cap for the field currently being edited. Caps for the pool
+   *  form come from targets.ts, so the TUI and `npm run settings` never accept
+   *  different lengths. Adding the planned 'throttle' arm is one more case. */
+  private editCap(kind: Editing['kind']): number {
+    switch (kind) {
+      case 'wallet': return 64; // wallet is exactly 64 hex
+      case 'pool-name': return NAME_MAX;
+      case 'pool-url': return URL_MAX;
+    }
   }
 
   private handleEditKey(str: string | undefined, k: readline.Key): void {
@@ -300,13 +325,21 @@ export class StartMenu {
       // string returns empty, so there's nothing to guard.
       ed.buffer = ed.buffer.slice(0, -1);
       ed.error = '';
+      ed.truncated = false;
       this.render();
       return;
     }
-    // Accept printable single chars only (ignore arrows/fn keys etc), and stop
-    // accepting once the field's cap is reached (drops the overflow of a paste).
+    // Accept printable single chars only (ignore arrows/fn keys etc). Once the
+    // field's cap is reached, an over-length paste is NOT silently dropped: flag
+    // it and show why, rather than swallowing the excess without a trace.
     if (typeof str === 'string' && str.length === 1 && str >= ' ' && !k.ctrl && !k.meta) {
-      if (ed.buffer.length >= this.editCap(ed.kind)) return;
+      const cap = this.editCap(ed.kind);
+      if (ed.buffer.length >= cap) {
+        ed.truncated = true;
+        ed.error = `Longer than ${cap} characters — the rest was dropped.`;
+        this.render();
+        return;
+      }
       ed.buffer += str;
       ed.error = '';
       this.render();
@@ -335,7 +368,7 @@ export class StartMenu {
         if (!HEX64.test(w)) {
           this.notice = 'Set a valid wallet address first.';
           this.selected = ROWS.findIndex((r) => r.kind === 'wallet');
-          this.editing = { kind: 'wallet', buffer: '', error: '' };
+          this.editing = { kind: 'wallet', buffer: '', error: '', truncated: false };
           this.render();
           return;
         }
@@ -369,7 +402,7 @@ export class StartMenu {
         // retype. A 64-hex value is valid input as-is; anything else (unset /
         // invalid) starts blank rather than seeding the buffer with junk.
         const cur = (process.env.MINER_PUBKEY ?? '').trim().toLowerCase();
-        this.editing = { kind: 'wallet', buffer: HEX64.test(cur) ? cur : '', error: '' };
+        this.editing = { kind: 'wallet', buffer: HEX64.test(cur) ? cur : '', error: '', truncated: false };
         this.render();
         return;
       }
@@ -431,37 +464,46 @@ export class StartMenu {
     this.render();
   }
 
-  /** Persist the chosen destination (FulgurPool / Solo / a custom pool) by its
-   *  index in this.targets. Preserves the raw MINER_POOL tri-state: undefined =
-   *  default pool, 'solo' = solo, url = a custom pool. */
-  private selectTarget(index: number): void {
-    if (index < 0 || index >= this.targets.length) return;
-    this.targetIndex = index;
-    const opt = this.targets[index]!;
-    persist({ MINER_POOL: opt.value });
-    if (opt.value === undefined) delete process.env.MINER_POOL;
-    else process.env.MINER_POOL = opt.value;
+  /** Persist the chosen destination through targets.ts's ONE writer. */
+  private selectTarget(target: Target): void {
+    persistTarget(target);
   }
 
   // ==================== Where-to-mine picker ===============================
   private openWhere(): void {
     this.refreshTargets();
-    this.whereCursor = this.targetIndex; // start on the active destination
+    this.whereCursor = this.model.activeIndex; // start on the active destination
+    this.editing = null;
+    this.removeConfirm = null;
+    this.removeError = '';
+    this.whereIssuesOpen = false;
     this.screen = 'where';
     this.render();
   }
 
-  /** Picker rows: 0..N-1 = each destination, N = "← Back". */
+  /** Picker rows: the model's destinations, then "+ Add a pool...", then (only
+   *  when pools.json has problems) the issues row, then "← Back". */
+  private whereRows(): WhereRow[] {
+    const rows: WhereRow[] = this.model.targets.map((target): WhereRow => ({ kind: 'target', target }));
+    rows.push({ kind: 'add' });
+    if (this.model.issues.length > 0) rows.push({ kind: 'issues' });
+    rows.push({ kind: 'back' });
+    return rows;
+  }
+
   private whereRowCount(): number {
-    return this.targets.length + 1;
+    return this.whereRows().length;
   }
 
   private handleWhereKey(k: readline.Key): void {
+    if (this.removeConfirm) { this.handleRemoveConfirmKey(k); return; }
+    if (this.whereIssuesOpen) { this.handleIssuesKey(k); return; }
     switch (k.name) {
       case 'up': case 'k': this.moveWhere(-1); break;
       case 'down': case 'j': this.moveWhere(1); break;
       case 'escape': case 'q': case 'left': this.backToMain(); break;
       case 'return': case 'space': this.activateWhereRow(); break;
+      case 'd': case 'delete': this.requestRemove(); break;
       default: break;
     }
   }
@@ -469,14 +511,123 @@ export class StartMenu {
   private moveWhere(delta: number): void {
     const n = this.whereRowCount();
     this.whereCursor = (this.whereCursor + delta + n) % n;
+    this.removeError = '';
     this.render();
   }
 
   private activateWhereRow(): void {
-    // Last row = Back; any earlier row picks that destination. Either way we
-    // return to the main menu (backToMain re-derives targetIndex from MINER_POOL).
-    if (this.whereCursor < this.targets.length) this.selectTarget(this.whereCursor);
-    this.backToMain();
+    const rows = this.whereRows();
+    const row = rows[this.whereCursor];
+    if (!row) { this.backToMain(); return; }
+    if (row.kind === 'target') {
+      this.selectTarget(row.target);
+      this.backToMain();
+      return;
+    }
+    if (row.kind === 'add') {
+      this.removeError = '';
+      this.editing = { kind: 'pool-name', buffer: '', error: '', truncated: false };
+      this.render();
+      return;
+    }
+    if (row.kind === 'issues') {
+      this.whereIssuesOpen = true;
+      this.render();
+      return;
+    }
+    this.backToMain(); // 'back'
+  }
+
+  /** `d` / Delete on a highlighted CUSTOM row asks for an explicit confirm.
+   *  Built-in / solo / unknown rows ignore the key entirely. */
+  private requestRemove(): void {
+    const rows = this.whereRows();
+    const row = rows[this.whereCursor];
+    if (!row || row.kind !== 'target' || !row.target.removable) return;
+    this.removeConfirm = row.target;
+    this.removeError = '';
+    this.render();
+  }
+
+  private handleRemoveConfirmKey(k: readline.Key): void {
+    if (k.name === 'return' || k.name === 'y') { this.commitRemove(); return; }
+    if (k.name === 'escape' || k.name === 'n' || k.name === 'left' || k.name === 'q') {
+      this.removeConfirm = null;
+      this.render();
+    }
+  }
+
+  private commitRemove(): void {
+    const t = this.removeConfirm;
+    this.removeConfirm = null;
+    if (!t) { this.render(); return; }
+    const r = removeCustomPool(t);
+    if (r.ok) {
+      this.model = r.model;
+      this.removeError = '';
+      const max = Math.max(0, this.whereRowCount() - 1);
+      if (this.whereCursor > max) this.whereCursor = max;
+    } else {
+      // Refuses the pool you are currently mining on, or a non-removable row —
+      // surfaced as a body row (see whereBody), never the hint line.
+      this.removeError = r.reason;
+    }
+    this.render();
+  }
+
+  private handleIssuesKey(_k: readline.Key): void {
+    // Any key closes the detail view and returns to the picker list.
+    this.whereIssuesOpen = false;
+    this.render();
+  }
+
+  // --- the add-a-pool form: step 1 (name) → step 2 (url) -> commit ---------
+  private commitPoolNameEdit(ed: Editing): void {
+    const name = ed.buffer.trim();
+    if (name === '') {
+      ed.error = 'Give the pool a name.';
+      this.render();
+      return;
+    }
+    this.editing = { kind: 'pool-url', buffer: '', error: '', truncated: false, name };
+    this.render();
+  }
+
+  private commitPoolUrlEdit(ed: Editing): void {
+    const name = ed.name ?? '';
+    const v = validateNewPool(name, ed.buffer, this.model.targets);
+    if (!v.ok) {
+      if (v.field === 'name') {
+        // The name looked fine at step 1 (non-blank) but validateNewPool caught
+        // something step 1 doesn't check (reserved, duplicate, non-ASCII) — step
+        // back so the user can fix it without retyping the URL.
+        this.editing = { kind: 'pool-name', buffer: name, error: v.reason, truncated: false };
+      } else {
+        ed.error = v.reason;
+      }
+      this.render();
+      return;
+    }
+    // addCustomPool re-validates against a FRESH read of pools.json (targets.ts's
+    // own doc comment: "the picker's model may be minutes old"), so a write can
+    // still be refused here even though `v.ok` above passed against our snapshot
+    // — e.g. another `npm run settings` process added the same name/url, or the
+    // file went unreadable, in the gap between opening this picker and now. The
+    // return shape doesn't distinguish "wrote it" from "refused, unchanged", so
+    // don't just trust it: confirm the entry actually landed before declaring
+    // success, the same TOCTOU care removeCustomPool already takes.
+    const updated = addCustomPool(v.entry.name, v.entry.url);
+    this.model = updated;
+    const idx = updated.targets.findIndex((t) => t.kind === 'custom' && t.value === v.entry.url);
+    if (idx < 0) {
+      ed.error = 'pools.json changed before this could be saved — try again.';
+      this.render();
+      return;
+    }
+    this.editing = null;
+    // Land the cursor on the pool that was just added.
+    this.whereCursor = idx;
+    this.render();
   }
 
   // ==================== Mode picker ========================================
@@ -524,9 +675,20 @@ export class StartMenu {
     }
   }
 
-  /** Validate + persist the in-progress wallet edit, or set an error and re-prompt. */
+  /** Dispatch the in-progress edit's commit (Enter) by kind. Adding the planned
+   *  'throttle' arm later is one more case here, not a restructure. */
   private commitEdit(): void {
-    const ed = this.editing!;
+    const ed = this.editing;
+    if (!ed) return;
+    switch (ed.kind) {
+      case 'wallet': this.commitWalletEdit(ed); return;
+      case 'pool-name': this.commitPoolNameEdit(ed); return;
+      case 'pool-url': this.commitPoolUrlEdit(ed); return;
+    }
+  }
+
+  /** Validate + persist the in-progress wallet edit, or set an error and re-prompt. */
+  private commitWalletEdit(ed: Editing): void {
     const lower = ed.buffer.trim().toLowerCase();
     if (!HEX64.test(lower)) {
       ed.error = 'Address must be exactly 64 hex characters (0-9, a-f).';
@@ -541,6 +703,10 @@ export class StartMenu {
 
   private backToMain(): void {
     this.refreshTargets();
+    this.editing = null;
+    this.removeConfirm = null;
+    this.removeError = '';
+    this.whereIssuesOpen = false;
     this.screen = 'main';
     this.render();
   }
@@ -567,12 +733,13 @@ export class StartMenu {
 
   /**
    * Target value with the page host rendered DIM + as an OSC 8 hyperlink when the
-   * selected pool has a `page`. FulgurPool always links to its page; custom pools
-   * link to their optional page. Host only — no banners/promo.
+   * active destination has a `page`. Host only — no banners/promo. activeIndex is
+   * never -1 (targets.ts's invariant), so the `!opt` branch is only a defensive
+   * fallback against a genuinely empty model.
    */
   private targetValue(): string {
-    const opt = this.targets[this.targetIndex];
-    if (!opt) return FULGURPOOL_NAME;
+    const opt = this.model.targets[this.model.activeIndex];
+    if (!opt) return '';
     const page = opt.page;
     if (!page) return opt.label;
     const host = this.hostOf(page);
@@ -769,7 +936,7 @@ export class StartMenu {
       } else {
         const labelCol = row.label.padEnd(LABEL_W);
         let body2: string;
-        if (this.editing && isSel && row.kind === 'wallet') {
+        if (this.editing && this.editing.kind === 'wallet' && isSel && row.kind === 'wallet') {
           // Fit the inverted edit cell inside the frame: budget = inner − 1 visible
           // (frame's per-line cap) − marker(2) − label(LABEL_W) − the two padding
           // spaces. Show the TAIL so the typing end (cursor) stays visible on a
@@ -833,38 +1000,134 @@ export class StartMenu {
     return this.frame(inner, 'FulgurMiner', body, this.mainHint());
   }
 
-  /** "Where to mine" picker — radio list + per-destination explanation. */
-  private buildWhere(cols: number): string[] {
-    const rows = this.buildWhereRows();
-    const sel = this.targets[this.whereCursor];
-    const explain = sel
-      ? whereExplain({ isDefault: this.whereCursor === 0, isSolo: sel.value === 'solo', name: sel.label })
-      : 'Go back to the menu without changing where you mine.';
-    const hint = `${DIM}↑/↓ move · Enter choose · Esc back${RESET}`;
-    const paned = this.twoPane(cols, 'Where to mine', () => rows, explain, hint);
-    if (paned) return paned;
-    const inner = this.mainWidth(cols) - 2;
-    return this.frame(inner, 'Where to mine', rows, hint);
+  // --- "Where to mine" picker body: list, add-a-pool form, remove confirm,
+  //      and the pools.json issues detail all render inside the SAME box, so
+  //      none of it is at risk from the hint line's clamping/truncation. ------
+  private editFieldLine(label: string, buffer: string, active: boolean, inner: number): string {
+    const labelCol = label.padEnd(6);
+    if (!active) return `${DIM}${labelCol}${RESET}${buffer}`;
+    // Same tail-show budget as the wallet's inline edit cell (item A pattern).
+    const budget = Math.max(1, inner - labelCol.length - 2);
+    const shown = buffer.length > budget ? buffer.slice(buffer.length - budget) : (buffer || ' ');
+    return `${DIM}${labelCol}${RESET}${INVERT} ${shown} ${RESET}`;
   }
 
-  /** Picker radio-list rows: each destination (• marks the active one) + a Back row. */
-  private buildWhereRows(): string[] {
-    const body: string[] = [];
-    for (let i = 0; i < this.targets.length; i++) {
-      const opt = this.targets[i]!;
-      const isSel = i === this.whereCursor;
-      const isActive = i === this.targetIndex;
-      const marker = isSel ? `${CYAN}▶${RESET} ` : '  ';
-      const radio = isActive ? `${GREEN}(•)${RESET}` : `${DIM}( )${RESET}`;
-      const name = isSel ? `${BOLD}${opt.label}${RESET}` : opt.label;
-      const host = opt.page ? ` ${DIM}· ${link(this.hostOf(opt.page), opt.page)}${RESET}` : '';
-      body.push(`${marker}${radio} ${name}${host}`);
+  private buildAddPoolForm(inner: number): string[] {
+    const ed = this.editing!;
+    const body: string[] = [`${BOLD}Add a pool${RESET}`, ''];
+    body.push(this.editFieldLine('Name', ed.kind === 'pool-name' ? ed.buffer : (ed.name ?? ''), ed.kind === 'pool-name', inner));
+    if (ed.kind === 'pool-url') {
+      body.push(this.editFieldLine('URL', ed.buffer, true, inner));
     }
-    const backSel = this.whereCursor === this.targets.length;
-    const marker = backSel ? `${CYAN}▶${RESET} ` : '  ';
-    const back = backSel ? `${BOLD}← Back${RESET}` : `${DIM}← Back${RESET}`;
-    body.push(`${marker}${back}`);
+    if (ed.error) {
+      body.push('');
+      for (const ln of this.wrap(ed.error, Math.max(10, inner - 1))) body.push(`${RED}${ln}${RESET}`);
+    }
     return body;
+  }
+
+  private buildIssuesRows(inner: number): string[] {
+    const body: string[] = [`${BOLD}pools.json problems${RESET}`, ''];
+    for (const issue of this.model.issues) {
+      for (const ln of this.wrap(`${issue.entry}: ${issue.reason}`, Math.max(10, inner - 1))) body.push(ln);
+    }
+    return body;
+  }
+
+  /** Picker radio-list rows: each destination (• marks the active one), then
+   *  "+ Add a pool...", the issues row (only when there are any), and Back. */
+  private buildWhereRows(): string[] {
+    const rows = this.whereRows();
+    const body: string[] = [];
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i]!;
+      const isSel = i === this.whereCursor;
+      const marker = isSel ? `${CYAN}▶${RESET} ` : '  ';
+      if (row.kind === 'target') {
+        const opt = row.target;
+        // Target rows occupy indices [0, model.targets.length) in whereRows(),
+        // in the exact same order as model.targets — so `i` lines up directly
+        // with model.activeIndex without any re-derivation.
+        const isActive = i === this.model.activeIndex;
+        const radio = isActive ? `${GREEN}(•)${RESET}` : `${DIM}( )${RESET}`;
+        const name = isSel ? `${BOLD}${opt.label}${RESET}` : opt.label;
+        const host = opt.page ? ` ${DIM}· ${link(this.hostOf(opt.page), opt.page)}${RESET}` : '';
+        const tag = opt.kind === 'unknown' ? ` ${YELLOW}· unrecognised${RESET}` : '';
+        body.push(`${marker}${radio} ${name}${host}${tag}`);
+      } else if (row.kind === 'add') {
+        const label = isSel ? `${BOLD}+ Add a pool...${RESET}` : `${DIM}+ Add a pool...${RESET}`;
+        body.push(`${marker}${label}`);
+      } else if (row.kind === 'issues') {
+        const n = this.model.issues.length;
+        const text = `! pools.json: ${n} problem${n === 1 ? '' : 's'}`;
+        const label = isSel ? `${BOLD}${YELLOW}${text}${RESET}` : `${YELLOW}${text}${RESET}`;
+        body.push(`${marker}${label}`);
+      } else {
+        const label = isSel ? `${BOLD}← Back${RESET}` : `${DIM}← Back${RESET}`;
+        body.push(`${marker}${label}`);
+      }
+    }
+    return body;
+  }
+
+  /** The picker's body content for the current sub-state: the add-pool form,
+   *  the issues detail view, or the normal list (with a remove confirm / error
+   *  appended as its own body rows — never the hint line, which the two-pane
+   *  layout clamps horizontally and drops first on a short terminal). */
+  private whereBody(inner: number): string[] {
+    if (this.editing && (this.editing.kind === 'pool-name' || this.editing.kind === 'pool-url')) {
+      return this.buildAddPoolForm(inner);
+    }
+    if (this.whereIssuesOpen) {
+      return this.buildIssuesRows(inner);
+    }
+    const body = this.buildWhereRows();
+    if (this.removeConfirm) {
+      body.push('');
+      for (const ln of this.wrap(`Remove "${this.removeConfirm.label}"? This cannot be undone.`, Math.max(10, inner - 1))) {
+        body.push(`${YELLOW}${ln}${RESET}`);
+      }
+      body.push(`${YELLOW}Enter/y confirm  ·  Esc/n cancel${RESET}`);
+    } else if (this.removeError) {
+      body.push('');
+      for (const ln of this.wrap(this.removeError, Math.max(10, inner - 1))) body.push(`${RED}${ln}${RESET}`);
+    }
+    return body;
+  }
+
+  private whereExplainText(row: WhereRow | undefined): string {
+    if (!row) return 'Go back to the menu without changing where you mine.';
+    if (row.kind === 'target') return whereExplain(row.target);
+    if (row.kind === 'add') return ADD_POOL_EXPLAIN;
+    if (row.kind === 'issues') return POOL_ISSUES_EXPLAIN;
+    return 'Go back to the menu without changing where you mine.';
+  }
+
+  private whereHint(): string {
+    if (this.editing && this.editing.kind === 'pool-name') return `${DIM}type · Enter next · Esc cancel${RESET}`;
+    if (this.editing && this.editing.kind === 'pool-url') return `${DIM}type · Enter save · Esc cancel${RESET}`;
+    if (this.whereIssuesOpen) return `${DIM}press any key to close${RESET}`;
+    return `${DIM}↑/↓ move · Enter choose · d remove · Esc back${RESET}`;
+  }
+
+  /** "Where to mine" picker — radio list + per-row explanation. */
+  private buildWhere(cols: number): string[] {
+    const rows = this.whereRows();
+    const sel = rows[this.whereCursor];
+    const explain = this.whereExplainText(sel);
+    const hint = this.whereHint();
+    const buildRows = (inner: number): string[] => this.whereBody(inner);
+    const paned = this.twoPane(cols, 'Where to mine', buildRows, explain, hint);
+    if (paned) return paned;
+    // Narrow fallback: append the wrapped explanation to the body instead of
+    // discarding it — below TWO_PANE_MIN the per-row descriptions AND the
+    // pools.json issues text used to be invisible here (buildMain already got
+    // this right; buildWhere and buildMode did not).
+    const inner = this.mainWidth(cols) - 2;
+    const body = buildRows(inner);
+    body.push('');
+    for (const ln of this.wrap(explain, inner - 1)) body.push(`${DIM}${ln}${RESET}`);
+    return this.frame(inner, 'Where to mine', body, hint);
   }
 
   /** Mode picker — radio list + per-mode explanation. */
@@ -877,8 +1140,13 @@ export class StartMenu {
     const hint = `${DIM}↑/↓ move · Enter choose · Esc back${RESET}`;
     const paned = this.twoPane(cols, 'Mode', () => rows, explain, hint);
     if (paned) return paned;
+    // Same narrow-fallback fix as buildWhere: append the wrapped explanation
+    // instead of dropping it below TWO_PANE_MIN.
     const inner = this.mainWidth(cols) - 2;
-    return this.frame(inner, 'Mode', rows, hint);
+    const body = [...rows];
+    body.push('');
+    for (const ln of this.wrap(explain, inner - 1)) body.push(`${DIM}${ln}${RESET}`);
+    return this.frame(inner, 'Mode', body, hint);
   }
 
   /** Picker radio-list rows: each mode (• marks the active one) + a Back row. */
