@@ -58,17 +58,54 @@ export function loadEnvLocal(path: string = ENV_FILE): void {
 }
 
 /**
- * Persist updates back to .env.local, preserving any keys already there.
- * A value of `undefined` removes the key entirely (e.g. unset MINER_POOL to
- * follow the default pool, or clear MINER_WORKERS/MINER_THROTTLE).
+ * Persist updates back to .env.local by SPLICING THE RAW TEXT - never by
+ * regenerating the file from parsed keys (that is what deleted every comment and
+ * every blank line up to 0.2.8, from a file .env.example tells people to hand-write).
+ *
+ *   - the FIRST non-comment line whose key matches is rewritten IN PLACE;
+ *   - a key the file does not have is APPENDED at the end;
+ *   - `undefined` DELETES the key;
+ *   - every other line - comments, blanks, unknown keys, ordering - is untouched.
+ *
+ * A duplicate line for a key we are writing is dropped, so exactly one line for it
+ * remains: readEnvFile is last-wins, and leaving a stale duplicate behind would
+ * silently shadow the value we just wrote. Mode 0600 as before (it applies when the
+ * file is created); a missing file is created.
  */
 export function persist(updates: Record<string, string | undefined>, path: string = ENV_FILE): void {
-  const merged: Record<string, string> = { ...readEnvFile(path) };
-  for (const [k, v] of Object.entries(updates)) {
-    if (v === undefined) delete merged[k];
-    else merged[k] = v;
+  const before = existsSync(path) ? readFileSync(path, 'utf8') : '';
+  // A file that ended with a newline still ends with one; one that did not, does not.
+  const trailingNewline = before === '' || before.endsWith('\n');
+  const lines = before === '' ? [] : before.replace(/\n$/, '').split('\n');
+
+  // hasOwnProperty, NOT `k in updates`: a line named `constructor=...` would
+  // otherwise look like a key we were asked to update, and get deleted.
+  const has = (k: string): boolean => Object.prototype.hasOwnProperty.call(updates, k);
+  const keyOf = (line: string): string | null => {
+    const t = line.trim();
+    if (!t || t.startsWith('#')) return null;
+    const eq = t.indexOf('=');
+    if (eq === -1) return null;
+    return t.slice(0, eq).trim() || null;
+  };
+
+  const out: string[] = [];
+  const written = new Set<string>();
+  for (const line of lines) {
+    const k = keyOf(line);
+    if (k === null || !has(k)) { out.push(line); continue; }   // comment / blank / a key we were not asked about
+    if (written.has(k)) continue;                              // a duplicate of a key we already wrote
+    written.add(k);
+    const v = updates[k];
+    if (v === undefined) continue;                             // delete: the line goes
+    out.push(`${k}=${v}`);                                     // rewrite in place, keeping its position
   }
-  const body = Object.entries(merged).map(([k, v]) => `${k}=${v}`).join('\n') + '\n';
+  for (const [k, v] of Object.entries(updates)) {
+    if (v === undefined || written.has(k)) continue;
+    out.push(`${k}=${v}`);                                     // a key the file did not have
+  }
+
+  const body = out.length ? out.join('\n') + (trailingNewline ? '\n' : '') : '';
   writeFileSync(path, body, { mode: 0o600 });
 }
 
