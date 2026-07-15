@@ -15,7 +15,7 @@
 //      from the menu's constructor before the alt-screen opens, or from inside it
 //      where the next frame erases it. That is how a real user's pools.json got
 //      silently discarded. There is a test that greps this file for that call.
-import { readFileSync, writeFileSync, existsSync, copyFileSync, chmodSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, copyFileSync, chmodSync, renameSync, unlinkSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { canonicalisePoolUrl, sanitiseForDisplay } from './pools.js';
 
@@ -127,6 +127,38 @@ export function dropBlankPoolEnv(env: NodeJS.ProcessEnv = process.env): void {
 }
 
 /**
+ * Write `body` to `path` ATOMICALLY: write the full content to a temp file in
+ * the SAME directory, chmod it, then renameSync it over the destination
+ * (rename is atomic on the same filesystem - a reader never observes a
+ * half-written file, and a process death or a full disk mid-write leaves the
+ * ORIGINAL file untouched). A direct writeFileSync(path, ...) truncates the
+ * destination the moment it opens it, so that same failure used to leave
+ * .env.local (which holds the wallet) or pools.json empty or partial.
+ *
+ * The temp name includes THIS process's pid so two DIFFERENT processes
+ * racing a write (the TUI menu autosaving while `npm run settings` is also
+ * open on the same file) never share one temp file. A single process's own
+ * calls can't overlap - these are synchronous and Node has no concurrent
+ * execution within one process - so reusing the same temp path across
+ * repeated calls from this process is safe.
+ */
+function writeAtomic(path: string, body: string, mode: number): void {
+  const tmp = `${path}.tmp.${process.pid}`;
+  try {
+    writeFileSync(tmp, body, { mode });
+    // Not just the writeFileSync `mode` option: that only applies when the
+    // file is newly created, so a stale tmp left by a genuine prior crash
+    // (unlikely, but the whole point of this function is the unlikely case)
+    // could otherwise carry over a looser mode.
+    chmodSync(tmp, mode);
+    renameSync(tmp, path);
+  } catch (e) {
+    try { unlinkSync(tmp); } catch { /* best-effort cleanup - non-fatal, and may not exist */ }
+    throw e;
+  }
+}
+
+/**
  * Persist updates back to .env.local by SPLICING THE RAW TEXT - never by
  * regenerating the file from parsed keys (that is what deleted every comment and
  * every blank line up to 0.2.8, from a file .env.example tells people to hand-write).
@@ -178,8 +210,7 @@ export function persist(updates: Record<string, string | undefined>, path: strin
   }
 
   const body = out.length ? out.join('\n') + (trailingNewline ? '\n' : '') : '';
-  writeFileSync(path, body, { mode: 0o600 });
-  chmodSync(path, 0o600);
+  writeAtomic(path, body, 0o600);
 }
 
 /** How an issue names the offending entry: its name, or its position when it has none. */
@@ -280,6 +311,5 @@ export function writePoolsFile(file: PoolsFile, path: string = POOLS_FILE): void
   }
   // Spread (not Object.assign): a "__proto__" key stays a plain data property.
   const outer = { ...file.extraKeys, pools: file.rawList };
-  writeFileSync(path, JSON.stringify(outer, null, 2) + '\n', { mode: 0o600 });
-  chmodSync(path, 0o600);
+  writeAtomic(path, JSON.stringify(outer, null, 2) + '\n', 0o600);
 }

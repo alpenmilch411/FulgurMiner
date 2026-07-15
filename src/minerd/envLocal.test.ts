@@ -14,7 +14,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import os from 'node:os';
 import path from 'node:path';
-import { mkdtempSync, readFileSync, writeFileSync, existsSync, statSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync, existsSync, statSync, mkdirSync, rmSync } from 'node:fs';
 import {
   persist,
   readEnvFile,
@@ -124,6 +124,43 @@ test('persist() does not treat an Object.prototype name as an update key', () =>
   persist({ MINER_POOL: 'solo' }, env);   // `'constructor' in updates` is TRUE via the prototype chain
 
   assert.match(readFileSync(env, 'utf8'), /^constructor=keep me$/m);
+});
+
+// -- FIX 3: atomic writes (temp file + renameSync), not a direct truncating
+// writeFileSync(destination, ...) -------------------------------------------
+// A process death or a full disk mid-write must never leave .env.local (the
+// wallet) or pools.json empty/partial. Both pre-create the PREDICTABLE temp
+// path (`${path}.tmp.${process.pid}`) as a DIRECTORY so the implementation's
+// own writeFileSync(tmp, ...) fails deterministically (EISDIR) before the
+// rename that would otherwise replace the real file - simulating a crash/
+// full-disk failure caught between "write the new content" and "publish it".
+
+test('persist(): a mid-write failure leaves the ORIGINAL .env.local intact (atomic temp-then-rename)', () => {
+  const { env } = tmpFiles();
+  writeFileSync(env, HAND_WRITTEN_ENV);
+
+  const tmpPath = `${env}.tmp.${process.pid}`;
+  mkdirSync(tmpPath);
+  try {
+    assert.throws(() => persist({ MINER_THROTTLE: '0.9' }, env));
+  } finally {
+    rmSync(tmpPath, { recursive: true, force: true });
+  }
+
+  // A writeFileSync(destination, ...) implementation would have truncated the
+  // real file the moment it opened it - the original must be byte-identical.
+  assert.equal(readFileSync(env, 'utf8'), HAND_WRITTEN_ENV);
+});
+
+test('persist(): a normal write still lands atomically with the right content and mode (no leftover temp file)', () => {
+  const { env } = tmpFiles();
+  writeFileSync(env, HAND_WRITTEN_ENV);
+
+  persist({ MINER_THROTTLE: '0.9' }, env);
+
+  assert.equal(readFileSync(env, 'utf8'), HAND_WRITTEN_ENV.replace('MINER_THROTTLE=0.77', 'MINER_THROTTLE=0.9'));
+  assert.equal(statSync(env).mode & 0o777, 0o600);
+  assert.equal(existsSync(`${env}.tmp.${process.pid}`), false, 'the temp file must not survive a successful write');
 });
 
 // -- pools.json: the read side -----------------------------------------------
@@ -276,6 +313,26 @@ test('writePoolsFile: a bare-array file is written back in the { pools: [...] } 
   const raw = JSON.parse(readFileSync(pools, 'utf8')) as { pools: Record<string, unknown>[] };
   assert.equal(raw.pools.length, 3);
   assert.deepEqual(raw.pools[1], { nope: 1 });           // still there, untouched
+});
+
+test('writePoolsFile(): a mid-write failure leaves the ORIGINAL pools.json intact (atomic temp-then-rename)', () => {
+  const { pools } = tmpFiles();
+  writeFileSync(pools, HAND_WRITTEN_POOLS);
+  const file = readPoolsFile(pools);
+  file.rawList.push({ name: 'Gamma', url: 'https://pool.gamma.example' });
+
+  const tmpPath = `${pools}.tmp.${process.pid}`;
+  mkdirSync(tmpPath);
+  try {
+    assert.throws(() => writePoolsFile(file, pools));
+  } finally {
+    rmSync(tmpPath, { recursive: true, force: true });
+  }
+
+  assert.equal(readFileSync(pools, 'utf8'), HAND_WRITTEN_POOLS);
+  // The .bak from the pre-write backup step still happened (it runs before the
+  // atomic write) - that is unrelated to, and unaffected by, this failure.
+  assert.equal(readFileSync(`${pools}.bak`, 'utf8'), HAND_WRITTEN_POOLS);
 });
 
 // -- the env loaders ----------------------------------------------------------
