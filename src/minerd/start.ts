@@ -21,7 +21,7 @@ import { ConsoleReporter, type MinerReporter, type ReporterStatus } from './repo
 import { DashboardReporter } from './tui.js';
 import { runStartMenu } from './menu.js';
 import { runSettings } from './settings.js';
-import { loadEnvLocal, persist } from './envLocal.js';
+import { loadEnvLocal, persist, dropBlankPoolEnv } from './envLocal.js';
 import { buildTargetModel, persistTarget, type Target, type TargetModel } from './targets.js';
 import { resolveEngine } from './engine.js';
 import { currentEngine } from './selectors.js';
@@ -234,6 +234,20 @@ async function runPlainSession(): Promise<void> {
   }
 }
 
+/**
+ * Drop a blank real-env MINER_POOL, then merge .env.local into process.env.
+ * Exported so this ordering is a small, directly testable step rather than
+ * only pinned by a source grep: without the drop FIRST, a real-env
+ * `MINER_POOL=` (defined but blank — e.g. exported by Docker/systemd) shadows
+ * whatever was stored in .env.local by the menu/settings forever, since both
+ * loaders only fill keys that are `undefined` (see envLocal.ts's
+ * dropBlankPoolEnv doc comment).
+ */
+export function loadLauncherEnv(): void {
+  dropBlankPoolEnv();
+  loadEnvLocal();
+}
+
 async function main(): Promise<void> {
   // Last-resort guard: turn an otherwise-silent uncaught error (any stray async
   // throw) into a restored terminal + a readable message instead of a vanished
@@ -245,7 +259,7 @@ async function main(): Promise<void> {
   installStdioErrorSink();
   installCrashGuard();
   assertNodeVersion();
-  loadEnvLocal();
+  loadLauncherEnv();
 
   const argv = process.argv.slice(2);
   if (argv.includes('settings')) {

@@ -262,3 +262,36 @@ test('buildStatus: an unrecognised url is shown as itself, never silently relabe
   const status = S.buildStatus(fakeCfg(poolUrl));
   assert.equal(status.target, 'https://random.example.org');
 });
+
+// -- FIX 1(b): loadLauncherEnv drops a blank real-env MINER_POOL FIRST --------
+// start.ts called loadEnvLocal() directly, with no dropBlankPoolEnv() first —
+// so a real-env `MINER_POOL=` (defined but blank, e.g. from Docker/systemd)
+// shadowed whatever the menu/settings had stored in .env.local forever, since
+// loadEnvLocal only fills keys that are `undefined`.
+
+test('loadLauncherEnv: a blank real-env MINER_POOL= no longer shadows a stored solo choice', () => {
+  writeFileSync(ENV_LOCAL, 'MINER_POOL=solo\n');
+  process.env.MINER_POOL = ''; // e.g. an exported empty var, or `MINER_POOL= npm start`
+
+  S.loadLauncherEnv();
+
+  assert.equal(process.env.MINER_POOL, 'solo');
+});
+
+test('loadLauncherEnv: a REAL (non-blank) env MINER_POOL still wins over .env.local', () => {
+  writeFileSync(ENV_LOCAL, 'MINER_POOL=solo\n');
+  process.env.MINER_POOL = 'https://custom.example';
+
+  S.loadLauncherEnv();
+
+  assert.equal(process.env.MINER_POOL, 'https://custom.example');
+});
+
+test('start.ts: main() calls loadLauncherEnv() — the blank-MINER_POOL drop can never be skipped by calling loadEnvLocal() directly', () => {
+  const src = readFileSync(new URL('./start.ts', import.meta.url), 'utf8');
+  assert.match(src, /\bloadLauncherEnv\(\)/, 'expected main() to call loadLauncherEnv()');
+  const mainStart = src.indexOf('async function main(');
+  assert.ok(mainStart >= 0);
+  const mainBody = src.slice(mainStart);
+  assert.doesNotMatch(mainBody, /\bloadEnvLocal\(\)/, 'main() must not call loadEnvLocal() directly, bypassing the drop');
+});

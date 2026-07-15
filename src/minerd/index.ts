@@ -2,6 +2,7 @@
 import { loadConfig } from './config.js';
 import { assertNodeVersion } from './version.js';
 import { installStdioErrorSink } from './crashGuard.js';
+import { dropBlankPoolEnv, loadEnvLocalKeys } from './envLocal.js';
 import { runMiner } from './miner.js';
 import { runPoolClient } from './poolClient.js';
 import { Blockchain } from './../chain/blockchain.js';
@@ -49,6 +50,28 @@ export function validateTemplate(
   const okStateRoot = compareBytes(template.header.stateRoot, stateRoot(expected)) === 0;
 
   return { okPrev, okStateRoot };
+}
+
+/**
+ * Headless `npm run mine` only: mirror a stored MINER_POOL / MINER_PUBKEY from
+ * .env.local into process.env before loadConfig() reads it. Without this, a
+ * choice saved via the arrow menu / `npm run settings` (e.g. MINER_POOL=solo,
+ * or a wallet) is silently ignored by the headless path, which then falls
+ * back to mining FulgurPool.
+ *
+ * Only these two keys are mirrored — every other .env.local setting
+ * (MINER_WORKERS/THROTTLE/SMART/NATIVE/HELPERS/DEBUG, ...) stays env-var-only
+ * on this path (D9): loading the whole file would let a stale .env.local line
+ * silently change a headless/fleet box's hashrate on upgrade. dropBlankPoolEnv()
+ * runs first so a real-env `MINER_POOL=` (defined but blank — e.g. from
+ * Docker/systemd) can't shadow a stored choice forever.
+ *
+ * NEVER called by dryrun() below: the consensus gate reads no config file, by
+ * design — see the file header on envLocal.ts's loadEnvLocalKeys/dropBlankPoolEnv.
+ */
+export function applyMineEnvOverrides(): void {
+  dropBlankPoolEnv();
+  loadEnvLocalKeys(['MINER_POOL', 'MINER_PUBKEY']);
 }
 
 async function dryrun(): Promise<void> {
@@ -123,6 +146,7 @@ async function main(): Promise<void> {
   // and the full crashGuard is intentionally NOT installed here (it would write
   // terminal-restore escapes into piped logs — see crashGuard.ts).
   installStdioErrorSink();
+  applyMineEnvOverrides();
   const cfg = loadConfig();
   if (cfg.poolUrl) {
     await runPoolClient(cfg.poolUrl, cfg.minerPubkeyHex, cfg.workers, cfg.throttle, undefined, undefined, undefined, cfg.smart);
