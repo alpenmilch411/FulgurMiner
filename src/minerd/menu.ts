@@ -592,6 +592,11 @@ export class StartMenu {
 
   // --- the add-a-pool form: step 1 (name) → step 2 (url) -> commit ---------
   private commitPoolNameEdit(ed: Editing): void {
+    // A buffer at the cap that was truncated (the rest was dropped) must
+    // never be committed as-is — Enter would silently carry a chopped name
+    // into step 2. handleEditKey already set ed.error to the "Longer than N
+    // characters" notice, which stays on screen; just refuse to advance.
+    if (ed.truncated) { this.render(); return; }
     const name = ed.buffer.trim();
     if (name === '') {
       ed.error = 'Give the pool a name.';
@@ -603,6 +608,11 @@ export class StartMenu {
   }
 
   private commitPoolUrlEdit(ed: Editing): void {
+    // Same guard as commitPoolNameEdit: a truncated url must never be saved —
+    // `npm run settings` rejects the same over-length input via
+    // validateNewPool, and committing here anyway would silently persist a
+    // chopped endpoint the two UIs then disagree about.
+    if (ed.truncated) { this.render(); return; }
     const name = ed.name ?? '';
     const v = validateNewPool(name, ed.buffer, this.model.targets);
     if (!v.ok) {
@@ -1235,8 +1245,15 @@ export class StartMenu {
     // this right; buildWhere and buildMode did not).
     const inner = this.mainWidth(cols) - 2;
     const body = buildRows(inner);
-    body.push('');
-    for (const ln of this.wrap(explain, inner - 1)) body.push(`${DIM}${ln}${RESET}`);
+    // A pending remove-confirm must stay the LAST thing in the body: render()
+    // scrolls to the tail to keep it on-screen on a short terminal (see
+    // there), which only works if nothing is appended after it. The per-row
+    // explanation is skippable in that state — the confirm text already says
+    // what's about to happen.
+    if (!this.removeConfirm) {
+      body.push('');
+      for (const ln of this.wrap(explain, inner - 1)) body.push(`${DIM}${ln}${RESET}`);
+    }
     return this.frame(inner, 'Where to mine', body, hint);
   }
 
@@ -1415,11 +1432,20 @@ export class StartMenu {
 
     let out = HOME;
     const max = Math.min(lines.length, rows - 1);
+    // A pending remove-confirm must NEVER be the part a short terminal
+    // silently drops: it's a destructive action, and Enter still deletes even
+    // when the user can't see the prompt asking them to confirm it. The
+    // confirm block (and its "Enter/y confirm" hint) is always the LAST thing
+    // in the frame before its closing border (see whereBody/buildWhere), so
+    // when the full frame doesn't fit, scroll to the TAIL instead of the
+    // head — rows/border above scroll off-screen, but the destructive prompt
+    // stays on screen for as long as it's armed.
+    const start = this.removeConfirm && lines.length > max ? lines.length - max : 0;
     for (let i = 0; i < max; i++) {
       // Hard safety net: even though the frame is sized to the terminal, a very
       // narrow window (below the min frame width) could still exceed `cols`.
       // Truncate each line to the visible width so we can never overflow.
-      out += this.clampVisible(lines[i] ?? '', cols) + CLEAR_LINE;
+      out += this.clampVisible(lines[start + i] ?? '', cols) + CLEAR_LINE;
       if (i < max - 1) out += '\n';
     }
     out += CLEAR_DOWN;

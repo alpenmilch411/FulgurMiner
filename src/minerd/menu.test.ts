@@ -265,6 +265,45 @@ test('an over-length pool-name paste is flagged (truncated + a body-row error), 
   assert.ok(text.includes(`Longer than ${T.NAME_MAX}`), `expected a truncation notice, got: ${text}`);
 });
 
+// -- FIX 5: a truncated pool-name/pool-url edit must never be committed -------
+// commitEdit() used to commit ed.buffer regardless of ed.truncated, so a
+// pasted-over-cap name/url silently saved its chopped prefix while
+// `npm run settings` refuses the SAME input via validateNewPool — the two UIs
+// disagreed about what got saved. Enter on a truncated field must now refuse
+// to commit and keep showing the existing over-length error.
+
+test('a truncated pool-NAME edit refuses to commit — Enter does not advance to the url step', () => {
+  const menu = new StartMenu();
+  openWhere(menu);
+  moveToRow(menu, 100, /\+ Add a pool/);
+  pressReturn(menu);
+  type(menu, 'x'.repeat(T.NAME_MAX));
+  type(menu, 'y'); // one char past the cap -> truncated
+  pressReturn(menu); // must NOT advance to the pool-url step
+  const text = narrowText(menu, 50);
+  assert.ok(text.includes(`Longer than ${T.NAME_MAX}`), `expected the truncation error to still be shown, got: ${text}`);
+  assert.ok(/Enter next/.test(text), `expected to still be on the NAME step (its hint), got: ${text}`);
+  assert.ok(!/Enter save/.test(text), 'must not have advanced to the URL step');
+});
+
+test('a truncated pool-URL edit does not persist and surfaces the error', () => {
+  const menu = new StartMenu();
+  openWhere(menu);
+  moveToRow(menu, 100, /\+ Add a pool/);
+  pressReturn(menu);
+  type(menu, 'MyPool');
+  pressReturn(menu); // -> pool-url step
+
+  type(menu, 'x'.repeat(T.URL_MAX));
+  type(menu, 'y'); // one char past the cap -> truncated
+  pressReturn(menu); // must NOT commit the truncated url
+
+  assert.ok(!existsSync(POOLS), 'a truncated url must persist nothing');
+  const text = narrowText(menu, 50);
+  assert.ok(text.includes(`Longer than ${T.URL_MAX}`), `expected a truncation notice, got: ${text}`);
+  assert.ok(/Enter save/.test(text), 'must still be on the URL step (not committed, not bounced back to the list)');
+});
+
 test('remove requires a confirm; removing the active pool is refused; the remove key does nothing on a built-in', () => {
   writeFileSync(POOLS, JSON.stringify({ pools: [{ name: 'MyPool', url: 'https://pool.foo.org' }] }, null, 2) + '\n');
 
@@ -339,6 +378,46 @@ test('where picker fits within common terminal widths — list, add-pool form, a
   moveToRow(menu, 100, /MyPool/);
   pressKey(menu, 'd');
   for (const cols of WIDTHS) assertFits(menu.buildLines(cols), cols);
+});
+
+// -- FIX 4: a pending remove-confirm must stay visible on a short terminal ----
+// render() used to clamp `buildLines()`'s output to the top `rows - 1` lines
+// unconditionally. whereBody() always appends the remove-confirm (and its
+// "Enter/y confirm" hint) as the LAST body rows, so with enough custom pools
+// pushing the list past the terminal height, the confirm text — and the
+// destructive "Enter deletes" hint — silently scrolled off the bottom while
+// the highlighted row stayed on screen: the user could press `d`, see nothing,
+// then press Enter expecting to select and delete the pool instead. This
+// drives the real render() path (not just buildLines()) with a genuinely
+// short terminal to prove the armed confirm is on screen.
+
+test('a pending remove-confirm stays visible on a short terminal — render() scrolls to keep it on screen', () => {
+  const pools = Array.from({ length: 40 }, (_, i) => ({ name: `Pool${i}`, url: `https://pool${i}.example.org` }));
+  writeFileSync(POOLS, JSON.stringify({ pools }, null, 2) + '\n');
+
+  const menu = new StartMenu();
+  openWhere(menu);
+  moveToRow(menu, 100, /Pool39/, 60); // the LAST custom pool — far down a long list
+
+  const origWrite = process.stdout.write;
+  const origCols = Object.getOwnPropertyDescriptor(process.stdout, 'columns');
+  const origRows = Object.getOwnPropertyDescriptor(process.stdout, 'rows');
+  let lastWrite = '';
+  (process.stdout as unknown as { write: typeof process.stdout.write }).write = ((chunk: unknown) => {
+    lastWrite = typeof chunk === 'string' ? chunk : Buffer.from(chunk as Uint8Array).toString('utf8');
+    return true;
+  }) as typeof process.stdout.write;
+  try {
+    Object.defineProperty(process.stdout, 'columns', { value: 100, configurable: true });
+    Object.defineProperty(process.stdout, 'rows', { value: 10, configurable: true }); // a short terminal
+    menu.handleKey(undefined, { name: 'd' } as import('node:readline').Key); // arm the confirm — triggers the real render()
+    const written = visible(lastWrite);
+    assert.ok(written.includes('Remove "Pool39"'), `expected the armed confirm to be on-screen on a short terminal, got:\n${written}`);
+  } finally {
+    process.stdout.write = origWrite;
+    if (origCols) Object.defineProperty(process.stdout, 'columns', origCols); else delete (process.stdout as { columns?: number }).columns;
+    if (origRows) Object.defineProperty(process.stdout, 'rows', origRows); else delete (process.stdout as { rows?: number }).rows;
+  }
 });
 
 // -- the Throttle picker -------------------------------------------------------
