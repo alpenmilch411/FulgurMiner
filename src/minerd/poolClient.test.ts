@@ -373,3 +373,57 @@ test('runPoolClient: a 426 on /job (headless shape — signal===undefined) stops
     delete process.env.FULGUR_NO_UPDATE_CHECK;
   }
 });
+
+// ─── FIX 2: a construction failure between startPoolStats() and the done()
+// teardown must never leak the stats interval ────────────────────────────────
+// startPoolStats() used to run BEFORE `new GrindPool()`/the smart controller/
+// the share dispatcher were constructed, and the only poolStats.stop() funnel
+// (done(), inside the stoppedPromise executor) was defined much later. If any
+// of those constructions threw (e.g. the OS refusing another worker thread),
+// runPoolClient rejected but the 25s stats interval kept polling forever — the
+// same ghost-process class already covered above for the 426/400 exits, just
+// reached from a different failure point. createPool is the injection seam
+// (mirrors the existing `doFetch` one) that lets this test force that failure
+// without spinning a real worker thread or waiting on an OS thread limit.
+
+test('runPoolClient: a construction failure (e.g. the OS refusing another worker thread) leaves no ghost interval — the stats poller never starts before construction succeeds', async () => {
+  process.env.FULGUR_NO_UPDATE_CHECK = '1';
+  const origSetInterval = global.setInterval;
+  const origClearInterval = global.clearInterval;
+  const created = new Set<ReturnType<typeof setInterval>>();
+  const cleared = new Set<ReturnType<typeof setInterval>>();
+  (global as any).setInterval = ((...args: any[]) => {
+    const h = (origSetInterval as any)(...args);
+    created.add(h);
+    return h;
+  }) as any;
+  (global as any).clearInterval = ((h: any) => {
+    cleared.add(h);
+    return (origClearInterval as any)(h);
+  }) as any;
+  try {
+    const doFetch: typeof fetch = (async (url: unknown) => {
+      const u = String(url);
+      if (u.includes('/register')) return resp(200, { workerId: 'w1' });
+      return resp(404, {});
+    }) as unknown as typeof fetch;
+    const { reporter } = makeReporter();
+    const boom = new Error('EAGAIN: resource temporarily unavailable, worker thread');
+    const throwingCreatePool = (): never => { throw boom; };
+    await assert.rejects(
+      () => runPoolClient(
+        'https://pool.fulgurpool.xyz', 'a'.repeat(64), 1, 1, reporter, undefined, undefined, 'off', doFetch, throwingCreatePool,
+      ),
+      (e: unknown) => e === boom,
+    );
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(created.size, 0, 'no interval may exist before the grind pool/controller/dispatcher are safely constructed');
+    for (const h of created) {
+      assert.ok(cleared.has(h), 'any interval that did get created before the throw must still be cleared');
+    }
+  } finally {
+    global.setInterval = origSetInterval;
+    global.clearInterval = origClearInterval;
+    delete process.env.FULGUR_NO_UPDATE_CHECK;
+  }
+});

@@ -467,6 +467,13 @@ export async function runPoolClient(
   /** Injectable fetch for tests; defaults to the global fetch. Never changes the
    *  wire protocol — only which fetch implementation performs the request. */
   doFetch: typeof fetch = fetch,
+  /** Injectable grind-pool constructor for tests (e.g. to simulate the OS
+   *  refusing another worker thread without spinning real ones). Defaults to
+   *  the real engine choice already resolved into `useNative` — never changes
+   *  which engine actually mines, only lets a test force this construction
+   *  step to throw. */
+  createPool: (useNative: boolean, workers: number, startDuty: number) => GrindPool | NativeGrindPool
+    = (useNative, workers, startDuty) => (useNative ? new NativeGrindPool(workers, startDuty) : new GrindPool(workers, startDuty)),
 ): Promise<void> {
   // Show "connecting to pool…" as bootstrapping activity before the first job
   // arrives. Pools need no chain sync, but registration + the first job poll
@@ -572,17 +579,6 @@ export async function runPoolClient(
   reporter.event('info', `[pool-miner] grind engine: ${useNative ? 'native' : 'wasm'}`);
   reporter.synced(0);
   let acceptedShares = 0;
-  // Jackpot is a FulgurPool-only feature. Gate on pool IDENTITY (isFulgurPool),
-  // not on whether a /jackpot response happens to parse — a third-party pool
-  // must never be asked for an endpoint it doesn't have, and must never be able
-  // to paint the FulgurPool-branded panel by returning a jackpot-shaped body.
-  // Derived here, once, from the canonical poolUrl this function was called with,
-  // so the gate is identical on the TUI path and the headless `npm run mine` path
-  // — both funnel through this one runPoolClient implementation.
-  const poolStats = startPoolStats({
-    poolUrl, address: payoutAddress, getAcceptedShares: () => acceptedShares, pageUrl: undefined,
-    reporter, signal, wantJackpot: isFulgurPool(poolUrl), doFetch,
-  });
 
   // Considerate's whole job is to get out of your way, so it also grinds at a lower
   // scheduling priority (solo has always done this). Manual and Max are NOT niced: a
@@ -592,9 +588,7 @@ export async function runPoolClient(
     try { os.setPriority(10); } catch { /* not permitted on some platforms — ignore */ }
   }
 
-  const pool: GrindPool | NativeGrindPool = useNative
-    ? new NativeGrindPool(workers, startDuty)
-    : new GrindPool(workers, startDuty);
+  const pool: GrindPool | NativeGrindPool = createPool(useNative, workers, startDuty);
   const smartController = smart !== 'off'
     ? new SmartController(
       pool,
@@ -700,6 +694,27 @@ export async function runPoolClient(
     getEpoch: () => epoch,
     submit: (nonce, jobId, capWorkerId, capEpoch) => submitShare(capWorkerId, jobId, capEpoch, nonce),
     onWarn: (msg) => reporter.event('warn', msg),
+  });
+
+  // Jackpot is a FulgurPool-only feature. Gate on pool IDENTITY (isFulgurPool),
+  // not on whether a /jackpot response happens to parse — a third-party pool
+  // must never be asked for an endpoint it doesn't have, and must never be able
+  // to paint the FulgurPool-branded panel by returning a jackpot-shaped body.
+  // Derived here, once, from the canonical poolUrl this function was called with,
+  // so the gate is identical on the TUI path and the headless `npm run mine` path
+  // — both funnel through this one runPoolClient implementation.
+  //
+  // Started only AFTER the grind pool / smart controller / share dispatcher have
+  // all been constructed above: those are the only synchronous steps between
+  // registration and the `done()` teardown (below) that can throw (e.g. the OS
+  // refusing another worker thread), and until this branch the only stop()
+  // funnel for this interval was `done()`, defined much later. If any of those
+  // constructions throws, runPoolClient now rejects BEFORE this timer ever
+  // exists, instead of leaving it polling forever — the same ghost-process
+  // class already fixed for the 426/400 exits, closed at its origin.
+  const poolStats = startPoolStats({
+    poolUrl, address: payoutAddress, getAcceptedShares: () => acceptedShares, pageUrl: undefined,
+    reporter, signal, wantJackpot: isFulgurPool(poolUrl), doFetch,
   });
 
   // Each solved nonce is offered to the dispatcher, capturing the submission identity
