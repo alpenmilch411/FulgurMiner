@@ -17,5 +17,12 @@ cuda-poc/block2-host
 cuda-poc/reference-vectors
 cuda-poc/library-smoke
 cuda-poc/cuda-validation
+cuda-poc/experimental/*.o
+cuda-poc/experimental/*-bench
+cuda-poc/experimental/*-sweep
+cuda-poc/experimental/validation-ref*
+cuda-poc/experimental/variant-compare
+cuda-poc/experimental/persistent-best
+cuda-poc/experimental/lib*.so
 cuda-poc/brc_argon_cuda.o
 cuda-poc/libbrc-argon-cuda.a

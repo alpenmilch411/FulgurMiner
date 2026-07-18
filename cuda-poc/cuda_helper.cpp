@@ -70,6 +70,13 @@ std::uint64_t env_mib(const char* name, std::uint64_t fallback) {
   return end != raw && end != nullptr && *end == '\0' ? value : fallback;
 }
 
+bool env_enabled(const char* name) {
+  const char* raw = std::getenv(name);
+  return raw != nullptr && (std::strcmp(raw, "1") == 0 ||
+                            std::strcmp(raw, "true") == 0 ||
+                            std::strcmp(raw, "on") == 0);
+}
+
 std::uint32_t choose_batch(std::uint64_t requested) {
   std::size_t free_bytes = 0;
   std::size_t total_bytes = 0;
@@ -83,7 +90,13 @@ std::uint32_t choose_batch(std::uint64_t requested) {
       static_cast<std::uint64_t>(total_bytes) > effective_free
         ? static_cast<std::uint64_t>(total_bytes) - effective_free : 0;
   const std::uint64_t reserve = env_mib("MINER_CUDA_VRAM_RESERVE_MIB", 1024) * kMib;
-  std::uint64_t budget = effective_free > reserve ? effective_free - reserve : 0;
+  // cudaMalloc's actual footprint can exceed the nominal 32 MiB Argon2
+  // workspace by a large driver/context allocation on some WSL/NVIDIA
+  // combinations. Keep a separate guard so the configured reserve remains a
+  // real post-allocation floor rather than an optimistic arithmetic estimate.
+  const std::uint64_t allocation_guard = env_mib("MINER_CUDA_VRAM_GUARD_MIB", 2048) * kMib;
+  const std::uint64_t protected_free = reserve + allocation_guard;
+  std::uint64_t budget = effective_free > protected_free ? effective_free - protected_free : 0;
   const std::uint64_t max_mib = env_mib("MINER_CUDA_VRAM_MAX_MIB", 0);
   if (max_mib != 0) {
     const std::uint64_t max_bytes = max_mib * kMib;
@@ -104,7 +117,8 @@ std::uint32_t choose_batch(std::uint64_t requested) {
               << " workspace_mib=" << selected * 32
               << " free_mib=" << free_bytes / kMib
               << " total_mib=" << total_bytes / kMib
-              << " reserve_mib=" << reserve / kMib << std::endl;
+              << " reserve_mib=" << reserve / kMib
+              << " guard_mib=" << allocation_guard / kMib << std::endl;
   }
   return static_cast<std::uint32_t>(selected);
 }
@@ -137,7 +151,16 @@ void run_job(brc_argon_cuda_context* context, const std::string& header_hex,
     return;
   }
   active_workspace_batch = selected_batch;
+  const bool persistent = env_enabled("MINER_CUDA_PERSISTENT");
+  const std::uint32_t persistent_iterations = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+      64, std::max<std::uint64_t>(1, env_mib("MINER_CUDA_PERSISTENT_ITERATIONS", 8))));
+  if (persistent) {
+    std::lock_guard lock(output_mutex);
+    std::cerr << "CUDA_MODE persistent iterations=" << persistent_iterations << std::endl;
+  }
   auto last_rebalance = std::chrono::steady_clock::now();
+  std::uint32_t pending_batch = selected_batch;
+  std::uint32_t pending_observations = 0;
   std::uint64_t nonce = start;
   std::uint64_t hashes = 0;
   std::uint64_t last_report_hashes = 0;
@@ -146,15 +169,22 @@ void run_job(brc_argon_cuda_context* context, const std::string& header_hex,
   while (!stop_requested.load(std::memory_order_relaxed) && nonce < end) {
     const std::uint32_t count = static_cast<std::uint32_t>(
         std::min<std::uint64_t>(selected_batch, end - nonce));
+    const std::uint32_t iterations = persistent
+        ? static_cast<std::uint32_t>(std::min<std::uint64_t>(
+            persistent_iterations, std::max<std::uint64_t>(1, (end - nonce) / count))) : 1;
+    const std::uint64_t work_count = static_cast<std::uint64_t>(count) * iterations;
     brc_argon_cuda_share share{};
     const auto started = std::chrono::steady_clock::now();
-    const int result = brc_argon_cuda_mine_batch(
-        context, header, static_cast<std::uint32_t>(nonce), count, target, &share);
+    const int result = persistent
+        ? brc_argon_cuda_mine_persistent(context, header, static_cast<std::uint32_t>(nonce),
+                                         count, iterations, target, &share)
+        : brc_argon_cuda_mine_batch(context, header, static_cast<std::uint32_t>(nonce),
+                                    count, target, &share);
     if (result < 0) {
       print_error(brc_argon_cuda_last_error());
       return;
     }
-    hashes += count;
+    hashes += work_count;
 
     const auto rebalance_now = std::chrono::steady_clock::now();
     if (rebalance_now - last_rebalance >= kRebalanceInterval) {
@@ -162,18 +192,43 @@ void run_job(brc_argon_cuda_context* context, const std::string& header_hex,
       const std::uint32_t delta = candidate > selected_batch
           ? candidate - selected_batch : selected_batch - candidate;
       if (candidate > 0 && delta >= kBatchStep) {
+        if (candidate == pending_batch) {
+          ++pending_observations;
+        } else {
+          pending_batch = candidate;
+          pending_observations = 1;
+        }
+        if (pending_observations < 2) {
+          std::lock_guard lock(output_mutex);
+          std::cerr << "CUDA_BATCH rebalance_pending=" << candidate
+                    << " observations=" << pending_observations << std::endl;
+          last_rebalance = rebalance_now;
+          continue;
+        }
+        // Move only one 16-nonce step per confirmed observation. This avoids
+        // throwing away a large, productive workspace because of one brief
+        // display/Windows allocation fluctuation.
+        const std::uint32_t next_batch = candidate > selected_batch
+            ? selected_batch + static_cast<std::uint32_t>(kBatchStep)
+            : selected_batch - static_cast<std::uint32_t>(kBatchStep);
         // The public trim API is deliberately shrink-only. For an upward
         // rebalance, release the old workspace first so the next batch can
         // allocate the larger workspace without requiring both sizes at once.
-        const std::uint32_t trim_target = candidate > selected_batch ? 0 : candidate;
+        const std::uint32_t trim_target = next_batch > selected_batch ? 0 : next_batch;
         if (brc_argon_cuda_trim(context, trim_target) != 0) {
           print_error(brc_argon_cuda_last_error());
           return;
         }
-        selected_batch = candidate;
+        selected_batch = next_batch;
+        pending_batch = selected_batch;
+        pending_observations = 0;
         active_workspace_batch = trim_target == 0 ? 0 : selected_batch;
         std::lock_guard lock(output_mutex);
-        std::cerr << "CUDA_BATCH rebalanced=" << selected_batch << std::endl;
+        std::cerr << "CUDA_BATCH rebalanced=" << selected_batch
+                  << " candidate=" << candidate << std::endl;
+      } else {
+        pending_batch = selected_batch;
+        pending_observations = 0;
       }
       last_rebalance = rebalance_now;
     }
@@ -202,13 +257,16 @@ void run_job(brc_argon_cuda_context* context, const std::string& header_hex,
       nonce = static_cast<std::uint64_t>(share.nonce) + 1;
       if (!continuous) return;
     } else {
-      nonce += count;
+      nonce += work_count;
     }
 
     const auto report_now = std::chrono::steady_clock::now();
-    if (std::chrono::duration<double>(report_now - last_report_at).count() >= 1.0 || nonce >= end) {
+    const double report_seconds = std::chrono::duration<double>(report_now - last_report_at).count();
+    if (report_seconds >= 1.0 || nonce >= end) {
       std::lock_guard lock(output_mutex);
-      std::cerr << "HASHRATE " << (hashes - last_report_hashes) << std::endl;
+      const double rate = report_seconds > 0.0
+          ? static_cast<double>(hashes - last_report_hashes) / report_seconds : 0.0;
+      std::cerr << "HASHRATE " << rate << std::endl;
       last_report_hashes = hashes;
       last_report_at = report_now;
     }

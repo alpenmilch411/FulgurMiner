@@ -177,8 +177,15 @@ __device__ void h0_kernel(const std::uint8_t header[kHeaderLen], std::uint8_t ou
   le32(0x13);          // Argon2 version 1.3
   le32(2);             // Argon2id
   le32(kHeaderLen);    // password length
+
+#ifdef BRC_CUDA_OPT_H0
+#pragma unroll
+#endif
   for (int i = 0; i < kHeaderLen; ++i) input[p++] = header[i];
   le32(kSaltLen);
+#ifdef BRC_CUDA_OPT_H0
+#pragma unroll
+#endif
   for (int i = 0; i < kSaltLen; ++i) input[p++] = static_cast<std::uint8_t>(kSaltDevice[i]);
   le32(0);              // secret length
   le32(0);              // associated-data length
@@ -190,7 +197,13 @@ __device__ void h0_kernel(const std::uint8_t header[kHeaderLen], std::uint8_t ou
   // The counter is the number of bytes processed after each block.
   blake2b_compress(h, input, 128, false);
   blake2b_compress(h, input + 128, static_cast<std::uint64_t>(p), true);
+#ifdef BRC_CUDA_OPT_H0
+#pragma unroll
+#endif
   for (int i = 0; i < 8; ++i)
+#ifdef BRC_CUDA_OPT_H0
+#pragma unroll
+#endif
     for (int j = 0; j < 8; ++j) out[i * 8 + j] = static_cast<std::uint8_t>(h[i] >> (8 * j));
 }
 
@@ -240,17 +253,36 @@ __device__ void fill_block_coop(const std::uint64_t* prev,
                                 const std::uint64_t* ref,
                                 std::uint64_t* dst, bool with_xor,
                                 CoopState& state, int lane) {
+#ifdef BRC_CUDA_OPT_HYBRID
+  std::uint64_t r0 = 0, r1 = 0, r2 = 0, r3 = 0;
+  if (!with_xor) {
+    r0 = prev[lane] ^ ref[lane];
+    r1 = prev[lane + 32] ^ ref[lane + 32];
+    r2 = prev[lane + 64] ^ ref[lane + 64];
+    r3 = prev[lane + 96] ^ ref[lane + 96];
+    state.z[lane] = r0;
+    state.z[lane + 32] = r1;
+    state.z[lane + 64] = r2;
+    state.z[lane + 96] = r3;
+  } else {
+#endif
   for (int i = lane; i < 128; i += 32) {
     state.r[i] = prev[i] ^ ref[i];
     if (with_xor) state.r[i] ^= dst[i];
     state.z[i] = state.r[i];
   }
+#ifdef BRC_CUDA_OPT_HYBRID
+  }
+#endif
   __syncwarp();
 
   // A Blake2 round contains eight independent G operations in each row. The
   // original path assigned one lane to an entire row, leaving the other lanes
   // idle while that lane executed all eight Gs serially. Process four rows at
   // a time, assigning one lane to each G. Two phases cover all eight rows.
+#ifdef BRC_CUDA_OPT_PERMUTE
+#pragma unroll
+#endif
   for (int group = 0; group < 2; ++group) {
     const int op = lane & 7;
     const int base = (group * 4 + (lane >> 3)) * 16;
@@ -278,6 +310,9 @@ __device__ void fill_block_coop(const std::uint64_t* prev,
   // Apply the same cooperative mapping to the eight column rounds. Each
   // column is represented by eight lanes; four columns are processed in each
   // phase. The index mapping is the exact q[] layout used by round16().
+#ifdef BRC_CUDA_OPT_PERMUTE
+#pragma unroll
+#endif
   for (int group = 0; group < 2; ++group) {
     const int op = lane & 7;
     const int col = group * 4 + (lane >> 3);
@@ -303,29 +338,70 @@ __device__ void fill_block_coop(const std::uint64_t* prev,
     }
     __syncwarp();
   }
-  for (int i = lane; i < 128; i += 32) dst[i] = state.z[i] ^ state.r[i];
+
+#ifdef BRC_CUDA_OPT_HYBRID
+  if (!with_xor) {
+    dst[lane] = state.z[lane] ^ r0;
+    dst[lane + 32] = state.z[lane + 32] ^ r1;
+    dst[lane + 64] = state.z[lane + 64] ^ r2;
+    dst[lane + 96] = state.z[lane + 96] ^ r3;
+  } else {
+#endif
+    for (int i = lane; i < 128; i += 32) dst[i] = state.z[i] ^ state.r[i];
+#ifdef BRC_CUDA_OPT_HYBRID
+  }
+#endif
   __syncwarp();
 }
 
-__device__ void fill_lane_coop(std::uint64_t* memory, CoopState& state, int lane) {
+__device__ void fill_lane_coop(std::uint64_t* memory, CoopState& state, int lane
+#ifdef BRC_CUDA_OPT_ADDRESS
+                               , const std::uint64_t* cached_addresses
+#endif
+                               ) {
   for (std::uint32_t slice = 0; slice < 4; ++slice) {
     const bool data_independent = slice < 2;
+#ifdef BRC_CUDA_OPT_ADDRESS_SLICE0
+    const bool use_cached_addresses = slice == 0;
+#elif defined(BRC_CUDA_OPT_ADDRESS_SLICE1)
+    const bool use_cached_addresses = slice == 1;
+#else
+    const bool use_cached_addresses = false;
+#endif
     const std::uint32_t start = slice == 0 ? 2 : 0;
-    if (data_independent && lane == 0) {
+    if (data_independent && lane == 0 && !use_cached_addresses) {
+#ifndef BRC_CUDA_OPT_ADDRESS
       for (int i = 0; i < 128; ++i) state.address[i] = 0;
       brc_argon2::init_address_block(state.address, 0, slice, 1);
+#endif
     }
     __syncwarp();
     for (std::uint32_t index = start; index < brc_argon2::kSegmentLength; ++index) {
       if (data_independent && lane == 0 && index != start && (index & 127) == 0)
+#ifndef BRC_CUDA_OPT_ADDRESS
         brc_argon2::init_address_block(state.address, 0, slice, index / 128 + 1);
+#endif
       if (lane == 0) {
         const std::uint32_t absolute = slice * brc_argon2::kSegmentLength + index;
         const std::uint64_t* prev = memory + ((absolute + brc_argon2::kMemoryBlocks - 1)
                                                % brc_argon2::kMemoryBlocks) * 128;
-        const std::uint32_t pseudo = data_independent
-            ? static_cast<std::uint32_t>(state.address[index & 127])
-            : static_cast<std::uint32_t>(prev[0]);
+        std::uint32_t pseudo = 0;
+        if (data_independent) {
+#ifdef BRC_CUDA_OPT_ADDRESS
+          if (use_cached_addresses) {
+          const std::size_t address_offset =
+              (static_cast<std::size_t>(slice) * 64 + index / 128) * 128 + (index & 127);
+          pseudo = static_cast<std::uint32_t>(cached_addresses[address_offset]);
+          } else
+#endif
+#ifndef BRC_CUDA_OPT_ADDRESS
+          pseudo = static_cast<std::uint32_t>(state.address[index & 127]);
+#else
+          pseudo = static_cast<std::uint32_t>(state.address[index & 127]);
+#endif
+        } else {
+          pseudo = static_cast<std::uint32_t>(prev[0]);
+        }
         state.ref = brc_argon2::reference_index(0, slice, index, pseudo);
       }
       __syncwarp();
@@ -339,14 +415,22 @@ __device__ void fill_lane_coop(std::uint64_t* memory, CoopState& state, int lane
 }
 
 __device__ void argon2_hash_coop(std::uint8_t* out, std::uint64_t* memory,
-                                 CoopState& state, int lane) {
+                                 CoopState& state, int lane
+#ifdef BRC_CUDA_OPT_ADDRESS
+                                 , const std::uint64_t* cached_addresses
+#endif
+                                 ) {
   if (lane == 0) {
     h0_kernel(state.header, state.h0);
     initial_block(state.h0, 0, 0, memory);
     initial_block(state.h0, 1, 0, memory + 128);
   }
   __syncwarp();
-  fill_lane_coop(memory, state, lane);
+  fill_lane_coop(memory, state, lane
+#ifdef BRC_CUDA_OPT_ADDRESS
+                 , cached_addresses
+#endif
+                 );
   if (lane == 0) {
     std::uint8_t final_block[1024];
     const std::uint64_t* last = memory + (brc_argon2::kMemoryBlocks - 1) * 128;
@@ -363,7 +447,11 @@ __global__ void mine_batch_coop_launch(const std::uint8_t* base_header,
                                        const std::uint8_t* target,
                                        std::uint64_t* memories,
                                        std::uint8_t* batch_digests,
-                                       std::uint8_t* batch_valid) {
+                                       std::uint8_t* batch_valid
+#ifdef BRC_CUDA_OPT_ADDRESS
+                                       , const std::uint64_t* cached_addresses
+#endif
+                                       ) {
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
   const std::uint32_t index = blockIdx.x * 4 + warp;
@@ -381,7 +469,11 @@ __global__ void mine_batch_coop_launch(const std::uint8_t* base_header,
   const std::size_t words_per_job = static_cast<std::size_t>(brc_argon2::kMemoryBlocks) * 128;
   argon2_hash_coop(batch_digests + static_cast<std::size_t>(index) * 32,
                   memories + static_cast<std::size_t>(index) * words_per_job,
-                  states[warp], lane);
+                  states[warp], lane
+#ifdef BRC_CUDA_OPT_ADDRESS
+                  , cached_addresses
+#endif
+                  );
   if (lane == 0) {
     batch_valid[index] = digest_less_than(
         batch_digests + static_cast<std::size_t>(index) * 32, target) ? 1 : 0;
@@ -412,6 +504,59 @@ __global__ void mine_batch_launch(const std::uint8_t* base_header,
     batch_digests[static_cast<std::size_t>(index) * 32 + i] = digest[i];
   batch_valid[index] = digest_less_than(digest, target) ? 1 : 0;
 }
+
+__global__ void mine_persistent_coop_launch(
+    const std::uint8_t* base_header, std::uint64_t nonce_start,
+    std::uint32_t count, std::uint32_t iterations,
+    const std::uint8_t* target, std::uint64_t* memories,
+    std::uint8_t* digests, std::uint8_t* valid
+#ifdef BRC_CUDA_OPT_ADDRESS
+    , const std::uint64_t* cached_addresses
+#endif
+    ) {
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const std::uint32_t slot = blockIdx.x * 4 + warp;
+  if (slot >= count) return;
+  const std::uint32_t total_slots = gridDim.x * 4;
+  __shared__ CoopState states[4];
+  const std::size_t words_per_job = static_cast<std::size_t>(brc_argon2::kMemoryBlocks) * 128;
+  for (std::uint32_t round = 0; round < iterations; ++round) {
+    const std::uint32_t index = round * total_slots + slot;
+    if (lane == 0) {
+      for (int i = 0; i < kHeaderLen; ++i) states[warp].header[i] = base_header[i];
+      const std::uint64_t nonce = nonce_start + index;
+      states[warp].header[112] = static_cast<std::uint8_t>(nonce >> 24);
+      states[warp].header[113] = static_cast<std::uint8_t>(nonce >> 16);
+      states[warp].header[114] = static_cast<std::uint8_t>(nonce >> 8);
+      states[warp].header[115] = static_cast<std::uint8_t>(nonce);
+    }
+    __syncwarp();
+    argon2_hash_coop(digests + static_cast<std::size_t>(index) * 32,
+                     memories + static_cast<std::size_t>(slot) * words_per_job,
+                     states[warp], lane
+#ifdef BRC_CUDA_OPT_ADDRESS
+                     , cached_addresses
+#endif
+                     );
+    if (lane == 0) {
+      valid[index] = digest_less_than(digests + static_cast<std::size_t>(index) * 32,
+                                      target) ? 1 : 0;
+    }
+  }
+}
+
+#ifdef BRC_CUDA_OPT_ADDRESS
+__global__ void init_cached_addresses_launch(std::uint64_t* addresses) {
+  const std::uint32_t block = blockIdx.x * blockDim.x + threadIdx.x;
+  if (block >= 128) return;
+  const std::uint32_t slice = block / 64;
+  const std::uint32_t counter = block % 64 + 1;
+  brc_argon2::init_address_block(
+      addresses + static_cast<std::size_t>(block) * 128,
+      0, slice, counter);
+}
+#endif
 
 __global__ void diagnostic_launch(std::uint32_t* result) {
   if (blockIdx.x == 0 && threadIdx.x == 0) *result = 0xB2C0128u;
@@ -577,12 +722,19 @@ struct brc_argon_cuda_context {
   std::uint8_t* d_target = nullptr;
   std::uint8_t* d_digests = nullptr;
   std::uint8_t* d_valid = nullptr;
+  std::uint8_t* d_persistent_digests = nullptr;
+  std::uint8_t* d_persistent_valid = nullptr;
+#ifdef BRC_CUDA_OPT_ADDRESS
+  std::uint64_t* d_cached_addresses = nullptr;
+#endif
   std::uint64_t* d_memory = nullptr;
   std::size_t memory_jobs = 0;
   std::size_t digest_capacity = 0;
   std::size_t valid_capacity = 0;
+  std::size_t persistent_capacity = 0;
   std::vector<std::uint8_t> host_digests;
   std::vector<std::uint8_t> host_valid;
+  std::vector<std::uint8_t> host_persistent_valid;
 };
 
 namespace {
@@ -646,6 +798,26 @@ bool api_ensure_workspace(brc_argon_cuda_context* context, std::size_t jobs) {
   }
   return true;
 }
+
+bool api_ensure_persistent_workspace(brc_argon_cuda_context* context, std::size_t jobs) {
+  if (jobs <= context->persistent_capacity) return true;
+  std::uint8_t* replacement_digests = nullptr;
+  std::uint8_t* replacement_valid = nullptr;
+  cudaError_t error = cudaMalloc(&replacement_digests, jobs * 32);
+  if (error == cudaSuccess) error = cudaMalloc(&replacement_valid, jobs);
+  if (error == cudaSuccess) {
+    cudaFree(context->d_persistent_digests);
+    cudaFree(context->d_persistent_valid);
+    context->d_persistent_digests = replacement_digests;
+    context->d_persistent_valid = replacement_valid;
+    context->persistent_capacity = jobs;
+    return true;
+  }
+  cudaFree(replacement_digests);
+  cudaFree(replacement_valid);
+  api_cuda_error("CUDA persistent result allocation", error);
+  return false;
+}
 } // namespace
 
 extern "C" int brc_argon_cuda_create(brc_argon_cuda_context** context, int device) {
@@ -659,6 +831,22 @@ extern "C" int brc_argon_cuda_create(brc_argon_cuda_context** context, int devic
   error = cudaSetDevice(device);
   if (error != cudaSuccess) return api_cuda_error("cudaSetDevice", error);
   *context = new brc_argon_cuda_context{device};
+#ifdef BRC_CUDA_OPT_ADDRESS
+  constexpr std::size_t address_words = 2 * 64 * 128;
+  error = cudaMalloc(&(*context)->d_cached_addresses,
+                     address_words * sizeof(std::uint64_t));
+  if (error == cudaSuccess) {
+    init_cached_addresses_launch<<<1, 128>>>((*context)->d_cached_addresses);
+    error = cudaGetLastError();
+  }
+  if (error == cudaSuccess) error = cudaDeviceSynchronize();
+  if (error != cudaSuccess) {
+    cudaFree((*context)->d_cached_addresses);
+    delete *context;
+    *context = nullptr;
+    return api_cuda_error("CUDA address cache initialization", error);
+  }
+#endif
   std::snprintf(g_api_error, sizeof(g_api_error), "ok");
   return 0;
 }
@@ -671,6 +859,11 @@ extern "C" void brc_argon_cuda_destroy(brc_argon_cuda_context* context) {
   cudaFree(context->d_target);
   cudaFree(context->d_digests);
   cudaFree(context->d_valid);
+  cudaFree(context->d_persistent_digests);
+  cudaFree(context->d_persistent_valid);
+#ifdef BRC_CUDA_OPT_ADDRESS
+  cudaFree(context->d_cached_addresses);
+#endif
   cudaFree(context->d_memory);
   delete context;
 }
@@ -720,7 +913,11 @@ extern "C" int brc_argon_cuda_mine_batch(
   if (error == cudaSuccess) {
     mine_batch_coop_launch<<<(count + 3) / 4, 128>>>(
         context->d_header, nonce_start, count, context->d_target,
-        context->d_memory, context->d_digests, context->d_valid);
+        context->d_memory, context->d_digests, context->d_valid
+#ifdef BRC_CUDA_OPT_ADDRESS
+        , context->d_cached_addresses
+#endif
+        );
     error = cudaGetLastError();
   }
   if (error == cudaSuccess) error = cudaDeviceSynchronize();
@@ -733,6 +930,56 @@ extern "C" int brc_argon_cuda_mine_batch(
     if (!context->host_valid[i]) continue;
     share->nonce = nonce_start + i;
     std::memcpy(share->digest, context->host_digests.data() + static_cast<std::size_t>(i) * 32, 32);
+    std::snprintf(g_api_error, sizeof(g_api_error), "ok");
+    return 0;
+  }
+  std::snprintf(g_api_error, sizeof(g_api_error), "no share");
+  return 1;
+}
+
+extern "C" int brc_argon_cuda_mine_persistent(
+    brc_argon_cuda_context* context,
+    const std::uint8_t header[kHeaderLen],
+    std::uint32_t nonce_start,
+    std::uint32_t count,
+    std::uint32_t iterations,
+    const std::uint8_t target[32],
+    brc_argon_cuda_share* share) {
+  if (context == nullptr || header == nullptr || target == nullptr || share == nullptr)
+    return api_error("null persistent mining argument");
+  if (count == 0 || iterations == 0) return api_error("persistent batch parameters must be positive");
+  const std::uint64_t total = static_cast<std::uint64_t>(count) * iterations;
+  if (total > 0xffffffffULL || nonce_start > 0xffffffffu - (total - 1))
+    return api_error("persistent nonce range exceeds uint32");
+  if (!api_set_device(context) || !api_ensure_workspace(context, count) ||
+      !api_ensure_persistent_workspace(context, static_cast<std::size_t>(total))) return -1;
+  if (context->host_persistent_valid.size() < total)
+    context->host_persistent_valid.resize(total);
+  cudaError_t error = cudaMemcpy(context->d_header, header, kHeaderLen, cudaMemcpyHostToDevice);
+  if (error == cudaSuccess) error = cudaMemcpy(context->d_target, target, 32, cudaMemcpyHostToDevice);
+  if (error == cudaSuccess) {
+    mine_persistent_coop_launch<<<(count + 3) / 4, 128>>>(
+        context->d_header, nonce_start, count, iterations, context->d_target,
+        context->d_memory, context->d_persistent_digests,
+        context->d_persistent_valid
+#ifdef BRC_CUDA_OPT_ADDRESS
+        , context->d_cached_addresses
+#endif
+        );
+    error = cudaGetLastError();
+  }
+  if (error == cudaSuccess) error = cudaDeviceSynchronize();
+  if (error == cudaSuccess) error = cudaMemcpy(
+      context->host_persistent_valid.data(), context->d_persistent_valid,
+      static_cast<std::size_t>(total), cudaMemcpyDeviceToHost);
+  if (error != cudaSuccess) return api_cuda_error("CUDA persistent mine", error);
+  for (std::uint64_t i = 0; i < total; ++i) {
+    if (!context->host_persistent_valid[i]) continue;
+    error = cudaMemcpy(share->digest,
+                       context->d_persistent_digests + i * 32, 32,
+                       cudaMemcpyDeviceToHost);
+    if (error != cudaSuccess) return api_cuda_error("CUDA persistent digest", error);
+    share->nonce = nonce_start + static_cast<std::uint32_t>(i);
     std::snprintf(g_api_error, sizeof(g_api_error), "ok");
     return 0;
   }
@@ -761,6 +1008,15 @@ extern "C" int brc_argon_cuda_trim(brc_argon_cuda_context* context, std::uint32_
     if (error != cudaSuccess) return api_cuda_error("CUDA result trim", error);
     context->d_valid = nullptr;
     context->valid_capacity = 0;
+  }
+  if (jobs < context->persistent_capacity) {
+    cudaError_t error = cudaFree(context->d_persistent_digests);
+    if (error != cudaSuccess) return api_cuda_error("CUDA persistent digest trim", error);
+    error = cudaFree(context->d_persistent_valid);
+    if (error != cudaSuccess) return api_cuda_error("CUDA persistent result trim", error);
+    context->d_persistent_digests = nullptr;
+    context->d_persistent_valid = nullptr;
+    context->persistent_capacity = 0;
   }
   std::snprintf(g_api_error, sizeof(g_api_error), "ok");
   return 0;

@@ -2,7 +2,8 @@
 
 NVCC ?= /usr/local/cuda-12.8/bin/nvcc
 CUDA_ARCH ?= sm_120
-CXXFLAGS ?= -O2 -std=c++17
+CXXFLAGS ?= -O2 -std=c++17 -diag-suppress=177
+CUDA_OPT_FLAGS ?= -DBRC_CUDA_OPT_REF_INDEX -DBRC_CUDA_OPT_PERMUTE -DBRC_CUDA_OPT_HYBRID -DBRC_CUDA_OPT_H0
 
 all: device-probe
 
@@ -31,10 +32,10 @@ cuda-h0: brc-pow-cuda
 	./brc-pow-cuda h0 "$${HEADER_HEX:?set HEADER_HEX to 296 hex characters}"
 
 brc-pow-cuda: argon2_cuda.cu argon2_block.cuh argon2_memory.cuh
-	$(NVCC) $(CXXFLAGS) -arch=$(CUDA_ARCH) $< -o $@
+	$(NVCC) $(CXXFLAGS) $(CUDA_OPT_FLAGS) -arch=$(CUDA_ARCH) $< -o $@
 
 brc_argon_cuda.o: argon2_cuda.cu argon2_block.cuh argon2_memory.cuh include/brc_argon_cuda.h
-	$(NVCC) $(CXXFLAGS) -DBRC_ARGON_CUDA_LIBRARY -Xcompiler -fPIC -arch=$(CUDA_ARCH) -c argon2_cuda.cu -o $@
+	$(NVCC) $(CXXFLAGS) $(CUDA_OPT_FLAGS) -DBRC_ARGON_CUDA_LIBRARY -Xcompiler -fPIC -arch=$(CUDA_ARCH) -c argon2_cuda.cu -o $@
 
 library: libbrc-argon-cuda.a
 

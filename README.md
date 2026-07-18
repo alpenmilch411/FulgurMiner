@@ -220,6 +220,9 @@ Every option is an environment variable or a line in `.env.local` (written for y
 | `MINER_CUDA_DEVICE` | `0` | CUDA device index. Use `./cuda-poc/brc-argon-cuda-helper --info` (or set this variable first) to verify the selected card. |
 | `MINER_CUDA_VRAM_MAX_MIB` | *(unset)* | Optional total VRAM usage budget. The helper stays below this amount after accounting for other GPU users. |
 | `MINER_CUDA_VRAM_RESERVE_MIB` | `1024` | VRAM kept free for Windows/WSL/display/other CUDA workloads when selecting the batch. |
+| `MINER_CUDA_VRAM_GUARD_MIB` | `2048` | Additional allowance for CUDA driver/context allocation overhead; protects the reserve from optimistic `cudaMalloc` estimates. |
+| `MINER_CUDA_PERSISTENT` | `0` | Enables the opt-in persistent CUDA kernel, which processes multiple nonce batches per launch. |
+| `MINER_CUDA_PERSISTENT_ITERATIONS` | `8` | Batches processed per persistent launch; larger values improve launch amortization but delay job updates. |
 | `MINER_HELPERS` | `api1`/`api2.browsercoin.org` | Comma-separated API helper URLs for chain sync / solo mining. Each read tries them in turn and takes the first that answers, so one dead helper doesn't stop the miner tracking the tip. A helper that keeps failing gets demoted so reads stop leading with it; you get a warning when *every* helper fails a round. A blank or comma-only value falls back to the defaults. |
 | `MINER_DEBUG` | *(off)* | `MINER_DEBUG=1` adds debug lines — the per-helper read failures the miner recovered from on its own, plus snapshot notes. Env var only (`npm run mine` doesn't read `.env.local`). |
 | `FULGUR_TUI` | *(auto)* | `0` forces plain logs; otherwise the TUI is used when stdout is a terminal. |

@@ -128,6 +128,20 @@ The correctness-first batched nonce command is:
 The helper selects its batch from available VRAM, keeping a configurable
 reserve. `MINER_CUDA_BATCH` may cap the selected batch, while `0` or an unset
 value means automatic sizing; each nonce uses about 32 MiB of GPU workspace.
+The helper also keeps a 2048 MiB allocation guard by default to account for
+driver/context overhead; adjust it with `MINER_CUDA_VRAM_GUARD_MIB` only when
+you have measured the host's actual post-allocation free VRAM.
+
+The persistent kernel is available in the main helper behind
+`MINER_CUDA_PERSISTENT=1`. It retains validity results for every nonce in its
+multi-batch window and returns the first valid share; it is disabled by
+default until validated against the pool. `MINER_CUDA_PERSISTENT_ITERATIONS`
+defaults to 8 and bounds how long one launch can delay a job update.
+
+The default CUDA build includes the validated reference-index, permutation,
+hybrid register/shared-memory, and H0 optimizations. The data-independent
+address cache experiment is deliberately excluded because it does not yet
+match the consensus digest.
 The nonce is inserted as a
 big-endian `u32` at header offset 112, and a share is accepted only when the
 32-byte digest is strictly less than the target interpreted as a big-endian

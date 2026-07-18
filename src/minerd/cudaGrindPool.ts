@@ -182,7 +182,7 @@ export class CudaGrindPool {
   private handleStderr(line: string, generation: number): void {
     if (generation !== this.generation || !this.active) return;
     const fields = line.trim().split(/\s+/);
-    if (fields[0] === 'CUDA_BATCH') {
+    if (fields[0] === 'CUDA_BATCH' || fields[0] === 'CUDA_MODE') {
       this.onInfo(line.trim());
       return;
     }

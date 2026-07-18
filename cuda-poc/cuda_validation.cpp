@@ -118,10 +118,11 @@ int main() {
     return 1;
   }
   const std::uint32_t max_batch = static_cast<std::uint32_t>(
-      std::min<std::size_t>(safe_nonces, 256));
+      std::min<std::size_t>(safe_nonces, 336));
   std::vector<std::uint32_t> counts{1, 16};
   if (max_batch >= 128) counts.push_back(128);
   if (max_batch >= 256) counts.push_back(256);
+  if (max_batch >= 336) counts.push_back(336);
   if (counts.back() > max_batch) counts.back() = max_batch;
 
   std::printf("device=%d name=%s vram_mib=%zu free_before_mib=%zu reserve_mib=2048 "

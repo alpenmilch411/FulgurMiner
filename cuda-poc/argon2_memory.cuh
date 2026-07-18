@@ -47,9 +47,18 @@ __device__ inline std::uint32_t reference_index(std::uint32_t pass,
   }
   // The mapping deliberately uses only the low 32 bits of J1, as specified by
   // Argon2's index_alpha function.
+  // The reference mapping uses the high half of two unsigned 32-bit
+  // products. Keep the original form for the production baseline and expose
+  // the intrinsic form to the experimental optimization builds.
+#ifdef BRC_CUDA_OPT_REF_INDEX
+  const std::uint64_t x2 = static_cast<std::uint64_t>(pseudo) * pseudo;
+  const std::uint32_t x2_high = static_cast<std::uint32_t>(x2 >> 32);
+  const std::uint32_t y = __umulhi(reference_area, x2_high);
+#else
   const std::uint64_t x = static_cast<std::uint64_t>(pseudo);
   const std::uint64_t x2 = x * x;
   const std::uint64_t y = (static_cast<std::uint64_t>(reference_area) * (x2 >> 32)) >> 32;
+#endif
   const std::uint32_t relative = reference_area - 1 - static_cast<std::uint32_t>(y);
   return (start_position + relative) % kMemoryBlocks;
 }

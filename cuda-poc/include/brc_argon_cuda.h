@@ -37,6 +37,17 @@ int brc_argon_cuda_mine_batch(
     const uint8_t target[BRC_ARGON_CUDA_DIGEST_BYTES],
     brc_argon_cuda_share* share);
 
+/* Scan count-sized windows for iterations consecutive nonce batches in one
+ * launch. Returns the first hit in the scanned range, or 1 when none hit. */
+int brc_argon_cuda_mine_persistent(
+    brc_argon_cuda_context* context,
+    const uint8_t header[BRC_ARGON_CUDA_HEADER_BYTES],
+    uint32_t nonce_start,
+    uint32_t count,
+    uint32_t iterations,
+    const uint8_t target[BRC_ARGON_CUDA_DIGEST_BYTES],
+    brc_argon_cuda_share* share);
+
 /* Release workspace above `jobs` capacity. Pass 0 to release all batch
  * workspace while retaining the CUDA context and small fixed buffers. */
 int brc_argon_cuda_trim(brc_argon_cuda_context* context, uint32_t jobs);
