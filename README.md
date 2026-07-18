@@ -255,6 +255,18 @@ MINER_LOG_DIR=logs npm run mine
 MINER_PUBKEY=<your-address> npm run mine:dryrun
 ```
 
+## Local observability
+
+The miner can write structured JSONL events alongside its normal console output.
+Use `MINER_LOG_DIR=logs` to create one timestamped file per miner process, or
+`MINER_LOG_FILE=path.jsonl` to append to a specific file. The directory form is
+recommended when running CPU and CUDA miners together because each session gets
+its own file and machine identity.
+
+For local graphs and event inspection, the repository includes a
+Vector → ClickHouse → Grafana stack. See the complete setup and troubleshooting
+instructions in [`observability/README.md`](observability/README.md).
+
 The update check is quiet and best-effort: it reads the latest version from the project's [GitHub releases](https://github.com/alpenmilch411/FulgurMiner/releases) (plus the pool's notice / required-version signal) and fails silently offline. Turn the check off with **Check for updates → off** or `FULGUR_NO_UPDATE_CHECK=1`. FulgurMiner never runs an update for you.
 
 **To update:**
