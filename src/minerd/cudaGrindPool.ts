@@ -13,7 +13,6 @@ import { NONCE_SPACE } from './partition.js';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const EXE = process.platform === 'win32' ? '.exe' : '';
 export const CUDA_HELPER_BIN = resolve(__dirname, `../../cuda-poc/brc-argon-cuda-helper${EXE}`);
-export const CUDA_MAX_BATCH = 256;
 export const CUDA_WORKSPACE_MIB_PER_NONCE = 32;
 
 const HEX64 = /^[0-9a-fA-F]{64}$/;
@@ -36,16 +35,17 @@ export function cudaRuntimeAvailable(path = CUDA_HELPER_BIN): boolean {
 
 export function resolveCudaBatch(env: NodeJS.ProcessEnv = process.env): number {
   const raw = env.MINER_CUDA_BATCH;
-  if (raw == null || raw.trim() === '') return CUDA_MAX_BATCH;
+  if (raw == null || raw.trim() === '') return 0;
   const value = Number(raw);
-  if (!Number.isFinite(value) || value < 1) return CUDA_MAX_BATCH;
-  return Math.min(CUDA_MAX_BATCH, Math.floor(value));
+  if (!Number.isFinite(value) || value <= 0) return 0;
+  return Math.floor(value);
 }
 
 export type CudaSolved = (nonce: number, hash: Uint8Array) => void;
 export type CudaHashrate = (hashesPerSecond: number) => void;
 export type CudaExhausted = () => void;
 export type CudaError = (error: Error) => void;
+export type CudaInfo = (message: string) => void;
 
 /** One helper owns the complete pool-assigned slot. The CUDA library batches
  * up to 256 nonces per launch and reuses its context/workspace between launches. */
@@ -60,6 +60,7 @@ export class CudaGrindPool {
   private onHashrate: CudaHashrate = () => {};
   private onExhausted: CudaExhausted = () => {};
   private onError: CudaError = () => {};
+  private onInfo: CudaInfo = () => {};
   private throttle: number;
 
   constructor(
@@ -74,6 +75,10 @@ export class CudaGrindPool {
   setThrottle(throttle: number): void {
     this.throttle = Math.min(1, Math.max(0.05, throttle));
     if (this.child?.stdin.writable) this.child.stdin.write(`THROTTLE ${this.throttle}\n`);
+  }
+
+  setInfoLogger(onInfo: CudaInfo): void {
+    this.onInfo = onInfo;
   }
 
   start(
@@ -177,6 +182,10 @@ export class CudaGrindPool {
   private handleStderr(line: string, generation: number): void {
     if (generation !== this.generation || !this.active) return;
     const fields = line.trim().split(/\s+/);
+    if (fields[0] === 'CUDA_BATCH') {
+      this.onInfo(line.trim());
+      return;
+    }
     if (fields[0] !== 'HASHRATE') return;
     const hps = Number(fields[1]);
     if (Number.isFinite(hps) && hps >= 0) this.onHashrate(hps);

@@ -216,8 +216,10 @@ Every option is an environment variable or a line in `.env.local` (written for y
 | `MINER_THROTTLE` | `0.75` | Duty cycle (`0.05`–`1.0`): fraction of wall-time spent hashing. Lower = cooler & quieter. Ignored when a Smart mode is on (the mode sets the rate). Any value in the range can be set from the Throttle picker's Custom option, not just the presets. |
 | `MINER_NATIVE` | *(off)* | `1` uses the native Rust engine (built on demand if missing and Rust is installed). |
 | `MINER_CUDA` | *(off)* | `1` uses the opt-in CUDA engine when `cuda-poc/brc-argon-cuda-helper` is built and the NVIDIA runtime is available; otherwise falls back to WASM. |
-| `MINER_CUDA_BATCH` | `128` | CUDA nonces per batch, from `1` to `256`. Each nonce reserves about 32 MiB of VRAM; `128` uses about 4 GiB and `256` about 8 GiB for Argon2 workspace. Increase gradually on larger cards. |
+| `MINER_CUDA_BATCH` | *(auto)* | Optional CUDA batch cap. Unset/`0` selects the largest batch that fits the detected VRAM budget; each nonce reserves about 32 MiB of VRAM. |
 | `MINER_CUDA_DEVICE` | `0` | CUDA device index. Use `./cuda-poc/brc-argon-cuda-helper --info` (or set this variable first) to verify the selected card. |
+| `MINER_CUDA_VRAM_MAX_MIB` | *(unset)* | Optional total VRAM usage budget. The helper stays below this amount after accounting for other GPU users. |
+| `MINER_CUDA_VRAM_RESERVE_MIB` | `1024` | VRAM kept free for Windows/WSL/display/other CUDA workloads when selecting the batch. |
 | `MINER_HELPERS` | `api1`/`api2.browsercoin.org` | Comma-separated API helper URLs for chain sync / solo mining. Each read tries them in turn and takes the first that answers, so one dead helper doesn't stop the miner tracking the tip. A helper that keeps failing gets demoted so reads stop leading with it; you get a warning when *every* helper fails a round. A blank or comma-only value falls back to the defaults. |
 | `MINER_DEBUG` | *(off)* | `MINER_DEBUG=1` adds debug lines — the per-helper read failures the miner recovered from on its own, plus snapshot notes. Env var only (`npm run mine` doesn't read `.env.local`). |
 | `FULGUR_TUI` | *(auto)* | `0` forces plain logs; otherwise the TUI is used when stdout is a terminal. |

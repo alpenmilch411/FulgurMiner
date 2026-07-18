@@ -117,6 +117,7 @@ export class DashboardReporter implements MinerReporter {
   private soloBlocks: { height: number; hash: string }[] = [];
   private orphanedSoloHashes = new Set<string>();
   private earnings_: EarningsInfo | null = null;
+  private workerId_: string | null = null;
   private jackpot_: JackpotInfo | null = null;
   private updateNotice_: UpdateNotice | null = null;
   private smart_: SmartInfo | null = null;
@@ -359,6 +360,11 @@ export class DashboardReporter implements MinerReporter {
   // Jackpot panel, and a one-line update nudge (all width-safe via row()).
   earnings(e: EarningsInfo): void {
     this.earnings_ = e;
+    this.render();
+  }
+
+  workerId(id: string): void {
+    this.workerId_ = id;
     this.render();
   }
 
@@ -769,11 +775,13 @@ export class DashboardReporter implements MinerReporter {
 
   private earningsText(e: EarningsInfo): string {
     if (e.kind === 'pool-balance') {
-      return `earnings: ${e.earnedBrc} BRC (pending ${e.pendingBrc}, paid ${e.paidBrc})`;
+      const id = this.workerId_ ? ` miner=${this.workerId_}` : '';
+      return `earnings: ${e.earnedBrc} BRC (pending ${e.pendingBrc}, paid ${e.paidBrc})${id}`;
     }
     if (e.kind === 'pool-shares') {
       const stats = e.pageUrl ? ` (stats: ${link(e.pageUrl, e.pageUrl)})` : '';
-      return `shares: ${e.shares}${stats}`;
+      const id = this.workerId_ ? ` miner=${this.workerId_}` : '';
+      return `shares: ${e.shares}${stats}${id}`;
     }
     return `earnings (est): ${e.earnedBrc} BRC (${this.canonicalSolo().count} blocks)`;
   }

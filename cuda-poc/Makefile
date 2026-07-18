@@ -1,4 +1,4 @@
-.PHONY: all clean run vectors cuda-h0 h0-reference block2-reference block2-host bench library library-smoke local-miner cuda-helper
+.PHONY: all clean run vectors cuda-h0 h0-reference block2-reference block2-host bench cuda-check cuda-profile cuda-profile-launch cuda-profile-timeline cuda-profile-timeline-stats library library-smoke local-miner cuda-helper
 
 NVCC ?= /usr/local/cuda-12.8/bin/nvcc
 CUDA_ARCH ?= sm_120
@@ -41,6 +41,28 @@ library: libbrc-argon-cuda.a
 library-smoke: libbrc-argon-cuda.a library_smoke.cpp include/brc_argon_cuda.h
 	$(NVCC) $(CXXFLAGS) -arch=$(CUDA_ARCH) library_smoke.cpp libbrc-argon-cuda.a -o library-smoke
 
+cuda-validation: libbrc-argon-cuda.a cuda_validation.cpp include/brc_argon_cuda.h
+	$(NVCC) $(CXXFLAGS) -arch=$(CUDA_ARCH) cuda_validation.cpp libbrc-argon-cuda.a -o cuda-validation
+
+cuda-check: cuda-validation
+	CUDA_CHECK_ROUNDS=$${CUDA_CHECK_ROUNDS:-10} CUDA_CHECK_SECONDS=$${CUDA_CHECK_SECONDS:-30} ./cuda-validation
+
+cuda-profile: cuda-validation
+	@command -v ncu >/dev/null || (echo 'ncu (Nsight Compute) is required' >&2; exit 2)
+	CUDA_CHECK_ROUNDS=1 CUDA_CHECK_SECONDS=$${CUDA_PROFILE_SECONDS:-1} ncu --set basic --target-processes all --launch-skip 6 --launch-count 1 --export "$${CUDA_PROFILE_OUT:-/tmp/fulgur-cuda-profile}" ./cuda-validation
+
+cuda-profile-launch: cuda-validation
+	@command -v ncu >/dev/null || (echo 'ncu (Nsight Compute) is required' >&2; exit 2)
+	CUDA_CHECK_ROUNDS=1 CUDA_CHECK_SECONDS=$${CUDA_PROFILE_SECONDS:-1} ncu --section LaunchStats --target-processes all --launch-skip 6 --launch-count 1 --export "$${CUDA_PROFILE_OUT:-/tmp/fulgur-cuda-launch-profile}" ./cuda-validation
+
+cuda-profile-timeline: cuda-validation
+	@command -v nsys >/dev/null || (echo 'nsys (Nsight Systems) is required' >&2; exit 2)
+	nsys profile --trace=cuda --cuda-memory-usage=true --sample=none --cpuctxsw=none --force-overwrite=true --output "$${CUDA_PROFILE_OUT:-/tmp/fulgur-cuda-timeline}" env CUDA_CHECK_ROUNDS=1 CUDA_CHECK_SECONDS=$${CUDA_PROFILE_SECONDS:-10} ./cuda-validation
+
+cuda-profile-timeline-stats:
+	@command -v nsys >/dev/null || (echo 'nsys (Nsight Systems) is required' >&2; exit 2)
+	nsys stats --force-export=true --report cuda_api_sum,cuda_gpu_kern_sum,cuda_gpu_mem_time_sum --format table "$${CUDA_PROFILE_REPORT:-/tmp/fulgur-cuda-timeline.nsys-rep}"
+
 local-miner: libbrc-argon-cuda.a local_miner.cpp include/brc_argon_cuda.h
 	$(NVCC) $(CXXFLAGS) -arch=$(CUDA_ARCH) local_miner.cpp libbrc-argon-cuda.a -o brc-argon-local
 
@@ -60,4 +82,4 @@ reference-vectors: reference_vectors.cpp
 	$(CXX) -O2 -std=c++17 $< -ldl -o $@
 
 clean:
-	rm -f device-probe reference-vectors h0-reference block2-host brc-pow-cuda brc_argon_cuda.o libbrc-argon-cuda.a library-smoke brc-argon-local brc-argon-cuda-helper
+	rm -f device-probe reference-vectors h0-reference block2-host brc-pow-cuda brc_argon_cuda.o libbrc-argon-cuda.a library-smoke cuda-validation brc-argon-local brc-argon-cuda-helper

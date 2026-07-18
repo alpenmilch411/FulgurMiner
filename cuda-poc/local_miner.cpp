@@ -77,7 +77,7 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  constexpr uint32_t batch_size = BRC_ARGON_CUDA_MAX_BATCH;
+  constexpr uint32_t batch_size = 128;
   uint64_t batches = 0;
   uint64_t hashes = 0;
   const auto begin = std::chrono::steady_clock::now();

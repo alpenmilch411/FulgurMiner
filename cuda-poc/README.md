@@ -56,6 +56,48 @@ make library-smoke
 ./library-smoke
 ```
 
+Run the single-command CUDA validation suite with:
+
+```bash
+make cuda-check
+```
+
+It checks the known digest, batched share behavior, the strict-target
+boundary, and a warmed-up throughput pass. The performance section warms up
+for two batches, then runs for at least 30 seconds by default. The test chooses
+its batch from current free VRAM and always preserves at least 2 GiB free, with
+an additional 64 MiB safety cushion. `CUDA_CHECK_SECONDS` controls the minimum
+measurement duration and `CUDA_CHECK_ROUNDS` sets a minimum number of measured
+batches.
+
+If Nsight Compute is installed, profile the warmed cooperative kernel with:
+
+```bash
+make cuda-profile
+```
+
+This writes `/tmp/fulgur-cuda-profile.ncu-rep` by default. Override the output
+with `CUDA_PROFILE_OUT` or the profiling duration with `CUDA_PROFILE_SECONDS`.
+If performance-counter permissions are unavailable, try the lighter launch
+timing profile with `make cuda-profile-launch`; it may still provide kernel
+duration and launch-geometry information.
+If Nsight Compute cannot access performance counters, use Nsight Systems for a
+CUDA API/kernel timeline:
+
+```bash
+make cuda-profile-timeline
+```
+
+This writes `/tmp/fulgur-cuda-timeline.qdrep` by default and can show kernel
+durations, launch spacing, synchronization, and host/device overlap.
+Summarize the generated report in the terminal with:
+
+```bash
+make cuda-profile-timeline-stats
+```
+
+Set `CUDA_PROFILE_REPORT` if the report was written elsewhere.
+
 Or with CMake:
 
 ```bash
@@ -83,8 +125,10 @@ The correctness-first batched nonce command is:
 ./brc-pow-cuda mine <148-byte-header-hex> <nonce-start> <count> <target-hex>
 ```
 
-`count` is currently limited to 1 through 256 (256 uses about 8 GiB of GPU
-workspace). The nonce is inserted as a
+The helper selects its batch from available VRAM, keeping a configurable
+reserve. `MINER_CUDA_BATCH` may cap the selected batch, while `0` or an unset
+value means automatic sizing; each nonce uses about 32 MiB of GPU workspace.
+The nonce is inserted as a
 big-endian `u32` at header offset 112, and a share is accepted only when the
 32-byte digest is strictly less than the target interpreted as a big-endian
 integer. The command prints `no-share` or the matching nonce and digest.

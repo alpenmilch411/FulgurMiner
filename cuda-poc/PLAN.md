@@ -17,6 +17,13 @@ with the pool client remaining the single source of truth for networking.
 It may modify the main miner only where required to add the CUDA engine
 selector and adapter. Do not run npm tests during this workstream.
 
+The production path and experimental kernels should remain separable. Future
+high-risk kernel work should live under a dedicated experimental POC directory
+or target, with its own executable and benchmark, and should not replace the
+stable helper/library until known vectors, accepted shares, VRAM safety, and
+long-run throughput all pass. A future `CUDA_EXPERIMENTAL=1` selector can make
+that path opt-in without changing the default engine.
+
 ### Feasibility assessment
 
 This is a moderate adapter/build task, not a protocol rewrite. The main
@@ -161,12 +168,25 @@ benchmark that reuses allocations is required before selecting a production
 batch size or reporting GPU throughput. Larger batches can be evaluated after
 that benchmark and the reusable API extraction.
 
-The persistent benchmark now measures the repeated kernel loop. Results are
+The persistent benchmark now measures the repeated kernel loop. It reports both
+host-wall-clock throughput and CUDA-event device throughput, so launch and
+runtime synchronization overhead can be separated from kernel execution.
+Older results are host-wall-clock measurements:
 8 nonces × 3 rounds in 1.086 seconds (22.1 hashes/second), 64 nonces × 2
 rounds in 1.150 seconds (111.3 hashes/second), and 128 nonces × 2 rounds in
 1.159 seconds (220.9 hashes/second). Throughput scales nearly linearly with
 the number of serial per-nonce threads, confirming that the GPU is not yet
 saturated; these are not final hardware capability numbers.
+
+The repeatable validation command is `make -C cuda-poc cuda-check`. It checks
+the known digest vector, batch/share behavior, strict-target boundaries, and a
+short throughput pass. It computes the largest test batch from current free
+VRAM while reserving at least 2 GiB plus a 64 MiB safety cushion, then verifies
+that at least 2 GiB remains free after validation. `CUDA_CHECK_ROUNDS` controls
+the number of performance rounds. The performance portion warms up for two
+batches and then measures for at least 30 seconds by default; `CUDA_CHECK_SECONDS`
+can adjust that duration, while `CUDA_CHECK_ROUNDS` sets a minimum of 10 measured
+rounds by default.
 
 A warp-cooperative batch path now reproduces the known digest for nonce 0 and
 reaches 521.8 hashes/second for 128 nonces × 2 rounds, about 2.36× faster than
@@ -229,33 +249,35 @@ path still uses one helper/context; `MINER_WORKERS` remains a CPU setting.
 The helper now honors `MINER_CUDA_DEVICE` and exposes `--info`, so multi-GPU
 hosts can verify and select the intended card explicitly.
 
-## Next workstream: VRAM-first automatic batch sizing
+## VRAM-first automatic batch sizing
 
-The fixed batch ceiling is only temporary. VRAM availability should be the
-authoritative safety limit so more capable cards can use larger batches while
-smaller or shared cards automatically remain safe.
+VRAM availability is now the authoritative safety limit so more capable cards
+can use larger batches while smaller or shared cards automatically remain
+safe.
 
-Planned behavior:
+Implemented behavior:
 
-- Treat `MINER_CUDA_BATCH` as a requested batch size or lower preference, not
-  as permission to exceed available VRAM.
-- Remove the hard-coded maximum batch limit from the helper/API once dynamic
-  result buffers and launch sizing are safe.
-- Add a total VRAM budget such as `MINER_CUDA_VRAM_MAX_MIB`; if unset, use the
-  detected card capacity minus a reserve.
-- Add `MINER_CUDA_VRAM_RESERVE_MIB`, defaulting to at least 1024 MiB, so
-  Windows, WSL, display workloads, and other CUDA applications retain room.
-- Account for memory already in use by other processes before selecting the
-  batch. Select the largest supported batch that fits the budget, rather than
-  blindly attempting `cudaMalloc`.
-- Report total VRAM, current free VRAM, reserve, selected batch, and estimated
-  Argon2 workspace in the miner status/log output.
-- Make workspace growth transactional: allocate the new workspace first and
-  release the old one only after allocation succeeds.
-- Handle a late allocation failure as a controlled CUDA-engine failure with a
-  clear fallback or reduced-batch retry, not a helper restart loop.
-- Revalidate nonce-slot boundaries, digest buffers, result buffers, and kernel
-  launch geometry for batches larger than the current 256 limit.
+- `MINER_CUDA_BATCH` is now an optional requested cap; unset/`0` means auto.
+- The fixed 256 batch ceiling has been removed from the public API and helper.
+- `MINER_CUDA_VRAM_MAX_MIB` optionally caps total GPU memory usage.
+- `MINER_CUDA_VRAM_RESERVE_MIB` defaults to 1024 MiB for Windows, WSL,
+  display workloads, and other CUDA applications.
+- The helper accounts for current device usage and selects the largest fitting
+  batch before allocation.
+- The helper reports the selected batch, workspace estimate, free VRAM, total
+  VRAM, and reserve.
+- The helper rechecks VRAM every 30 seconds, changes capacity only when the
+  candidate differs by at least 16 nonces, and trims released workspace before
+  continuing.
+- Dynamic digest/result buffers and transactional workspace replacement are
+  implemented.
+
+Remaining safety work:
+
+- Handle a late allocation failure as a reduced-batch retry or controlled
+  fallback rather than a helper restart loop.
+- Add direct C API free-memory validation for callers other than the helper.
+- Revalidate very large launch geometry and profile larger-card behavior.
 
 The observed RTX 5080 baseline to preserve is batch 256 at approximately
 1,024 reported H/s and 13.1 GiB total GPU memory usage, including the roughly
@@ -275,6 +297,10 @@ The host-side pool communication is not the likely bottleneck: each batch only
 copies a 148-byte header, a 32-byte target, and small result buffers. The main
 optimization target is the warp-cooperative Argon2 implementation:
 
+The CUDA API now also reuses its host-side digest and validity buffers between
+batches. This removes repeated CPU allocator work from the hot loop; the
+transfers themselves remain small and synchronous.
+
 - `round16()` performs most of its work in eight lanes while the rest of the
   warp waits.
 - Repeated `__syncwarp()` barriers serialize the dependent memory-fill loop.
@@ -287,15 +313,42 @@ optimization target is the warp-cooperative Argon2 implementation:
 
 The next optimization sequence is:
 
-1. Add CUDA-event timing around the kernel and separate it from the helper's
-   one-second, whole-batch hashrate reporting.
+1. CUDA-event timing is now available in the persistent `bench` command; use
+   its `device_hashes_per_sec` field for kernel comparisons instead of the
+   helper's one-second, whole-batch hashrate reporting.
 2. Capture Nsight Compute/System metrics for achieved occupancy, warp stall
    reasons, global-memory throughput, instruction throughput, and barrier cost.
-3. Prototype a warp mapping that distributes the independent G operations in
-   `round16()` across more lanes, using shuffles or a carefully bounded shared
-   layout.
+3. The first warp-mapping prototype is now implemented in `fill_block_coop()`.
+   It distributes the row and column G operations across the warp with explicit
+   barriers between dependent phases. It still uses the existing shared state,
+   so it is a focused optimization experiment rather than the final layout.
 4. Re-measure correctness vectors, accepted shares, VRAM, power, and H/s at
    batches 128, 192, 256, and the later VRAM-selected sizes.
+
+The automated correctness, VRAM-safety, and performance check is implemented
+in `cuda_validation.cpp` and exposed through the single `cuda-check` target.
+
+Compiler resource inspection showed the cooperative kernel reaching 255
+registers per thread with spills and 12.6 KiB shared memory per block. A
+follow-up change moved the per-thread header and digest temporaries into the
+per-warp shared state/output path; runtime throughput validation is still
+required before treating that register-pressure reduction as an improvement.
+
+Nsight Compute is installed in the development environment, but its CUDA driver
+connection is unavailable there because only a stub `libcuda` is exposed. The
+reproducible `make -C cuda-poc cuda-profile` target is therefore intended to be
+run on the RTX host; it profiles the warmed cooperative kernel and writes an
+`.ncu-rep` report while retaining the validation program's 2 GiB VRAM reserve.
+The RTX host also lacks NVIDIA performance-counter permission, including for
+the lighter LaunchStats section. `make -C cuda-poc cuda-profile-timeline` now
+provides an Nsight Systems fallback for CUDA API/kernel durations and launch
+spacing that does not depend on those counters.
+On the RTX host, that fallback records CUDA API waits but still omits kernel
+and GPU-memory activity records, even with CUDA memory tracking enabled. The
+available evidence is nevertheless sufficient to rule out host communication,
+launches, and result copies as the dominant bottleneck; further gains should
+target the cooperative kernel's memory dependency, synchronization, and
+register/shared-state behavior.
 
 Before profiling, a 1.2x–1.5x improvement is plausible; 1.5x–2x is possible
 if the warp redesign improves both arithmetic utilization and dependency
@@ -306,13 +359,21 @@ throughput to roughly the single-process batch-64 rate.
 
 Observed throughput and hardware measurements are recorded in
 [`BENCHMARKS.md`](BENCHMARKS.md). The current baseline is batch 256 at about
-1,024 reported H/s on the RTX 5080, using about 13.1 GiB total GPU memory
-including the system baseline. The next optimization comparison must use
+2,041 sustained validation H/s on the RTX 5080, using about 13.1 GiB total GPU
+memory including the system baseline. The next optimization comparison must use
 precise CUDA timing or profiler metrics in addition to the pool display.
 
-TypeScript typechecking passes and the helper builds. The manual helper smoke
+The warp-mapping prototype builds successfully, passes the known digest and
+accepted-share validation, and improved the sustained validation rate by about
+5.5%. The manual helper smoke
 reached CUDA initialization but this sandbox reports `CUDA driver version is
 insufficient for CUDA runtime version`; an actual compatible NVIDIA runtime
 still needs to validate digest parity and sustained throughput. The remaining
 work is runtime validation, selector/UI polish, and packaging—not a new pool
 protocol.
+
+The attempted fine-tuning experiment that removed barriers between the two
+disjoint row groups and the two disjoint column groups was not a confirmed
+improvement and has been reverted. The restored baseline keeps the explicit
+barriers between all group phases while retaining the successful register/
+temporary-storage reduction.

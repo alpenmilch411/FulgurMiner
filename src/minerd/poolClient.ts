@@ -532,6 +532,7 @@ export async function runPoolClient(
     return;
   }
   let workerId = initialReg.workerId;
+  reporter.workerId?.(workerId);
   const versionFields = {
     latestMinerVersion: initialReg.latestMinerVersion,
     minMinerVersion: initialReg.minMinerVersion,
@@ -601,6 +602,9 @@ export async function runPoolClient(
   }
 
   const pool: GrindPool | NativeGrindPool | CudaGrindPool = createPool(useNative, workers, startDuty, useCuda);
+  if (pool instanceof CudaGrindPool) {
+    pool.setInfoLogger((message) => reporter.event('info', `[pool-miner] ${message}`));
+  }
   const smartController = smart !== 'off'
     ? new SmartController(
       pool,
@@ -666,6 +670,7 @@ export async function runPoolClient(
       return;
     }
     workerId = regBody.workerId;
+    reporter.workerId?.(workerId);
     reporter.event('info', `[pool-miner] registered worker ${workerId} at ${poolUrl}`);
   };
 

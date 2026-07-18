@@ -9,7 +9,6 @@ extern "C" {
 
 #define BRC_ARGON_CUDA_HEADER_BYTES 148u
 #define BRC_ARGON_CUDA_DIGEST_BYTES 32u
-#define BRC_ARGON_CUDA_MAX_BATCH 256u
 
 typedef struct brc_argon_cuda_context brc_argon_cuda_context;
 
@@ -37,6 +36,10 @@ int brc_argon_cuda_mine_batch(
     uint32_t count,
     const uint8_t target[BRC_ARGON_CUDA_DIGEST_BYTES],
     brc_argon_cuda_share* share);
+
+/* Release workspace above `jobs` capacity. Pass 0 to release all batch
+ * workspace while retaining the CUDA context and small fixed buffers. */
+int brc_argon_cuda_trim(brc_argon_cuda_context* context, uint32_t jobs);
 
 /* Returns a thread-local diagnostic string for the most recent failure. */
 const char* brc_argon_cuda_last_error(void);

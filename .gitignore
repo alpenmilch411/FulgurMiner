@@ -16,5 +16,6 @@ cuda-poc/h0-reference
 cuda-poc/block2-host
 cuda-poc/reference-vectors
 cuda-poc/library-smoke
+cuda-poc/cuda-validation
 cuda-poc/brc_argon_cuda.o
 cuda-poc/libbrc-argon-cuda.a
