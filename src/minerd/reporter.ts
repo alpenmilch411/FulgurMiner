@@ -28,7 +28,7 @@ export interface ReporterStatus {
   targetUrl?: string;
   /** Website to hyperlink the shown host to (OSC 8). Falls back to targetUrl. */
   targetPage?: string;
-  backend: 'wasm' | 'native';
+  backend: 'wasm' | 'native' | 'cuda';
   /** Optional one-line note about the backend choice, e.g. why native fell back to
    *  wasm. Shown persistently so the user doesn't have to quit to discover it. */
   backendNote?: string;

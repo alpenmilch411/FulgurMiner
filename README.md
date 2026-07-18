@@ -215,6 +215,9 @@ Every option is an environment variable or a line in `.env.local` (written for y
 | `MINER_WORKERS` | cores − 1 | CPU worker threads. Auto (unset) leaves one core free; inside a CPU-limited container it uses the whole allowance instead of the host's core count. Set it by hand to override. |
 | `MINER_THROTTLE` | `0.75` | Duty cycle (`0.05`–`1.0`): fraction of wall-time spent hashing. Lower = cooler & quieter. Ignored when a Smart mode is on (the mode sets the rate). Any value in the range can be set from the Throttle picker's Custom option, not just the presets. |
 | `MINER_NATIVE` | *(off)* | `1` uses the native Rust engine (built on demand if missing and Rust is installed). |
+| `MINER_CUDA` | *(off)* | `1` uses the opt-in CUDA engine when `cuda-poc/brc-argon-cuda-helper` is built and the NVIDIA runtime is available; otherwise falls back to WASM. |
+| `MINER_CUDA_BATCH` | `128` | CUDA nonces per batch, from `1` to `256`. Each nonce reserves about 32 MiB of VRAM; `128` uses about 4 GiB and `256` about 8 GiB for Argon2 workspace. Increase gradually on larger cards. |
+| `MINER_CUDA_DEVICE` | `0` | CUDA device index. Use `./cuda-poc/brc-argon-cuda-helper --info` (or set this variable first) to verify the selected card. |
 | `MINER_HELPERS` | `api1`/`api2.browsercoin.org` | Comma-separated API helper URLs for chain sync / solo mining. Each read tries them in turn and takes the first that answers, so one dead helper doesn't stop the miner tracking the tip. A helper that keeps failing gets demoted so reads stop leading with it; you get a warning when *every* helper fails a round. A blank or comma-only value falls back to the defaults. |
 | `MINER_DEBUG` | *(off)* | `MINER_DEBUG=1` adds debug lines — the per-helper read failures the miner recovered from on its own, plus snapshot notes. Env var only (`npm run mine` doesn't read `.env.local`). |
 | `FULGUR_TUI` | *(auto)* | `0` forces plain logs; otherwise the TUI is used when stdout is a terminal. |
@@ -268,7 +271,27 @@ cd native/brc-pow && cargo build --release && cd ../..
 MINER_NATIVE=1 npm start
 ```
 
-The status bar shows `native` vs `wasm` so you can confirm which is active. If native was selected but isn't built yet, the dashboard says so and keeps mining with wasm.
+## CUDA engine (experimental)
+
+The CUDA engine reuses FulgurMiner's existing pool client and share
+submission path. Build the helper from the repository root on a compatible
+NVIDIA system:
+
+```bash
+make -C cuda-poc cuda-helper
+./cuda-poc/brc-argon-cuda-helper --info
+MINER_CUDA=1 npm run mine
+```
+
+CUDA is opt-in. If the helper is missing or cannot initialize the NVIDIA
+runtime, the miner reports the reason and uses the portable WASM engine. The
+CUDA helper honors the pool-assigned nonce slot and does not implement a
+separate pool protocol. `MINER_CUDA_BATCH=32` is an example that limits the
+working set to roughly 1 GiB. `MINER_WORKERS` controls CPU workers and does not
+create additional CUDA contexts; the CUDA path uses one helper and one active
+batch at a time.
+
+The status bar shows `cuda`, `native`, or `wasm` so you can confirm which is active. If CUDA or native was selected but isn't usable, the dashboard says why and keeps mining with wasm.
 
 ## Troubleshooting
 

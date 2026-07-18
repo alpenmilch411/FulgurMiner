@@ -1,0 +1,878 @@
+// CUDA Argon2id implementation, built in correctness-checked slices.
+// This first slice implements Argon2's H0 input framing and BLAKE2b-512 on
+// the device. It intentionally does not claim to produce a PoW digest yet.
+#include <cuda_runtime.h>
+
+#include <chrono>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <vector>
+
+#include "argon2_block.cuh"
+#include "argon2_memory.cuh"
+
+namespace {
+
+constexpr int kHeaderLen = 148;
+constexpr int kSaltLen = 18;
+constexpr int kH0Len = 64;
+__device__ __constant__ char kSaltDevice[kSaltLen + 1] = "browsercoin-pow-v5";
+
+__device__ __constant__ std::uint64_t kIV[8] = {
+    0x6a09e667f3bcc908ULL, 0xbb67ae8584caa73bULL,
+    0x3c6ef372fe94f82bULL, 0xa54ff53a5f1d36f1ULL,
+    0x510e527fade682d1ULL, 0x9b05688c2b3e6c1fULL,
+    0x1f83d9abfb41bd6bULL, 0x5be0cd19137e2179ULL};
+
+__device__ __constant__ std::uint8_t kSigma[12][16] = {
+    {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15},
+    {14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3},
+    {11, 8, 12, 0, 5, 2, 15, 13, 10, 14, 3, 6, 7, 1, 9, 4},
+    {7, 9, 3, 1, 13, 12, 11, 14, 2, 6, 5, 10, 4, 0, 15, 8},
+    {9, 0, 5, 7, 2, 4, 10, 15, 14, 1, 11, 12, 6, 8, 3, 13},
+    {2, 12, 6, 10, 0, 11, 8, 3, 4, 13, 7, 5, 15, 14, 1, 9},
+    {12, 5, 1, 15, 14, 13, 4, 10, 0, 7, 6, 3, 9, 2, 8, 11},
+    {13, 11, 7, 14, 12, 1, 3, 9, 5, 0, 15, 4, 8, 6, 2, 10},
+    {6, 15, 14, 9, 11, 3, 0, 8, 12, 2, 13, 7, 1, 4, 10, 5},
+    {10, 2, 8, 4, 7, 6, 1, 5, 15, 11, 9, 14, 3, 12, 13, 0},
+    {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15},
+    {14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3}};
+
+__device__ inline std::uint64_t rotr(std::uint64_t x, int n) {
+  return (x >> n) | (x << (64 - n));
+}
+
+__device__ inline void mix(std::uint64_t& a, std::uint64_t& b,
+                           std::uint64_t& c, std::uint64_t& d,
+                           std::uint64_t x, std::uint64_t y) {
+  a = a + b + x;
+  d = rotr(d ^ a, 32);
+  c += d;
+  b = rotr(b ^ c, 24);
+  a = a + b + y;
+  d = rotr(d ^ a, 16);
+  c += d;
+  b = rotr(b ^ c, 63);
+}
+
+__device__ void blake2b_compress(std::uint64_t h[8], const std::uint8_t block[128],
+                                 std::uint64_t counter, bool last) {
+  std::uint64_t m[16];
+  for (int i = 0; i < 16; ++i) {
+    m[i] = 0;
+    for (int j = 0; j < 8; ++j) m[i] |= std::uint64_t(block[i * 8 + j]) << (8 * j);
+  }
+  std::uint64_t v[16];
+  for (int i = 0; i < 8; ++i) v[i] = h[i];
+  for (int i = 0; i < 8; ++i) v[i + 8] = kIV[i];
+  v[12] ^= counter;
+  if (last) v[14] = ~v[14];
+  for (int r = 0; r < 12; ++r) {
+    const auto* s = kSigma[r];
+    mix(v[0], v[4], v[8], v[12], m[s[0]], m[s[1]]);
+    mix(v[1], v[5], v[9], v[13], m[s[2]], m[s[3]]);
+    mix(v[2], v[6], v[10], v[14], m[s[4]], m[s[5]]);
+    mix(v[3], v[7], v[11], v[15], m[s[6]], m[s[7]]);
+    mix(v[0], v[5], v[10], v[15], m[s[8]], m[s[9]]);
+    mix(v[1], v[6], v[11], v[12], m[s[10]], m[s[11]]);
+    mix(v[2], v[7], v[8], v[13], m[s[12]], m[s[13]]);
+    mix(v[3], v[4], v[9], v[14], m[s[14]], m[s[15]]);
+  }
+  for (int i = 0; i < 8; ++i) h[i] ^= v[i] ^ v[i + 8];
+}
+
+// Blake2b with an output length up to 64 bytes. Argon2 H' uses both short
+// inputs (initial blocks) and a 1028-byte finalization input, so process all
+// input blocks with the byte counter advancing across the message.
+__device__ void blake2b_hash64(const std::uint8_t* data, int len,
+                               std::uint8_t* out, int out_len) {
+  std::uint64_t h[8];
+  for (int i = 0; i < 8; ++i) h[i] = kIV[i];
+  h[0] ^= 0x01010000ULL | static_cast<std::uint64_t>(out_len);
+  int offset = 0;
+  while (offset < len || (len == 0 && offset == 0)) {
+    std::uint8_t block[128]{};
+    const int remaining = len - offset;
+    const int chunk = remaining > 128 ? 128 : remaining;
+    for (int i = 0; i < chunk; ++i) block[i] = data[offset + i];
+    offset += chunk;
+    blake2b_compress(h, block, static_cast<std::uint64_t>(offset), offset == len);
+  }
+  for (int i = 0; i < out_len; ++i)
+    out[i] = static_cast<std::uint8_t>(h[i / 8] >> (8 * (i % 8)));
+}
+
+// RFC 9106 variable-length Blake2b, called H' by Argon2. This is used to
+// expand H0||LE32(pass)||LE32(lane) into each 1024-byte initial block.
+__device__ void blake2b_long(const std::uint8_t* input, int input_len,
+                             std::uint8_t* out, int out_len) {
+  std::uint8_t first[4 + 1024]{};
+  first[0] = static_cast<std::uint8_t>(out_len);
+  first[1] = static_cast<std::uint8_t>(out_len >> 8);
+  first[2] = static_cast<std::uint8_t>(out_len >> 16);
+  first[3] = static_cast<std::uint8_t>(out_len >> 24);
+  for (int i = 0; i < input_len; ++i) first[i + 4] = input[i];
+
+  if (out_len <= 64) {
+    blake2b_hash64(first, input_len + 4, out, out_len);
+    return;
+  }
+
+  std::uint8_t v[64];
+  blake2b_hash64(first, input_len + 4, v, 64);
+
+  int produced = 0;
+  for (int i = 0; i < 32; ++i) out[produced++] = v[i];
+  int remaining = out_len - 32;
+  while (remaining > 64) {
+    std::uint8_t next[64];
+    blake2b_hash64(v, 64, next, 64);
+    for (int i = 0; i < 32; ++i) out[produced++] = next[i];
+    for (int i = 0; i < 64; ++i) v[i] = next[i];
+    remaining -= 32;
+  }
+  blake2b_hash64(v, 64, out + produced, remaining);
+}
+
+__device__ void initial_block(const std::uint8_t h0[kH0Len],
+                              std::uint32_t block_index, std::uint32_t lane,
+                              std::uint64_t* dst) {
+  std::uint8_t input[kH0Len + 8];
+  for (int i = 0; i < kH0Len; ++i) input[i] = h0[i];
+  input[64] = static_cast<std::uint8_t>(block_index);
+  input[65] = static_cast<std::uint8_t>(block_index >> 8);
+  input[66] = static_cast<std::uint8_t>(block_index >> 16);
+  input[67] = static_cast<std::uint8_t>(block_index >> 24);
+  input[68] = static_cast<std::uint8_t>(lane);
+  input[69] = static_cast<std::uint8_t>(lane >> 8);
+  input[70] = static_cast<std::uint8_t>(lane >> 16);
+  input[71] = static_cast<std::uint8_t>(lane >> 24);
+  std::uint8_t bytes[1024];
+  blake2b_long(input, sizeof(input), bytes, sizeof(bytes));
+  for (int i = 0; i < 128; ++i) {
+    std::uint64_t word = 0;
+    for (int j = 0; j < 8; ++j) word |= std::uint64_t(bytes[i * 8 + j]) << (8 * j);
+    dst[i] = word;
+  }
+}
+
+__device__ void h0_kernel(const std::uint8_t header[kHeaderLen], std::uint8_t out[kH0Len]) {
+  // Argon2 H0, RFC 9106 section 3.3: LE32 parameters followed by length-
+  // prefixed password and salt, with zero-length secret and associated data.
+  std::uint8_t input[256]{};
+  int p = 0;
+  auto le32 = [&](std::uint32_t x) {
+    input[p++] = static_cast<std::uint8_t>(x);
+    input[p++] = static_cast<std::uint8_t>(x >> 8);
+    input[p++] = static_cast<std::uint8_t>(x >> 16);
+    input[p++] = static_cast<std::uint8_t>(x >> 24);
+  };
+  le32(1);             // parallelism
+  le32(32);            // tag length
+  le32(32 * 1024);     // memory KiB
+  le32(1);             // passes
+  le32(0x13);          // Argon2 version 1.3
+  le32(2);             // Argon2id
+  le32(kHeaderLen);    // password length
+  for (int i = 0; i < kHeaderLen; ++i) input[p++] = header[i];
+  le32(kSaltLen);
+  for (int i = 0; i < kSaltLen; ++i) input[p++] = static_cast<std::uint8_t>(kSaltDevice[i]);
+  le32(0);              // secret length
+  le32(0);              // associated-data length
+
+  std::uint64_t h[8];
+  for (int i = 0; i < 8; ++i) h[i] = kIV[i];
+  h[0] ^= 0x01010040ULL; // digest length 64, key length 0, fanout 1, depth 1
+  // H0 is 202 bytes for this header/salt, so BLAKE2b consumes two blocks.
+  // The counter is the number of bytes processed after each block.
+  blake2b_compress(h, input, 128, false);
+  blake2b_compress(h, input + 128, static_cast<std::uint64_t>(p), true);
+  for (int i = 0; i < 8; ++i)
+    for (int j = 0; j < 8; ++j) out[i * 8 + j] = static_cast<std::uint8_t>(h[i] >> (8 * j));
+}
+
+__global__ void h0_launch(const std::uint8_t* header, std::uint8_t* out) {
+  if (blockIdx.x == 0 && threadIdx.x == 0) h0_kernel(header, out);
+}
+
+__device__ void argon2_hash(const std::uint8_t* header, std::uint8_t* out,
+                            std::uint64_t* memory) {
+  std::uint8_t h0[kH0Len];
+  h0_kernel(header, h0);
+  initial_block(h0, 0, 0, memory);
+  initial_block(h0, 1, 0, memory + 128);
+  brc_argon2::fill_lane(memory);
+
+  std::uint8_t final_block[1024];
+  const std::uint64_t* last = memory + (brc_argon2::kMemoryBlocks - 1) * 128;
+  for (int i = 0; i < 128; ++i)
+    for (int j = 0; j < 8; ++j)
+      final_block[i * 8 + j] = static_cast<std::uint8_t>(last[i] >> (8 * j));
+  blake2b_long(final_block, sizeof(final_block), out, 32);
+}
+
+__global__ void argon2_launch(const std::uint8_t* header, std::uint8_t* out,
+                              std::uint64_t* memory) {
+  if (blockIdx.x == 0 && threadIdx.x == 0) argon2_hash(header, out, memory);
+}
+
+__device__ bool digest_less_than(const std::uint8_t* digest,
+                                 const std::uint8_t* target) {
+  for (int i = 0; i < 32; ++i) {
+    if (digest[i] != target[i]) return digest[i] < target[i];
+  }
+  return false;
+}
+
+struct CoopState {
+  std::uint8_t h0[64];
+  std::uint64_t address[128];
+  std::uint64_t r[128];
+  std::uint64_t z[128];
+  std::uint32_t ref;
+};
+
+__device__ void fill_block_coop(const std::uint64_t* prev,
+                                const std::uint64_t* ref,
+                                std::uint64_t* dst, bool with_xor,
+                                CoopState& state, int lane) {
+  for (int i = lane; i < 128; i += 32) {
+    state.r[i] = prev[i] ^ ref[i];
+    if (with_xor) state.r[i] ^= dst[i];
+    state.z[i] = state.r[i];
+  }
+  __syncwarp();
+  for (int row = 0; row < 8; ++row) {
+    if (lane < 8) brc_argon2::round16(state.z + row * 16);
+    __syncwarp();
+  }
+  for (int col = 0; col < 8; ++col) {
+    if (lane < 8) {
+      std::uint64_t q[16];
+      for (int i = 0; i < 8; ++i) {
+        q[i * 2] = state.z[i * 16 + col * 2];
+        q[i * 2 + 1] = state.z[i * 16 + col * 2 + 1];
+      }
+      brc_argon2::round16(q);
+      for (int i = 0; i < 8; ++i) {
+        state.z[i * 16 + col * 2] = q[i * 2];
+        state.z[i * 16 + col * 2 + 1] = q[i * 2 + 1];
+      }
+    }
+    __syncwarp();
+  }
+  for (int i = lane; i < 128; i += 32) dst[i] = state.z[i] ^ state.r[i];
+  __syncwarp();
+}
+
+__device__ void fill_lane_coop(std::uint64_t* memory, CoopState& state, int lane) {
+  for (std::uint32_t slice = 0; slice < 4; ++slice) {
+    const bool data_independent = slice < 2;
+    const std::uint32_t start = slice == 0 ? 2 : 0;
+    if (data_independent && lane == 0) {
+      for (int i = 0; i < 128; ++i) state.address[i] = 0;
+      brc_argon2::init_address_block(state.address, 0, slice, 1);
+    }
+    __syncwarp();
+    for (std::uint32_t index = start; index < brc_argon2::kSegmentLength; ++index) {
+      if (data_independent && lane == 0 && index != start && (index & 127) == 0)
+        brc_argon2::init_address_block(state.address, 0, slice, index / 128 + 1);
+      if (lane == 0) {
+        const std::uint32_t absolute = slice * brc_argon2::kSegmentLength + index;
+        const std::uint64_t* prev = memory + ((absolute + brc_argon2::kMemoryBlocks - 1)
+                                               % brc_argon2::kMemoryBlocks) * 128;
+        const std::uint32_t pseudo = data_independent
+            ? static_cast<std::uint32_t>(state.address[index & 127])
+            : static_cast<std::uint32_t>(prev[0]);
+        state.ref = brc_argon2::reference_index(0, slice, index, pseudo);
+      }
+      __syncwarp();
+      const std::uint32_t absolute = slice * brc_argon2::kSegmentLength + index;
+      const std::uint64_t* prev = memory + ((absolute + brc_argon2::kMemoryBlocks - 1)
+                                             % brc_argon2::kMemoryBlocks) * 128;
+      fill_block_coop(prev, memory + state.ref * 128, memory + absolute * 128,
+                      false, state, lane);
+    }
+  }
+}
+
+__device__ void argon2_hash_coop(const std::uint8_t* header, std::uint8_t* out,
+                                 std::uint64_t* memory, CoopState& state, int lane) {
+  if (lane == 0) {
+    h0_kernel(header, state.h0);
+    initial_block(state.h0, 0, 0, memory);
+    initial_block(state.h0, 1, 0, memory + 128);
+  }
+  __syncwarp();
+  fill_lane_coop(memory, state, lane);
+  if (lane == 0) {
+    std::uint8_t final_block[1024];
+    const std::uint64_t* last = memory + (brc_argon2::kMemoryBlocks - 1) * 128;
+    for (int i = 0; i < 128; ++i)
+      for (int j = 0; j < 8; ++j)
+        final_block[i * 8 + j] = static_cast<std::uint8_t>(last[i] >> (8 * j));
+    blake2b_long(final_block, sizeof(final_block), out, 32);
+  }
+}
+
+__global__ void mine_batch_coop_launch(const std::uint8_t* base_header,
+                                       std::uint64_t nonce_start,
+                                       std::uint32_t count,
+                                       const std::uint8_t* target,
+                                       std::uint64_t* memories,
+                                       std::uint8_t* batch_digests,
+                                       std::uint8_t* batch_valid) {
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const std::uint32_t index = blockIdx.x * 4 + warp;
+  if (index >= count) return;
+  __shared__ CoopState states[4];
+  std::uint8_t header[kHeaderLen];
+  std::uint8_t digest[32];
+  if (lane == 0) {
+    for (int i = 0; i < kHeaderLen; ++i) header[i] = base_header[i];
+    const std::uint64_t nonce = nonce_start + index;
+    header[112] = static_cast<std::uint8_t>(nonce >> 24);
+    header[113] = static_cast<std::uint8_t>(nonce >> 16);
+    header[114] = static_cast<std::uint8_t>(nonce >> 8);
+    header[115] = static_cast<std::uint8_t>(nonce);
+  }
+  const std::size_t words_per_job = static_cast<std::size_t>(brc_argon2::kMemoryBlocks) * 128;
+  argon2_hash_coop(header, digest,
+                  memories + static_cast<std::size_t>(index) * words_per_job,
+                  states[warp], lane);
+  if (lane == 0) {
+    for (int i = 0; i < 32; ++i)
+      batch_digests[static_cast<std::size_t>(index) * 32 + i] = digest[i];
+    batch_valid[index] = digest_less_than(digest, target) ? 1 : 0;
+  }
+}
+
+__global__ void mine_batch_launch(const std::uint8_t* base_header,
+                                  std::uint64_t nonce_start,
+                                  std::uint32_t count,
+                                  const std::uint8_t* target,
+                                  std::uint64_t* memories,
+                                  std::uint8_t* batch_digests,
+                                  std::uint8_t* batch_valid) {
+  const std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index >= count) return;
+  std::uint8_t header[kHeaderLen];
+  for (int i = 0; i < kHeaderLen; ++i) header[i] = base_header[i];
+  const std::uint64_t nonce = nonce_start + index;
+  header[112] = static_cast<std::uint8_t>(nonce >> 24);
+  header[113] = static_cast<std::uint8_t>(nonce >> 16);
+  header[114] = static_cast<std::uint8_t>(nonce >> 8);
+  header[115] = static_cast<std::uint8_t>(nonce);
+  std::uint8_t digest[32];
+  const std::size_t words_per_job =
+      static_cast<std::size_t>(brc_argon2::kMemoryBlocks) * 128;
+  argon2_hash(header, digest, memories + static_cast<std::size_t>(index) * words_per_job);
+  for (int i = 0; i < 32; ++i)
+    batch_digests[static_cast<std::size_t>(index) * 32 + i] = digest[i];
+  batch_valid[index] = digest_less_than(digest, target) ? 1 : 0;
+}
+
+__global__ void diagnostic_launch(std::uint32_t* result) {
+  if (blockIdx.x == 0 && threadIdx.x == 0) *result = 0xB2C0128u;
+}
+
+__global__ void initial_prefix_launch(const std::uint8_t* header, std::uint8_t* out,
+                                      std::uint32_t block_index) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) return;
+  std::uint8_t h0[kH0Len];
+  std::uint64_t block[128];
+  h0_kernel(header, h0);
+  initial_block(h0, block_index, 0, block);
+  for (int i = 0; i < 8; ++i)
+    for (int j = 0; j < 8; ++j)
+      out[i * 8 + j] = static_cast<std::uint8_t>(block[i] >> (8 * j));
+}
+
+__global__ void initial_tail_launch(const std::uint8_t* header, std::uint8_t* out) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) return;
+  std::uint8_t h0[kH0Len];
+  std::uint64_t block[128];
+  h0_kernel(header, h0);
+  initial_block(h0, 0, 0, block);
+  for (int i = 0; i < 8; ++i)
+    for (int j = 0; j < 8; ++j)
+      out[i * 8 + j] = static_cast<std::uint8_t>(block[i + 8] >> (8 * j));
+}
+
+__global__ void initial_end_launch(const std::uint8_t* header, std::uint8_t* out) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) return;
+  std::uint8_t h0[kH0Len];
+  std::uint64_t block[128];
+  h0_kernel(header, h0);
+  initial_block(h0, 1, 0, block);
+  for (int i = 0; i < 8; ++i)
+    for (int j = 0; j < 8; ++j)
+      out[i * 8 + j] = static_cast<std::uint8_t>(block[i + 120] >> (8 * j));
+}
+
+__global__ void block2_prefix_launch(const std::uint8_t* header, std::uint8_t* out,
+                                     std::uint64_t* memory) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) return;
+  std::uint8_t h0[kH0Len];
+  h0_kernel(header, h0);
+  initial_block(h0, 0, 0, memory);
+  initial_block(h0, 1, 0, memory + 128);
+  brc_argon2::fill_lane(memory);
+  const std::uint64_t* block = memory + 2 * 128;
+  for (int i = 0; i < 8; ++i)
+    for (int j = 0; j < 8; ++j)
+      out[i * 8 + j] = static_cast<std::uint8_t>(block[i] >> (8 * j));
+}
+
+__global__ void block3_prefix_launch(const std::uint8_t* header, std::uint8_t* out,
+                                     std::uint64_t* memory) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) return;
+  std::uint8_t h0[kH0Len];
+  h0_kernel(header, h0);
+  initial_block(h0, 0, 0, memory);
+  initial_block(h0, 1, 0, memory + 128);
+  brc_argon2::fill_lane(memory);
+  const std::uint64_t* block = memory + 3 * 128;
+  for (int i = 0; i < 8; ++i)
+    for (int j = 0; j < 8; ++j)
+      out[i * 8 + j] = static_cast<std::uint8_t>(block[i] >> (8 * j));
+}
+
+__global__ void block130_prefix_launch(const std::uint8_t* header, std::uint8_t* out,
+                                       std::uint64_t* memory) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) return;
+  std::uint8_t h0[kH0Len];
+  h0_kernel(header, h0);
+  initial_block(h0, 0, 0, memory);
+  initial_block(h0, 1, 0, memory + 128);
+  brc_argon2::fill_lane(memory);
+  const std::uint64_t* block = memory + 130 * 128;
+  for (int i = 0; i < 8; ++i)
+    for (int j = 0; j < 8; ++j)
+      out[i * 8 + j] = static_cast<std::uint8_t>(block[i] >> (8 * j));
+}
+
+__global__ void block8192_prefix_launch(const std::uint8_t* header, std::uint8_t* out,
+                                        std::uint64_t* memory) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) return;
+  std::uint8_t h0[kH0Len];
+  h0_kernel(header, h0);
+  initial_block(h0, 0, 0, memory);
+  initial_block(h0, 1, 0, memory + 128);
+  brc_argon2::fill_lane(memory);
+  const std::uint64_t* block = memory + 8192 * 128;
+  for (int i = 0; i < 8; ++i)
+    for (int j = 0; j < 8; ++j)
+      out[i * 8 + j] = static_cast<std::uint8_t>(block[i] >> (8 * j));
+}
+
+__global__ void block16384_prefix_launch(const std::uint8_t* header, std::uint8_t* out,
+                                         std::uint64_t* memory) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) return;
+  std::uint8_t h0[kH0Len];
+  h0_kernel(header, h0);
+  initial_block(h0, 0, 0, memory);
+  initial_block(h0, 1, 0, memory + 128);
+  brc_argon2::fill_lane(memory);
+  const std::uint64_t* block = memory + 16384 * 128;
+  for (int i = 0; i < 8; ++i)
+    for (int j = 0; j < 8; ++j)
+      out[i * 8 + j] = static_cast<std::uint8_t>(block[i] >> (8 * j));
+}
+
+__global__ void block24576_prefix_launch(const std::uint8_t* header, std::uint8_t* out,
+                                         std::uint64_t* memory) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) return;
+  std::uint8_t h0[kH0Len];
+  h0_kernel(header, h0);
+  initial_block(h0, 0, 0, memory);
+  initial_block(h0, 1, 0, memory + 128);
+  brc_argon2::fill_lane(memory);
+  const std::uint64_t* block = memory + 24576 * 128;
+  for (int i = 0; i < 8; ++i)
+    for (int j = 0; j < 8; ++j)
+      out[i * 8 + j] = static_cast<std::uint8_t>(block[i] >> (8 * j));
+}
+
+__global__ void block32767_prefix_launch(const std::uint8_t* header, std::uint8_t* out,
+                                         std::uint64_t* memory) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) return;
+  std::uint8_t h0[kH0Len];
+  h0_kernel(header, h0);
+  initial_block(h0, 0, 0, memory);
+  initial_block(h0, 1, 0, memory + 128);
+  brc_argon2::fill_lane(memory);
+  const std::uint64_t* block = memory + 32767 * 128;
+  for (int i = 0; i < 8; ++i)
+    for (int j = 0; j < 8; ++j)
+      out[i * 8 + j] = static_cast<std::uint8_t>(block[i] >> (8 * j));
+}
+
+bool decode_hex(const char* s, std::vector<std::uint8_t>& out) {
+  const std::size_t n = std::strlen(s);
+  if (n % 2 != 0) return false;
+  out.resize(n / 2);
+  for (std::size_t i = 0; i < out.size(); ++i) {
+    unsigned x = 0;
+    if (std::sscanf(s + i * 2, "%2x", &x) != 1) return false;
+    out[i] = static_cast<std::uint8_t>(x);
+  }
+  return true;
+}
+
+void print_hex(const std::uint8_t* p, std::size_t n) {
+  for (std::size_t i = 0; i < n; ++i) std::printf("%02x", p[i]);
+  std::putchar('\n');
+}
+
+} // namespace
+
+#include "include/brc_argon_cuda.h"
+
+struct brc_argon_cuda_context {
+  int device;
+  std::uint8_t* d_header = nullptr;
+  std::uint8_t* d_out = nullptr;
+  std::uint8_t* d_target = nullptr;
+  std::uint8_t* d_digests = nullptr;
+  std::uint8_t* d_valid = nullptr;
+  std::uint64_t* d_memory = nullptr;
+  std::size_t memory_jobs = 0;
+};
+
+namespace {
+thread_local char g_api_error[256] = "ok";
+
+int api_error(const char* message) {
+  std::snprintf(g_api_error, sizeof(g_api_error), "%s", message);
+  return -1;
+}
+
+int api_cuda_error(const char* operation, cudaError_t error) {
+  std::snprintf(g_api_error, sizeof(g_api_error), "%s: %s", operation,
+                cudaGetErrorString(error));
+  return -1;
+}
+
+bool api_set_device(const brc_argon_cuda_context* context) {
+  return context != nullptr && cudaSetDevice(context->device) == cudaSuccess;
+}
+
+bool api_ensure_workspace(brc_argon_cuda_context* context, std::size_t jobs) {
+  const std::size_t words = static_cast<std::size_t>(brc_argon2::kMemoryBlocks) * 128;
+  cudaError_t error = cudaSuccess;
+  if (context->d_header == nullptr) error = cudaMalloc(&context->d_header, kHeaderLen);
+  if (error == cudaSuccess && context->d_out == nullptr) error = cudaMalloc(&context->d_out, 32);
+  if (error == cudaSuccess && context->d_target == nullptr) error = cudaMalloc(&context->d_target, 32);
+  if (error == cudaSuccess && context->d_memory == nullptr) {
+    error = cudaMalloc(&context->d_memory, jobs * words * sizeof(std::uint64_t));
+    if (error == cudaSuccess) context->memory_jobs = jobs;
+  }
+  if (error == cudaSuccess && jobs > context->memory_jobs) {
+    cudaFree(context->d_memory);
+    context->d_memory = nullptr;
+    error = cudaMalloc(&context->d_memory, jobs * words * sizeof(std::uint64_t));
+    if (error == cudaSuccess) context->memory_jobs = jobs;
+  }
+  if (error == cudaSuccess && context->d_digests == nullptr)
+    error = cudaMalloc(&context->d_digests, BRC_ARGON_CUDA_MAX_BATCH * 32);
+  if (error == cudaSuccess && context->d_valid == nullptr)
+    error = cudaMalloc(&context->d_valid, BRC_ARGON_CUDA_MAX_BATCH);
+  if (error != cudaSuccess) {
+    api_cuda_error("CUDA workspace allocation", error);
+    return false;
+  }
+  return true;
+}
+} // namespace
+
+extern "C" int brc_argon_cuda_create(brc_argon_cuda_context** context, int device) {
+  if (context == nullptr) return api_error("context output is null");
+  int count = 0;
+  cudaError_t error = cudaGetDeviceCount(&count);
+  if (error != cudaSuccess) return api_cuda_error("cudaGetDeviceCount", error);
+  if (count == 0) return api_error("no CUDA devices found");
+  if (device < 0) device = 0;
+  if (device >= count) return api_error("CUDA device index out of range");
+  error = cudaSetDevice(device);
+  if (error != cudaSuccess) return api_cuda_error("cudaSetDevice", error);
+  *context = new brc_argon_cuda_context{device};
+  std::snprintf(g_api_error, sizeof(g_api_error), "ok");
+  return 0;
+}
+
+extern "C" void brc_argon_cuda_destroy(brc_argon_cuda_context* context) {
+  if (context == nullptr) return;
+  cudaSetDevice(context->device);
+  cudaFree(context->d_header);
+  cudaFree(context->d_out);
+  cudaFree(context->d_target);
+  cudaFree(context->d_digests);
+  cudaFree(context->d_valid);
+  cudaFree(context->d_memory);
+  delete context;
+}
+
+extern "C" int brc_argon_cuda_hash(
+    brc_argon_cuda_context* context,
+    const std::uint8_t header[kHeaderLen],
+    std::uint8_t digest[32]) {
+  if (context == nullptr || header == nullptr || digest == nullptr)
+    return api_error("null hash argument");
+  if (!api_set_device(context)) return api_error("invalid CUDA context");
+  if (!api_ensure_workspace(context, 1)) return -1;
+  cudaError_t error = cudaSuccess;
+  if (error == cudaSuccess) error = cudaMemcpy(context->d_header, header, kHeaderLen, cudaMemcpyHostToDevice);
+  if (error == cudaSuccess) {
+    argon2_launch<<<1, 1>>>(context->d_header, context->d_out, context->d_memory);
+    error = cudaGetLastError();
+  }
+  if (error == cudaSuccess) error = cudaDeviceSynchronize();
+  if (error == cudaSuccess) error = cudaMemcpy(digest, context->d_out, 32, cudaMemcpyDeviceToHost);
+  if (error != cudaSuccess) return api_cuda_error("CUDA hash", error);
+  std::snprintf(g_api_error, sizeof(g_api_error), "ok");
+  return 0;
+}
+
+extern "C" int brc_argon_cuda_mine_batch(
+    brc_argon_cuda_context* context,
+    const std::uint8_t header[kHeaderLen],
+    std::uint32_t nonce_start,
+    std::uint32_t count,
+    const std::uint8_t target[32],
+    brc_argon_cuda_share* share) {
+  if (context == nullptr || header == nullptr || target == nullptr || share == nullptr)
+    return api_error("null mining argument");
+  if (count == 0 || count > BRC_ARGON_CUDA_MAX_BATCH)
+    return api_error("batch count out of range");
+  if (nonce_start > 0xffffffffu - (count - 1))
+    return api_error("nonce range exceeds uint32");
+  if (!api_set_device(context)) return api_error("invalid CUDA context");
+  if (!api_ensure_workspace(context, count)) return -1;
+  cudaError_t error = cudaMemcpy(context->d_header, header, kHeaderLen, cudaMemcpyHostToDevice);
+  if (error == cudaSuccess) error = cudaMemcpy(context->d_target, target, 32, cudaMemcpyHostToDevice);
+  std::vector<std::uint8_t> digests(static_cast<std::size_t>(count) * 32);
+  std::vector<std::uint8_t> valid(count);
+  if (error == cudaSuccess) {
+    mine_batch_coop_launch<<<(count + 3) / 4, 128>>>(
+        context->d_header, nonce_start, count, context->d_target,
+        context->d_memory, context->d_digests, context->d_valid);
+    error = cudaGetLastError();
+  }
+  if (error == cudaSuccess) error = cudaDeviceSynchronize();
+  if (error == cudaSuccess) error = cudaMemcpy(digests.data(), context->d_digests,
+                                                digests.size(), cudaMemcpyDeviceToHost);
+  if (error == cudaSuccess) error = cudaMemcpy(valid.data(), context->d_valid,
+                                                valid.size(), cudaMemcpyDeviceToHost);
+  if (error != cudaSuccess) return api_cuda_error("CUDA batch mine", error);
+  for (std::uint32_t i = 0; i < count; ++i) {
+    if (!valid[i]) continue;
+    share->nonce = nonce_start + i;
+    std::memcpy(share->digest, digests.data() + static_cast<std::size_t>(i) * 32, 32);
+    std::snprintf(g_api_error, sizeof(g_api_error), "ok");
+    return 0;
+  }
+  std::snprintf(g_api_error, sizeof(g_api_error), "no share");
+  return 1;
+}
+
+extern "C" const char* brc_argon_cuda_last_error(void) {
+  return g_api_error;
+}
+
+#ifndef BRC_ARGON_CUDA_LIBRARY
+int main(int argc, char** argv) {
+  if (argc == 2 && std::strcmp(argv[1], "diagnose") == 0) {
+    int count = 0;
+    cudaError_t e = cudaGetDeviceCount(&count);
+    std::printf("cudaGetDeviceCount: %s (%d)\n", cudaGetErrorString(e), count);
+    if (e != cudaSuccess || count == 0) return 1;
+    cudaDeviceProp prop{};
+    e = cudaGetDeviceProperties(&prop, 0);
+    std::printf("cudaGetDeviceProperties: %s\n", cudaGetErrorString(e));
+    if (e != cudaSuccess) return 1;
+    std::printf("device: %s, compute_%d%d, memory=%zu MiB\n", prop.name,
+                prop.major, prop.minor, prop.totalGlobalMem / (1024 * 1024));
+    std::uint32_t* d_result = nullptr;
+    std::uint32_t result = 0;
+    e = cudaMalloc(&d_result, sizeof(result));
+    std::printf("cudaMalloc: %s\n", cudaGetErrorString(e));
+    if (e != cudaSuccess) return 1;
+    diagnostic_launch<<<1, 1>>>(d_result);
+    e = cudaGetLastError();
+    std::printf("kernel launch: %s\n", cudaGetErrorString(e));
+    if (e == cudaSuccess) e = cudaDeviceSynchronize();
+    std::printf("cudaDeviceSynchronize: %s\n", cudaGetErrorString(e));
+    if (e == cudaSuccess) e = cudaMemcpy(&result, d_result, sizeof(result), cudaMemcpyDeviceToHost);
+    std::printf("cudaMemcpy: %s, sentinel=0x%08x\n", cudaGetErrorString(e), result);
+    cudaFree(d_result);
+    return e == cudaSuccess && result == 0xB2C0128u ? 0 : 1;
+  }
+  const bool prefix = argc == 3 && (std::strcmp(argv[1], "init-prefix") == 0
+                                    || std::strcmp(argv[1], "init1-prefix") == 0);
+  const bool block2 = argc == 3 && std::strcmp(argv[1], "block2-prefix") == 0;
+  const bool block3 = argc == 3 && std::strcmp(argv[1], "block3-prefix") == 0;
+  const bool block130 = argc == 3 && std::strcmp(argv[1], "block130-prefix") == 0;
+  const bool block8192 = argc == 3 && std::strcmp(argv[1], "block8192-prefix") == 0;
+  const bool block16384 = argc == 3 && std::strcmp(argv[1], "block16384-prefix") == 0;
+  const bool block24576 = argc == 3 && std::strcmp(argv[1], "block24576-prefix") == 0;
+  const bool block32767 = argc == 3 && std::strcmp(argv[1], "block32767-prefix") == 0;
+  const bool tail = argc == 3 && std::strcmp(argv[1], "init-tail") == 0;
+  const bool end = argc == 3 && std::strcmp(argv[1], "init-end") == 0;
+  const bool mine = argc == 6 && std::strcmp(argv[1], "mine") == 0;
+  const bool bench = argc == 6 && std::strcmp(argv[1], "bench") == 0;
+  const bool batch_mode = mine || bench;
+  if ((!batch_mode && argc != 3) || (batch_mode ? false : (!prefix && !block2 && !block3 && !block130 && !block8192 && !block16384 && !block24576 && !block32767 && !tail && !end && std::strcmp(argv[1], "h0") != 0 && std::strcmp(argv[1], "hash") != 0))) {
+    std::fprintf(stderr, "usage: brc-pow-cuda diagnose | h0 | init-prefix | init1-prefix | init-tail | init-end | block2-prefix | block3-prefix | block130-prefix | block8192-prefix | block16384-prefix | block24576-prefix | block32767-prefix | hash <148-byte-header-hex> | mine <148-byte-header-hex> <nonce-start> <count> <target-hex> | bench <148-byte-header-hex> <nonce-start> <count> <rounds>\n");
+    return 2;
+  }
+  std::vector<std::uint8_t> header;
+  if (!decode_hex(argv[2], header) || header.size() != kHeaderLen) {
+    std::fprintf(stderr, "header must be exactly 148 bytes of hex\n");
+    return 2;
+  }
+  std::uint64_t nonce_start = 0;
+  std::uint32_t mine_count = 0;
+  std::vector<std::uint8_t> target;
+  std::uint32_t rounds = 0;
+  if (batch_mode) {
+    char* endptr = nullptr;
+    const unsigned long long parsed_start = std::strtoull(argv[3], &endptr, 0);
+    if (!endptr || *endptr != '\0' || parsed_start > 0xffffffffULL) {
+      std::fprintf(stderr, "nonce-start must be a uint32\n");
+      return 2;
+    }
+    const unsigned long long parsed_count = std::strtoull(argv[4], &endptr, 0);
+    if (!endptr || *endptr != '\0' || parsed_count == 0 || parsed_count > BRC_ARGON_CUDA_MAX_BATCH) {
+      std::fprintf(stderr, "count must be between 1 and %u\n", BRC_ARGON_CUDA_MAX_BATCH);
+      return 2;
+    }
+    if (mine) {
+      if (!decode_hex(argv[5], target) || target.size() != 32) {
+        std::fprintf(stderr, "target must be exactly 32 bytes of hex\n");
+        return 2;
+      }
+    } else {
+      char* rounds_end = nullptr;
+      const unsigned long long parsed_rounds = std::strtoull(argv[5], &rounds_end, 0);
+      if (!rounds_end || *rounds_end != '\0' || parsed_rounds == 0 || parsed_rounds > 1000) {
+        std::fprintf(stderr, "rounds must be between 1 and 1000\n");
+        return 2;
+      }
+      target.assign(32, 0xff);
+      rounds = static_cast<std::uint32_t>(parsed_rounds);
+    }
+    nonce_start = static_cast<std::uint64_t>(parsed_start);
+    mine_count = static_cast<std::uint32_t>(parsed_count);
+    if (nonce_start + mine_count - 1 > 0xffffffffULL) {
+      std::fprintf(stderr, "nonce range exceeds uint32\n");
+      return 2;
+    }
+  }
+  std::uint8_t *d_header = nullptr, *d_out = nullptr;
+  std::uint8_t out[kH0Len]{};
+  std::uint64_t* d_memory = nullptr;
+  std::uint8_t* d_target = nullptr;
+  std::uint8_t* d_batch_digests = nullptr;
+  std::uint8_t* d_batch_valid = nullptr;
+  auto check = [](cudaError_t e) { return e == cudaSuccess; };
+  const bool full_hash = std::strcmp(argv[1], "hash") == 0;
+  const std::size_t output_len = full_hash ? 32 : kH0Len;
+  const bool needs_memory = full_hash || block2 || block3 || block130 || block8192 || block16384 || block24576 || block32767;
+  const std::size_t words_per_job = static_cast<std::size_t>(brc_argon2::kMemoryBlocks) * 128;
+  const std::size_t memory_jobs = batch_mode ? mine_count : 1;
+  if (!check(cudaMalloc(&d_header, header.size()))
+      || (!batch_mode && !check(cudaMalloc(&d_out, output_len)))
+      || (needs_memory && !batch_mode && !check(cudaMalloc(&d_memory, words_per_job * sizeof(std::uint64_t))))
+      || (batch_mode && (!check(cudaMalloc(&d_target, target.size()))
+                   || !check(cudaMalloc(&d_batch_digests, memory_jobs * 32))
+                   || !check(cudaMalloc(&d_batch_valid, memory_jobs))
+                   || !check(cudaMalloc(&d_memory, memory_jobs * words_per_job * sizeof(std::uint64_t)))))
+      || !check(cudaMemcpy(d_header, header.data(), header.size(), cudaMemcpyHostToDevice))
+      || (batch_mode && !check(cudaMemcpy(d_target, target.data(), target.size(), cudaMemcpyHostToDevice)))) {
+    std::fprintf(stderr, "CUDA allocation/copy failed\n");
+    cudaFree(d_header); cudaFree(d_out); cudaFree(d_memory); cudaFree(d_target);
+    cudaFree(d_batch_digests); cudaFree(d_batch_valid); return 1;
+  }
+  if (bench) {
+    const auto begin = std::chrono::steady_clock::now();
+    for (std::uint32_t round = 0; round < rounds; ++round) {
+      mine_batch_coop_launch<<<(mine_count + 3) / 4, 128>>>(
+          d_header, nonce_start, mine_count, d_target, d_memory,
+          d_batch_digests, d_batch_valid);
+      if (!check(cudaGetLastError()) || !check(cudaDeviceSynchronize())) {
+        std::fprintf(stderr, "CUDA benchmark failed: %s\n", cudaGetErrorString(cudaGetLastError()));
+        cudaFree(d_header); cudaFree(d_memory); cudaFree(d_target);
+        cudaFree(d_batch_digests); cudaFree(d_batch_valid); return 1;
+      }
+    }
+    const auto end_time = std::chrono::steady_clock::now();
+    const double seconds = std::chrono::duration<double>(end_time - begin).count();
+    const double hashes = static_cast<double>(mine_count) * rounds;
+    std::printf("bench count=%u rounds=%u elapsed=%.3f sec hashes_per_sec=%.3f\n",
+                mine_count, rounds, seconds, hashes / seconds);
+    cudaFree(d_header); cudaFree(d_memory); cudaFree(d_target);
+    cudaFree(d_batch_digests); cudaFree(d_batch_valid);
+    return 0;
+  }
+  if (mine) {
+    mine_batch_coop_launch<<<(mine_count + 3) / 4, 128>>>(
+        d_header, nonce_start, mine_count, d_target, d_memory, d_batch_digests, d_batch_valid);
+  } else if (full_hash) argon2_launch<<<1, 1>>>(d_header, d_out, d_memory);
+  else if (block2) block2_prefix_launch<<<1, 1>>>(d_header, d_out, d_memory);
+  else if (block3) block3_prefix_launch<<<1, 1>>>(d_header, d_out, d_memory);
+  else if (block130) block130_prefix_launch<<<1, 1>>>(d_header, d_out, d_memory);
+  else if (block8192) block8192_prefix_launch<<<1, 1>>>(d_header, d_out, d_memory);
+  else if (block16384) block16384_prefix_launch<<<1, 1>>>(d_header, d_out, d_memory);
+  else if (block24576) block24576_prefix_launch<<<1, 1>>>(d_header, d_out, d_memory);
+  else if (block32767) block32767_prefix_launch<<<1, 1>>>(d_header, d_out, d_memory);
+  else if (end) initial_end_launch<<<1, 1>>>(d_header, d_out);
+  else if (tail) initial_tail_launch<<<1, 1>>>(d_header, d_out);
+  else if (prefix) initial_prefix_launch<<<1, 1>>>(d_header, d_out,
+                                                    std::strcmp(argv[1], "init1-prefix") == 0 ? 1 : 0);
+  else h0_launch<<<1, 1>>>(d_header, d_out);
+  if (!check(cudaGetLastError()) || !check(cudaDeviceSynchronize())) {
+    std::fprintf(stderr, "CUDA H0 execution failed: %s\n", cudaGetErrorString(cudaGetLastError()));
+    cudaFree(d_header); cudaFree(d_out); cudaFree(d_memory); cudaFree(d_target);
+    cudaFree(d_batch_digests); cudaFree(d_batch_valid); return 1;
+  }
+  if (mine) {
+    std::uint8_t batch_digests[BRC_ARGON_CUDA_MAX_BATCH * 32]{};
+    std::uint8_t batch_valid[BRC_ARGON_CUDA_MAX_BATCH]{};
+    if (!check(cudaMemcpy(batch_digests, d_batch_digests, mine_count * 32,
+                          cudaMemcpyDeviceToHost))
+        || !check(cudaMemcpy(batch_valid, d_batch_valid, mine_count,
+                             cudaMemcpyDeviceToHost))) {
+      std::fprintf(stderr, "CUDA result copy failed\n");
+      return 1;
+    }
+    std::uint32_t found_index = mine_count;
+    for (std::uint32_t i = 0; i < mine_count; ++i) {
+      if (batch_valid[i]) {
+        found_index = i;
+        break;
+      }
+    }
+    if (found_index == mine_count) {
+      std::printf("no-share\n");
+    } else {
+      std::printf("nonce=%llu digest=", static_cast<unsigned long long>(nonce_start + found_index));
+      print_hex(batch_digests + found_index * 32, 32);
+    }
+    cudaFree(d_header); cudaFree(d_out); cudaFree(d_memory); cudaFree(d_target);
+    cudaFree(d_batch_digests); cudaFree(d_batch_valid);
+    return 0;
+  }
+  if (!check(cudaMemcpy(out, d_out, output_len, cudaMemcpyDeviceToHost))) {
+    std::fprintf(stderr, "CUDA H0 execution failed: %s\n", cudaGetErrorString(cudaGetLastError()));
+    cudaFree(d_header); cudaFree(d_out); cudaFree(d_memory); return 1;
+  }
+  print_hex(out, output_len);
+  cudaFree(d_header); cudaFree(d_out); cudaFree(d_memory);
+  return 0;
+}
+#endif

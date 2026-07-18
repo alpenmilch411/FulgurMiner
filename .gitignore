@@ -6,3 +6,15 @@ native/brc-pow/target/
 .fulgurminer/
 *.log
 .DS_Store
+cuda-poc/reference/Cargo.lock
+cuda-poc/reference/target/
+cuda-poc/brc-pow-cuda
+cuda-poc/brc-argon-cuda-helper
+cuda-poc/brc-argon-local
+cuda-poc/device-probe
+cuda-poc/h0-reference
+cuda-poc/block2-host
+cuda-poc/reference-vectors
+cuda-poc/library-smoke
+cuda-poc/brc_argon_cuda.o
+cuda-poc/libbrc-argon-cuda.a

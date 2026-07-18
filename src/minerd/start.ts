@@ -139,7 +139,9 @@ function wantTui(argv: string[]): boolean {
  * pickers do.
  */
 export function buildStatus(cfg: ReturnType<typeof loadConfig>): ReporterStatus {
-  const backend: 'wasm' | 'native' = currentEngine(process.env.MINER_NATIVE);
+  const cudaSelected = process.env.MINER_CUDA !== undefined
+    && process.env.MINER_CUDA.trim() !== '' && process.env.MINER_CUDA.trim() !== '0';
+  const backend: 'wasm' | 'native' | 'cuda' = cudaSelected ? 'cuda' : currentEngine(process.env.MINER_NATIVE);
   if (!cfg.poolUrl) {
     return { mode: 'solo', target: 'solo', backend, workers: cfg.workers, throttle: cfg.throttle, address: cfg.minerPubkeyHex };
   }
