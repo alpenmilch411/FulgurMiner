@@ -800,8 +800,13 @@ export async function runPoolClient(
     // at a stale job, so no in-flight share keeps submitting under a job we're no
     // longer mining. It is re-asserted only AFTER a successful start, below.
     activeJobId = null;
-    pool.stop();
+    // CUDA replaces the job through its START protocol while retaining the
+    // helper process/context. CPU/WASM pools still need an explicit stop.
+    if (!(pool instanceof CudaGrindPool)) pool.stop();
     lastNonzeroTickAt = Date.now();
+    if (pool instanceof CudaGrindPool) {
+      reporter.event('info', `[pool-miner] CUDA_POOL_JOB id=${j.jobId}`);
+    }
     pool.start(
       hexToBytes(j.headerHex),
       j.shareTargetHex,
@@ -816,6 +821,12 @@ export async function runPoolClient(
         reporter.event('info', '[pool-miner] nonce slot exhausted — requesting fresh work');
         exhaustedKey = lastKey;
         lastKey = null;
+        // Do not keep advertising the exhausted job via ?have. A plain /job
+        // request lets the pool issue a fresh nonce slot even when the block
+        // template/job ID itself has not changed.
+        activeJobId = null;
+        forcePlainPoll = true;
+        currentCycle?.abort(new DOMException('nonce slot exhausted', 'WakeError'));
       },
       (err) => reporter.event('warn', `[pool-miner] grind error: ${err.message}`),
       j.nonceStart, // honor the pool's per-worker slot — out-of-slot nonces are

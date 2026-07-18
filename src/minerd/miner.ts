@@ -13,6 +13,7 @@ import { ChainSync } from './sync.js';
 import { buildTemplate, type Template } from './template.js';
 import { GrindPool } from './grindPool.js';
 import { NativeGrindPool } from './nativeGrindPool.js';
+import { CudaGrindPool, cudaRuntimeAvailable } from './cudaGrindPool.js';
 import { submitSoloBlock } from './submitSolo.js';
 import { ConsoleReporter, type MinerReporter, type ReporterStatus } from './reporter.js';
 import { restoreSnapshot, saveSnapshot, deleteSnapshot } from './persistence.js';
@@ -137,8 +138,8 @@ const SAVE_EVERY_MS = 60_000;
 // file, full-sync this session) rather than hanging unresponsive.
 const SNAPSHOT_CONFIRM_TIMEOUT_MS = 15_000;
 
-/** The subset of the grind-pool surface that runMiner depends on. Both the
- *  default worker_threads GrindPool and the native NativeGrindPool implement it. */
+/** The subset of the grind-pool surface that runMiner depends on. The WASM,
+ * native, and CUDA grinders all implement it. */
 interface GrindPoolLike {
   start(
     headerBytes: Uint8Array,
@@ -147,6 +148,9 @@ interface GrindPoolLike {
     onHashrate: (hps: number) => void,
     onExhausted?: () => void,
     onError?: (err: Error) => void,
+    nonceStart?: number,
+    nonceEnd?: number,
+    continuous?: boolean,
   ): void;
   stop(): void;
   setThrottle(throttle: number): void;
@@ -595,17 +599,23 @@ export async function runMiner(
   // Run below normal priority so foreground apps always win the CPU (safeguard).
   try { os.setPriority(10); } catch { /* not permitted on some platforms — ignore */ }
   // Default = worker_threads + WASM GrindPool (byte-unchanged behavior).
+  // CUDA is opt-in and can be used for both pool and solo grinding. If its
+  // helper/runtime is unavailable, retain the existing native/WASM fallback.
+  const cudaRequested = !!process.env.MINER_CUDA;
+  const useCuda = cudaRequested && cudaRuntimeAvailable();
   // Set MINER_NATIVE to use the native Rust grind processes instead (same
   // interface, parity-equivalent solutions, one OS process per nonce range).
-  const useNative = !!process.env.MINER_NATIVE;
+  const useNative = !useCuda && !!process.env.MINER_NATIVE;
   // Smart modes set their OWN starting duty cycle from the mode (Max=100%,
   // Considerate=50%); only Manual uses cfg.throttle. Seeding from cfg.throttle made
   // Smart Max start at a lowered manual throttle and ramp up slowly instead of
   // going straight to full — see smartStartDuty().
   const startDuty = smartStartDuty(cfg.smart, cfg.throttle);
-  const pool: GrindPoolLike = useNative
-    ? new NativeGrindPool(cfg.workers, startDuty)
-    : new GrindPool(cfg.workers, startDuty);
+  const pool: GrindPoolLike = useCuda
+    ? new CudaGrindPool(cfg.workers, startDuty)
+    : useNative
+      ? new NativeGrindPool(cfg.workers, startDuty)
+      : new GrindPool(cfg.workers, startDuty);
   const smartController = cfg.smart !== 'off'
     ? new SmartController(
       pool,
@@ -627,8 +637,14 @@ export async function runMiner(
   const status: ReporterStatus = {
     mode: 'solo',
     target: 'solo',
-    backend: useNative ? 'native' : 'wasm',
-    workers: cfg.workers,
+    backend: useCuda ? 'cuda' : useNative ? 'native' : 'wasm',
+    backendNote: cudaRequested && !useCuda
+      ? 'CUDA requested but unavailable; falling back to the selected CPU backend.'
+      : undefined,
+    // CUDA uses one helper process and its own VRAM-resident batch lanes; the
+    // CPU worker count is not active in this mode and should not be displayed
+    // as if 31 CPU workers were hashing.
+    workers: useCuda ? 1 : cfg.workers,
     // The effective starting duty cycle: mode-derived in Smart, the manual value in
     // 'off'. (Not cfg.throttle — that would print the leftover manual throttle while
     // Smart Max actually starts at 100%.)

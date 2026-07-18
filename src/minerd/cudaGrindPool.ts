@@ -62,6 +62,7 @@ export class CudaGrindPool {
   private onError: CudaError = () => {};
   private onInfo: CudaInfo = () => {};
   private throttle: number;
+  private jobToken = 0;
 
   constructor(
     _workerCount: number,
@@ -92,9 +93,12 @@ export class CudaGrindPool {
     nonceEnd = NONCE_SPACE,
     continuous = false,
   ): void {
-    this.stop();
+    const existing = this.child;
+    const reuse = !this.stopping && existing !== null
+      && existing.exitCode === null && existing.signalCode === null
+      && existing.stdin.writable;
+    if (!reuse) this.stop();
     this.generation++;
-    const generation = this.generation;
     this.onSolved = onSolved;
     this.onHashrate = onHashrate;
     this.onExhausted = onExhausted;
@@ -112,31 +116,38 @@ export class CudaGrindPool {
       throw new Error('invalid CUDA nonce range');
     }
 
-    let child: ChildProcessWithoutNullStreams;
-    try {
-      child = spawn(this.helper, [], { stdio: ['pipe', 'pipe', 'pipe'] });
-    } catch (error) {
-      this.active = false;
-      throw error;
+    let child = existing;
+    if (!reuse) {
+      try {
+        child = spawn(this.helper, [], { stdio: ['pipe', 'pipe', 'pipe'] });
+      } catch (error) {
+        this.active = false;
+        throw error;
+      }
+      this.child = child;
+      this.stdout = createInterface({ input: child.stdout });
+      this.stderr = createInterface({ input: child.stderr });
+      this.stdout.on('line', (line) => this.handleStdout(line));
+      this.stderr.on('line', (line) => this.handleStderr(line));
+      child.on('error', (error) => {
+        if (this.child === child && !this.stopping) this.onError(error);
+      });
+      child.on('exit', (code, signal) => {
+        // A rapid stop/start can leave the old child's exit event queued after
+        // the replacement child is already installed. Never report that
+        // intentional old-process exit as a live helper failure.
+        if (this.child !== child || this.stopping) return;
+        this.active = false;
+        this.closeReaders();
+        this.child = null;
+        this.onError(new Error(`CUDA helper exited (code=${code}, signal=${signal ?? 'none'})`));
+      });
     }
-    this.child = child;
-    this.stdout = createInterface({ input: child.stdout });
-    this.stderr = createInterface({ input: child.stderr });
-    this.stdout.on('line', (line) => this.handleStdout(line, generation));
-    this.stderr.on('line', (line) => this.handleStderr(line, generation));
-    child.on('error', (error) => {
-      if (generation === this.generation && !this.stopping) this.onError(error);
-    });
-    child.on('exit', (code, signal) => {
-      if (generation !== this.generation || this.stopping) return;
-      this.active = false;
-      this.closeReaders();
-      this.child = null;
-      this.onError(new Error(`CUDA helper exited (code=${code}, signal=${signal ?? 'none'})`));
-    });
 
     const headerHex = Buffer.from(headerBytes).toString('hex');
-    child.stdin.write(`START ${headerHex} ${targetHex} ${nonceStart} ${nonceEnd} ${this.throttle} ${continuous ? 1 : 0} ${this.batchSize}\n`);
+    const token = ++this.jobToken;
+    if (!child) throw new Error('CUDA helper process was not available');
+    child.stdin.write(`START ${headerHex} ${targetHex} ${nonceStart} ${nonceEnd} ${this.throttle} ${continuous ? 1 : 0} ${this.batchSize} ${token}\n`);
   }
 
   stop(): void {
@@ -156,12 +167,13 @@ export class CudaGrindPool {
     this.stop();
   }
 
-  private handleStdout(line: string, generation: number): void {
-    if (generation !== this.generation || !this.active) return;
+  private handleStdout(line: string): void {
+    if (!this.active) return;
     const fields = line.trim().split(/\s+/);
-    if (fields[0] === 'SOLVED' && fields.length === 3) {
-      const nonce = Number(fields[1]);
-      const hashHex = fields[2]!;
+    if (fields[0] === 'SOLVED' && fields.length === 4) {
+      if (Number(fields[1]) !== this.jobToken) return;
+      const nonce = Number(fields[2]);
+      const hashHex = fields[3]!;
       if (!Number.isInteger(nonce) || nonce < 0 || nonce >= NONCE_SPACE || !HEX64.test(hashHex)) {
         this.onError(new Error('CUDA helper emitted an invalid SOLVED record'));
         return;
@@ -171,7 +183,8 @@ export class CudaGrindPool {
       } catch (error) {
         this.onError(error instanceof Error ? error : new Error(String(error)));
       }
-    } else if (fields[0] === 'EXHAUSTED') {
+    } else if (fields[0] === 'EXHAUSTED' && fields.length === 2) {
+      if (Number(fields[1]) !== this.jobToken) return;
       this.active = false;
       this.onExhausted();
     } else if (fields[0] === 'ERROR') {
@@ -179,15 +192,16 @@ export class CudaGrindPool {
     }
   }
 
-  private handleStderr(line: string, generation: number): void {
-    if (generation !== this.generation || !this.active) return;
+  private handleStderr(line: string): void {
+    if (!this.active) return;
     const fields = line.trim().split(/\s+/);
-    if (fields[0] === 'CUDA_BATCH' || fields[0] === 'CUDA_MODE') {
+    if (fields[0] === 'CUDA_BATCH' || fields[0] === 'CUDA_MODE' || fields[0] === 'CUDA_JOB') {
       this.onInfo(line.trim());
       return;
     }
     if (fields[0] !== 'HASHRATE') return;
-    const hps = Number(fields[1]);
+    if (Number(fields[1]) !== this.jobToken) return;
+    const hps = Number(fields[2]);
     if (Number.isFinite(hps) && hps >= 0) this.onHashrate(hps);
   }
 

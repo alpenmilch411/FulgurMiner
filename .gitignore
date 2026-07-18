@@ -26,3 +26,5 @@ cuda-poc/experimental/persistent-best
 cuda-poc/experimental/lib*.so
 cuda-poc/brc_argon_cuda.o
 cuda-poc/libbrc-argon-cuda.a
+logs/*
+observability/data/

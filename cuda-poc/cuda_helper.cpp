@@ -28,6 +28,12 @@ std::atomic<bool> stop_requested{false};
 std::atomic<double> throttle{1.0};
 std::mutex output_mutex;
 std::uint64_t active_workspace_batch = 0;
+// Rebalance state must outlive an individual pool job. Pool templates can roll
+// every few seconds, while the safety interval intentionally spans 30 seconds.
+// Keeping this state here prevents every START from resetting the hysteresis.
+std::chrono::steady_clock::time_point last_rebalance_global{};
+std::uint32_t pending_batch_global = 0;
+std::uint32_t pending_observations_global = 0;
 
 int selected_device() {
   const char* raw = std::getenv("MINER_CUDA_DEVICE");
@@ -131,7 +137,7 @@ void print_error(const std::string& message) {
 void run_job(brc_argon_cuda_context* context, const std::string& header_hex,
              const std::string& target_hex, std::uint64_t start,
              std::uint64_t end, double initial_throttle, bool continuous,
-  std::uint32_t batch_limit) {
+             std::uint32_t batch_limit, std::uint64_t job_token) {
   std::uint8_t header[BRC_ARGON_CUDA_HEADER_BYTES]{};
   std::uint8_t target[BRC_ARGON_CUDA_DIGEST_BYTES]{};
   if (!decode_hex(header_hex, header, sizeof(header)) ||
@@ -144,6 +150,10 @@ void run_job(brc_argon_cuda_context* context, const std::string& header_hex,
     return;
   }
 
+  {
+    std::lock_guard lock(output_mutex);
+    std::cerr << "CUDA_JOB token=" << job_token << std::endl;
+  }
   throttle.store(std::max(0.05, std::min(1.0, initial_throttle)), std::memory_order_relaxed);
   std::uint32_t selected_batch = choose_batch(batch_limit);
   if (selected_batch == 0) {
@@ -158,9 +168,13 @@ void run_job(brc_argon_cuda_context* context, const std::string& header_hex,
     std::lock_guard lock(output_mutex);
     std::cerr << "CUDA_MODE persistent iterations=" << persistent_iterations << std::endl;
   }
-  auto last_rebalance = std::chrono::steady_clock::now();
-  std::uint32_t pending_batch = selected_batch;
-  std::uint32_t pending_observations = 0;
+  auto last_rebalance = last_rebalance_global;
+  if (last_rebalance.time_since_epoch().count() == 0) {
+    last_rebalance = std::chrono::steady_clock::now();
+    last_rebalance_global = last_rebalance;
+  }
+  std::uint32_t pending_batch = pending_batch_global == 0 ? selected_batch : pending_batch_global;
+  std::uint32_t pending_observations = pending_observations_global;
   std::uint64_t nonce = start;
   std::uint64_t hashes = 0;
   std::uint64_t last_report_hashes = 0;
@@ -184,6 +198,11 @@ void run_job(brc_argon_cuda_context* context, const std::string& header_hex,
       print_error(brc_argon_cuda_last_error());
       return;
     }
+    // An upward rebalance temporarily clears active_workspace_batch so the
+    // replacement allocation can be made without double-counting the old
+    // workspace. Once this first call succeeds, the new workspace is live and
+    // must be included in subsequent cudaMemGetInfo calculations.
+    active_workspace_batch = selected_batch;
     hashes += work_count;
 
     const auto rebalance_now = std::chrono::steady_clock::now();
@@ -203,6 +222,9 @@ void run_job(brc_argon_cuda_context* context, const std::string& header_hex,
           std::cerr << "CUDA_BATCH rebalance_pending=" << candidate
                     << " observations=" << pending_observations << std::endl;
           last_rebalance = rebalance_now;
+          last_rebalance_global = last_rebalance;
+          pending_batch_global = pending_batch;
+          pending_observations_global = pending_observations;
           continue;
         }
         // Move only one 16-nonce step per confirmed observation. This avoids
@@ -231,6 +253,9 @@ void run_job(brc_argon_cuda_context* context, const std::string& header_hex,
         pending_observations = 0;
       }
       last_rebalance = rebalance_now;
+      last_rebalance_global = last_rebalance;
+      pending_batch_global = pending_batch;
+      pending_observations_global = pending_observations;
     }
 
     const double duty = throttle.load(std::memory_order_relaxed);
@@ -245,7 +270,7 @@ void run_job(brc_argon_cuda_context* context, const std::string& header_hex,
     if (result == 0) {
       {
         std::lock_guard lock(output_mutex);
-        std::cout << "SOLVED " << share.nonce << " ";
+        std::cout << "SOLVED " << job_token << " " << share.nonce << " ";
         for (std::uint8_t byte : share.digest)
           std::cout << std::hex << std::setw(2) << std::setfill('0')
                     << static_cast<unsigned>(byte);
@@ -266,14 +291,14 @@ void run_job(brc_argon_cuda_context* context, const std::string& header_hex,
       std::lock_guard lock(output_mutex);
       const double rate = report_seconds > 0.0
           ? static_cast<double>(hashes - last_report_hashes) / report_seconds : 0.0;
-      std::cerr << "HASHRATE " << rate << std::endl;
+      std::cerr << "HASHRATE " << job_token << " " << rate << std::endl;
       last_report_hashes = hashes;
       last_report_at = report_now;
     }
   }
   if (!stop_requested.load(std::memory_order_relaxed)) {
     std::lock_guard lock(output_mutex);
-    std::cout << "EXHAUSTED" << std::endl;
+    std::cout << "EXHAUSTED " << job_token << std::endl;
   }
 }
 
@@ -309,14 +334,16 @@ int main(int argc, char** argv) {
 
   std::thread job;
   std::string line;
+  std::uint64_t next_job_token = 0;
   while (std::getline(std::cin, line)) {
     std::istringstream input(line);
     std::string command;
     input >> command;
     if (command == "START") {
-      std::string header, target, start_text, end_text, throttle_text, continuous_text, batch_text;
-      input >> header >> target >> start_text >> end_text >> throttle_text >> continuous_text >> batch_text;
+      std::string header, target, start_text, end_text, throttle_text, continuous_text, batch_text, token_text;
+      input >> header >> target >> start_text >> end_text >> throttle_text >> continuous_text >> batch_text >> token_text;
       std::uint64_t start = 0, end = 0;
+      std::uint64_t job_token = ++next_job_token;
       double duty = 1.0;
       std::uint64_t batch_value = 0; // 0 = select automatically from VRAM
       if (header.empty() || target.empty() || !parse_u64(start_text, start) ||
@@ -324,7 +351,11 @@ int main(int argc, char** argv) {
           (!batch_text.empty() && (!parse_u64(batch_text, batch_value)
                                    || batch_value > 0xffffffffULL)) ||
           (continuous_text != "0" && continuous_text != "1")) {
-        print_error("usage START <header> <target> <start> <end> <throttle> <continuous> <batch>");
+        print_error("usage START <header> <target> <start> <end> <throttle> <continuous> <batch> [token]");
+        continue;
+      }
+      if (!token_text.empty() && !parse_u64(token_text, job_token)) {
+        print_error("invalid START token");
         continue;
       }
       stop_requested.store(true, std::memory_order_relaxed);
@@ -332,7 +363,7 @@ int main(int argc, char** argv) {
       stop_requested.store(false, std::memory_order_relaxed);
       const bool continuous = continuous_text == "1";
       job = std::thread(run_job, context, header, target, start, end, duty, continuous,
-                        static_cast<std::uint32_t>(batch_value));
+                        static_cast<std::uint32_t>(batch_value), job_token);
     } else if (command == "THROTTLE") {
       std::string value;
       double duty = 1.0;

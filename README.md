@@ -225,6 +225,8 @@ Every option is an environment variable or a line in `.env.local` (written for y
 | `MINER_CUDA_PERSISTENT_ITERATIONS` | `8` | Batches processed per persistent launch; larger values improve launch amortization but delay job updates. |
 | `MINER_HELPERS` | `api1`/`api2.browsercoin.org` | Comma-separated API helper URLs for chain sync / solo mining. Each read tries them in turn and takes the first that answers, so one dead helper doesn't stop the miner tracking the tip. A helper that keeps failing gets demoted so reads stop leading with it; you get a warning when *every* helper fails a round. A blank or comma-only value falls back to the defaults. |
 | `MINER_DEBUG` | *(off)* | `MINER_DEBUG=1` adds debug lines — the per-helper read failures the miner recovered from on its own, plus snapshot notes. Env var only (`npm run mine` doesn't read `.env.local`). |
+| `MINER_LOG_FILE` | *(off)* | Optional append-only JSONL sidecar path. Console output remains enabled; structured events include hashrate, CUDA jobs/batches, shares, slot exhaustion, earnings, and blocks. |
+| `MINER_LOG_DIR` | *(off)* | Optional directory for one new timestamped JSONL event file per miner start. Created automatically; `MINER_LOG_FILE` takes precedence. |
 | `FULGUR_TUI` | *(auto)* | `0` forces plain logs; otherwise the TUI is used when stdout is a terminal. |
 | `FULGUR_NO_UPDATE_CHECK` | *(off)* | `1` disables the best-effort startup update check. |
 | `JOB_POLL_MS` | `1000` | Pool mode only: fallback polling interval (ms). When the pool supports long-poll, new work arrives instantly; otherwise the miner polls `/job` at this cadence. Clamped to `250`–`60000`. |
@@ -234,11 +236,20 @@ Every option is an environment variable or a line in `.env.local` (written for y
 # Solo-mine
 MINER_PUBKEY=<your-address> MINER_POOL=solo npm run mine
 
+# CUDA solo mining
+MINER_PUBKEY=<your-address> MINER_POOL=solo MINER_CUDA=1 npm run mine
+
 # Considerate smart mode, native engine
 MINER_PUBKEY=<your-address> MINER_SMART=considerate MINER_NATIVE=1 npm run mine
 
 # Mine at a specific pool
 MINER_PUBKEY=<your-address> MINER_POOL=https://pool.example.org npm run mine
+
+# Keep console output and write structured events to a JSONL sidecar
+MINER_LOG_FILE=miner-events.jsonl npm run mine
+
+# Create a separate timestamped file for this miner session
+MINER_LOG_DIR=logs npm run mine
 
 # Safe smoke test — syncs the chain, checks everything agrees, submits nothing
 MINER_PUBKEY=<your-address> npm run mine:dryrun
@@ -278,23 +289,30 @@ MINER_NATIVE=1 npm start
 
 ## CUDA engine (experimental)
 
-The CUDA engine reuses FulgurMiner's existing pool client and share
-submission path. Build the helper from the repository root on a compatible
+The CUDA engine reuses FulgurMiner's existing mining coordination and
+block/share submission paths. It can mine pool jobs or search the full nonce
+range for solo block templates. Build the helper from the repository root on a compatible
 NVIDIA system:
 
 ```bash
 make -C cuda-poc cuda-helper
 ./cuda-poc/brc-argon-cuda-helper --info
 MINER_CUDA=1 npm run mine
+# CUDA solo mining
+MINER_PUBKEY=<your-address> MINER_POOL=solo MINER_CUDA=1 npm run mine
 ```
 
 CUDA is opt-in. If the helper is missing or cannot initialize the NVIDIA
 runtime, the miner reports the reason and uses the portable WASM engine. The
-CUDA helper honors the pool-assigned nonce slot and does not implement a
-separate pool protocol. `MINER_CUDA_BATCH=32` is an example that limits the
+CUDA helper honors either the pool-assigned nonce slot or solo's full nonce
+range and does not implement a separate pool protocol. `MINER_CUDA_BATCH=32` is an example that limits the
 working set to roughly 1 GiB. `MINER_WORKERS` controls CPU workers and does not
 create additional CUDA contexts; the CUDA path uses one helper and one active
 batch at a time.
+
+Solo CUDA mining submits only complete blocks, not shares. Its expected block
+finding rate is the same as any other miner at the same hashrate, so long
+periods without a block are normal even when the local CUDA hashrate is high.
 
 The status bar shows `cuda`, `native`, or `wasm` so you can confirm which is active. If CUDA or native was selected but isn't usable, the dashboard says why and keeps mining with wasm.
 
