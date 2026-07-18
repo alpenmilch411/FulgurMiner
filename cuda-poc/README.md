@@ -133,9 +133,10 @@ big-endian `u32` at header offset 112, and a share is accepted only when the
 32-byte digest is strictly less than the target interpreted as a big-endian
 integer. The command prints `no-share` or the matching nonce and digest.
 
-The standalone pool miner is intentionally not wired yet; networking follows
-only after batched local mining and the reusable CUDA library boundary are
-stable.
+The production npm miner is now wired through the existing pool client and
+share-submission path. The CUDA helper remains focused on hashing; it does not
+duplicate pool networking. Start the integrated path from the repository root
+with `MINER_CUDA=1 npm run mine` after building the helper.
 
 On WSL2, successful access normally requires a current Windows NVIDIA driver
 with WSL GPU support. The session must expose `/dev/dxg`; `nvidia-smi` and the
