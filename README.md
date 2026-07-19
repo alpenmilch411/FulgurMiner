@@ -303,16 +303,74 @@ MINER_NATIVE=1 npm start
 
 The CUDA engine reuses FulgurMiner's existing mining coordination and
 block/share submission paths. It can mine pool jobs or search the full nonce
-range for solo block templates. Build the helper from the repository root on a compatible
-NVIDIA system:
+range for solo block templates.
+
+### CUDA quick setup (Linux)
+
+You need a CUDA-capable NVIDIA GPU and driver, Node.js 20.6+, Git, Make, a C++
+compiler, and the **CUDA 12.8 Toolkit**. First check that the driver can see the
+GPU:
 
 ```bash
-make -C cuda-poc cuda-helper
-./cuda-poc/brc-argon-cuda-helper --info
-MINER_CUDA=1 npm run mine
-# CUDA solo mining
-MINER_PUBKEY=<your-address> MINER_POOL=solo MINER_CUDA=1 npm run mine
+nvidia-smi
 ```
+
+Add NVIDIA's CUDA package repository for your exact distribution and release
+using the commands from the [CUDA 12.8 download
+archive](https://developer.nvidia.com/cuda-12-8-0-download-archive?target_os=Linux).
+Choose **Linux**, your architecture and distribution, then **deb (network)** or
+**rpm (network)**. After running the repository setup shown there, install the
+pinned toolkit and normal build tools:
+
+```bash
+# Ubuntu / Debian
+sudo apt update
+sudo apt install build-essential cuda-toolkit-12-8
+
+# Fedora (run these instead)
+sudo dnf install make gcc-c++ cuda-toolkit-12-8
+```
+
+CUDA 12.8 may reject the newer GCC shipped by some Fedora releases. If it does,
+install the GCC compatibility package recommended by NVIDIA's [CUDA 12.8 Linux
+guide](https://docs.nvidia.com/cuda/archive/12.8.0/cuda-installation-guide-linux/#gcc-compatibility-package-for-fedora)
+and set `NVCC_CCBIN` as shown there (for example, `g++-13` on Fedora 41).
+
+On Debian/Ubuntu, do not rely on the distro's unversioned
+`nvidia-cuda-toolkit` package: this build defaults to NVIDIA's versioned compiler at
+`/usr/local/cuda-12.8/bin/nvcc`. Confirm the toolchain, install the Node
+dependencies, build the helper, and run its validation:
+
+```bash
+/usr/local/cuda-12.8/bin/nvcc --version
+npm install
+make -C cuda-poc cuda-helper
+make -C cuda-poc cuda-check
+./cuda-poc/brc-argon-cuda-helper --info
+```
+
+The default build target is `sm_120`, validated on an RTX 5080. For another
+GPU, find its [CUDA compute
+capability](https://developer.nvidia.com/cuda-gpus), remove the decimal point,
+and override the target when building (for example,
+`make -C cuda-poc cuda-helper CUDA_ARCH=sm_89` for capability 8.9). Other GPU
+architectures are currently experimental.
+
+From the repository root, start the configured CUDA solo miner with:
+
+```bash
+MINER_CUDA=1 MINER_CUDA_DEVICE=0 \
+  MINER_CUDA_VRAM_RESERVE_MIB=2048 MINER_CUDA_BATCH=400 \
+  MINER_SMART=off MINER_THROTTLE=1 \
+  MINER_CUDA_PERSISTENT=1 MINER_CUDA_PERSISTENT_ITERATIONS=16 \
+  MINER_LOG_DIR=logs \
+  MINER_PUBKEY=aa507295d44c9338c1f9698ccd55cf8aaf217e14c91cb28ae735381fa46283a7 \
+  MINER_POOL=solo npm run mine
+```
+
+`MINER_CUDA_BATCH=400` is a cap for a high-VRAM card, not a guaranteed
+allocation; the helper lowers it when necessary to preserve the configured
+VRAM reserve and its allocation guard.
 
 CUDA is opt-in. If the helper is missing or cannot initialize the NVIDIA
 runtime, the miner reports the reason and uses the portable WASM engine. The
