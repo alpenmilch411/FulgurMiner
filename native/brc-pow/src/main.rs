@@ -196,6 +196,19 @@ pub fn pow_hash(password: &[u8]) -> Result<[u8; OUTPUT_LEN], String> {
     Ok(out)
 }
 
+/// Height-gated single hash: Sandglass v3 at/after the fork height, Argon2id
+/// below it. Mirrors the gate in src/crypto/pow.ts (powHash).
+fn pow_dispatch(header: &[u8]) -> Result<[u8; OUTPUT_LEN], String> {
+    if header.len() < 4 {
+        return Err(format!("header too short for height: {} bytes", header.len()));
+    }
+    if header_height(header) >= SANDGLASS_FORK_HEIGHT {
+        Ok(sandglass_hash(header))
+    } else {
+        pow_hash(header)
+    }
+}
+
 /// Write `nonce` as a big-endian u32 at NONCE_OFFSET of `header`.
 /// Mirrors writeNonceBE() in src/minerd/powWorker.ts byte-for-byte.
 #[inline]
@@ -258,10 +271,20 @@ fn grind(
         });
     }
 
+    // Height is constant across a grind range (only the nonce at offset 112
+    // varies), so pick the PoW engine ONCE. At/after the fork → Sandglass; below
+    // → Argon2id (byte-unchanged). Allocate only the scratch the chosen engine
+    // needs — the 32 MB Argon2 blocks OR the 512 KiB Sandglass buffer, never both.
+    let sandglass = header_height(&header) >= SANDGLASS_FORK_HEIGHT;
     let params = Params::new(MEM_KIB, ITERATIONS, PARALLELISM, Some(OUTPUT_LEN))
         .map_err(|e| format!("invalid argon2 params: {e}"))?;
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params.clone());
-    let mut blocks = vec![Block::new(); params.block_count()];
+    let mut blocks = if sandglass {
+        Vec::new()
+    } else {
+        vec![Block::new(); params.block_count()]
+    };
+    let mut sg_buf: Vec<u32> = if sandglass { vec![0u32; SG_W] } else { Vec::new() };
 
     let mut hashes_window: u64 = 0;
     let mut last_report = Instant::now();
@@ -273,10 +296,15 @@ fn grind(
     while nonce < end {
         write_nonce_be(&mut header, nonce as u32);
         let t0 = Instant::now();
-        let mut out = [0u8; OUTPUT_LEN];
-        argon2
-            .hash_password_into_with_memory(&header, SALT, &mut out, &mut blocks)
-            .map_err(|e| format!("argon2 hashing failed: {e}"))?;
+        let out = if sandglass {
+            sandglass_hash_into(&header, &mut sg_buf)
+        } else {
+            let mut o = [0u8; OUTPUT_LEN];
+            argon2
+                .hash_password_into_with_memory(&header, SALT, &mut o, &mut blocks)
+                .map_err(|e| format!("argon2 hashing failed: {e}"))?;
+            o
+        };
         let work = t0.elapsed();
         hashes_window += 1;
 
@@ -345,7 +373,7 @@ fn main() {
                 exit(2);
             }
             let header = decode_hex(&args[2]).unwrap_or_else(|e| fail(e));
-            match pow_hash(&header) {
+            match pow_dispatch(&header) {
                 Ok(digest) => println!("{}", to_hex(&digest)),
                 Err(e) => fail(e),
             }
@@ -423,5 +451,33 @@ mod sandglass_tests {
             let got = to_hex(&sandglass_hash(&header));
             assert_eq!(got, v.digest_hex, "Sandglass digest mismatch for header {}", v.header_hex);
         }
+    }
+
+    use super::{header_height, pow_dispatch, pow_hash, SANDGLASS_FORK_HEIGHT};
+
+    fn header_at_height(height: u32) -> Vec<u8> {
+        let mut h = vec![0u8; 148];
+        h[0] = (height >> 24) as u8;
+        h[1] = (height >> 16) as u8;
+        h[2] = (height >> 8) as u8;
+        h[3] = height as u8;
+        h
+    }
+
+    /// Anti-drift: the Rust gate must switch eras at EXACTLY SANDGLASS_FORK_HEIGHT
+    /// (mirroring genesis.ts). If this Rust const drifts from the TS one, the
+    /// boundary check in parity-harness.ts also catches it against the live TS gate.
+    #[test]
+    fn gate_switches_exactly_at_fork_height() {
+        let below = header_at_height(SANDGLASS_FORK_HEIGHT - 1);
+        let at = header_at_height(SANDGLASS_FORK_HEIGHT);
+        assert_eq!(header_height(&below), SANDGLASS_FORK_HEIGHT - 1);
+        assert_eq!(header_height(&at), SANDGLASS_FORK_HEIGHT);
+        // Below the fork → Argon2id path.
+        assert_eq!(pow_dispatch(&below).unwrap(), pow_hash(&below).unwrap());
+        // At/after the fork → Sandglass path.
+        assert_eq!(pow_dispatch(&at).unwrap(), sandglass_hash(&at));
+        // The two eras must differ for the same-shaped header.
+        assert_ne!(pow_dispatch(&below).unwrap(), pow_dispatch(&at).unwrap());
     }
 }
