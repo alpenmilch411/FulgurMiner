@@ -31,6 +31,7 @@
 //!        process — Node spawns one process per nonce range.
 
 use argon2::{Algorithm, Argon2, Block, Params, Version};
+use sha2::{Digest, Sha256};
 use std::io::BufRead;
 use std::process::exit;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -50,6 +51,104 @@ const OUTPUT_LEN: usize = 32;
 const NONCE_OFFSET: usize = 112;
 const HEADER_LEN: usize = 148;
 const HASHRATE_REPORT: Duration = Duration::from_millis(1000);
+
+// ─── Fork #2: Sandglass v3 PoW — mirrors src/crypto/sandglass.ts byte-for-byte ───
+// Any deviation → wrong digest → post-fork blocks rejected → wedge. The frozen
+// vectors (src/crypto/sandglass.vectors.json) are the ultimate arbiter.
+//
+// ⚠️ MUST match SANDGLASS_FORK_HEIGHT in src/chain/genesis.ts. Rust can't import
+// the TS constant; the boundary check in parity-harness.ts is the anti-drift gate.
+const SANDGLASS_FORK_HEIGHT: u32 = 33_550;
+
+const SG_W: usize = 1 << 17; // 131,072 u32 = 512 KiB
+const SG_MASK: u32 = (SG_W as u32) - 1; // 0x1FFFF
+const SG_STEPS: usize = 1 << 21; // 2,097,152 total dependent steps
+const SG_CHAINS: usize = 4;
+const SG_PER: usize = SG_STEPS / SG_CHAINS; // 524,288 steps per chain
+const GOLDEN: u32 = 0x9e37_79b9;
+
+/// lowbias32 32-bit finalizer — matches `mix` in sandglass.ts (all wrapping u32).
+#[inline(always)]
+fn sg_mix(mut x: u32) -> u32 {
+    x ^= x >> 16;
+    x = x.wrapping_mul(0x7feb_352d);
+    x ^= x >> 15;
+    x = x.wrapping_mul(0x846c_a68b);
+    x ^= x >> 16;
+    x
+}
+
+/// Block height = the header's first 4 bytes, u32 big-endian. Mirrors the gate in
+/// src/crypto/pow.ts and the encodeHeader layout.
+#[inline]
+fn header_height(header: &[u8]) -> u32 {
+    ((header[0] as u32) << 24)
+        | ((header[1] as u32) << 16)
+        | ((header[2] as u32) << 8)
+        | (header[3] as u32)
+}
+
+/// Sandglass core: fill `buf` (a reused 512 KiB heap scratch — never a stack
+/// array, which overflows a spawned grind worker thread) from SHA256(header) and
+/// run the 4-chain read-modify-write walk. Returns the 32-byte digest.
+///
+/// Mirrors `sandglassHash`/`fillAndWalk` in src/crypto/sandglass.ts exactly.
+fn sandglass_hash_into(header: &[u8], buf: &mut [u32]) -> [u8; OUTPUT_LEN] {
+    debug_assert_eq!(buf.len(), SG_W);
+    let digest = Sha256::digest(header);
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(&digest);
+
+    // The 8 words of the 256-bit seed (big-endian).
+    let mut sw = [0u32; 8];
+    for i in 0..8 {
+        sw[i] = u32::from_be_bytes([seed[i * 4], seed[i * 4 + 1], seed[i * 4 + 2], seed[i * 4 + 3]]);
+    }
+
+    // Phase 1 — fill. One seed word injected on EVERY step (cyclically), so the
+    // buffer — and the whole walk that reads it — is keyed by all 256 seed bits.
+    let mut h = sg_mix(sw[0] ^ GOLDEN);
+    for i in 0..SG_W {
+        h = sg_mix(h.wrapping_add(GOLDEN).wrapping_add(sw[i & 7]));
+        buf[i] = h;
+    }
+
+    // Init 4 chains from h (same derivation as the bench kernel).
+    let mut x = h;
+    x = sg_mix(x ^ 1); let mut a0 = sg_mix(x ^ GOLDEN); let mut i0 = (x & SG_MASK) as usize;
+    x = sg_mix(x ^ 2); let mut a1 = sg_mix(x ^ GOLDEN); let mut i1 = (x & SG_MASK) as usize;
+    x = sg_mix(x ^ 3); let mut a2 = sg_mix(x ^ GOLDEN); let mut i2 = (x & SG_MASK) as usize;
+    x = sg_mix(x ^ 4); let mut a3 = sg_mix(x ^ GOLDEN); let mut i3 = (x & SG_MASK) as usize;
+
+    // Phase 2 — 4 interleaved dependent read-modify-write walks.
+    for s in 0..SG_PER {
+        let s = s as u32;
+        a0 = sg_mix(a0 ^ buf[i0]); buf[i0] = a0.wrapping_add(s); i0 = (a0 & SG_MASK) as usize;
+        a1 = sg_mix(a1 ^ buf[i1]); buf[i1] = a1.wrapping_add(s); i1 = (a1 & SG_MASK) as usize;
+        a2 = sg_mix(a2 ^ buf[i2]); buf[i2] = a2.wrapping_add(s); i2 = (a2 & SG_MASK) as usize;
+        a3 = sg_mix(a3 ^ buf[i3]); buf[i3] = a3.wrapping_add(s); i3 = (a3 & SG_MASK) as usize;
+    }
+
+    // Phase 3 — finalize: SHA256(seed ‖ u32be(h) ‖ u32be(a0..a3)).
+    let mut fin = [0u8; 52];
+    fin[0..32].copy_from_slice(&seed);
+    fin[32..36].copy_from_slice(&h.to_be_bytes());
+    fin[36..40].copy_from_slice(&a0.to_be_bytes());
+    fin[40..44].copy_from_slice(&a1.to_be_bytes());
+    fin[44..48].copy_from_slice(&a2.to_be_bytes());
+    fin[48..52].copy_from_slice(&a3.to_be_bytes());
+    let out = Sha256::digest(fin);
+    let mut result = [0u8; OUTPUT_LEN];
+    result.copy_from_slice(&out);
+    result
+}
+
+/// Convenience wrapper that allocates its own 512 KiB scratch (for `hash` + tests;
+/// the grind loop reuses one buffer per process instead).
+fn sandglass_hash(header: &[u8]) -> [u8; OUTPUT_LEN] {
+    let mut buf = vec![0u32; SG_W];
+    sandglass_hash_into(header, &mut buf)
+}
 
 fn decode_hex(s: &str) -> Result<Vec<u8>, String> {
     let s = s.trim();
@@ -95,6 +194,19 @@ pub fn pow_hash(password: &[u8]) -> Result<[u8; OUTPUT_LEN], String> {
         .hash_password_into(password, SALT, &mut out)
         .map_err(|e| format!("argon2 hashing failed: {e}"))?;
     Ok(out)
+}
+
+/// Height-gated single hash: Sandglass v3 at/after the fork height, Argon2id
+/// below it. Mirrors the gate in src/crypto/pow.ts (powHash).
+fn pow_dispatch(header: &[u8]) -> Result<[u8; OUTPUT_LEN], String> {
+    if header.len() < 4 {
+        return Err(format!("header too short for height: {} bytes", header.len()));
+    }
+    if header_height(header) >= SANDGLASS_FORK_HEIGHT {
+        Ok(sandglass_hash(header))
+    } else {
+        pow_hash(header)
+    }
 }
 
 /// Write `nonce` as a big-endian u32 at NONCE_OFFSET of `header`.
@@ -159,10 +271,20 @@ fn grind(
         });
     }
 
+    // Height is constant across a grind range (only the nonce at offset 112
+    // varies), so pick the PoW engine ONCE. At/after the fork → Sandglass; below
+    // → Argon2id (byte-unchanged). Allocate only the scratch the chosen engine
+    // needs — the 32 MB Argon2 blocks OR the 512 KiB Sandglass buffer, never both.
+    let sandglass = header_height(&header) >= SANDGLASS_FORK_HEIGHT;
     let params = Params::new(MEM_KIB, ITERATIONS, PARALLELISM, Some(OUTPUT_LEN))
         .map_err(|e| format!("invalid argon2 params: {e}"))?;
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params.clone());
-    let mut blocks = vec![Block::new(); params.block_count()];
+    let mut blocks = if sandglass {
+        Vec::new()
+    } else {
+        vec![Block::new(); params.block_count()]
+    };
+    let mut sg_buf: Vec<u32> = if sandglass { vec![0u32; SG_W] } else { Vec::new() };
 
     let mut hashes_window: u64 = 0;
     let mut last_report = Instant::now();
@@ -174,10 +296,15 @@ fn grind(
     while nonce < end {
         write_nonce_be(&mut header, nonce as u32);
         let t0 = Instant::now();
-        let mut out = [0u8; OUTPUT_LEN];
-        argon2
-            .hash_password_into_with_memory(&header, SALT, &mut out, &mut blocks)
-            .map_err(|e| format!("argon2 hashing failed: {e}"))?;
+        let out = if sandglass {
+            sandglass_hash_into(&header, &mut sg_buf)
+        } else {
+            let mut o = [0u8; OUTPUT_LEN];
+            argon2
+                .hash_password_into_with_memory(&header, SALT, &mut o, &mut blocks)
+                .map_err(|e| format!("argon2 hashing failed: {e}"))?;
+            o
+        };
         let work = t0.elapsed();
         hashes_window += 1;
 
@@ -246,7 +373,7 @@ fn main() {
                 exit(2);
             }
             let header = decode_hex(&args[2]).unwrap_or_else(|e| fail(e));
-            match pow_hash(&header) {
+            match pow_dispatch(&header) {
                 Ok(digest) => println!("{}", to_hex(&digest)),
                 Err(e) => fail(e),
             }
@@ -295,5 +422,62 @@ fn main() {
             eprintln!("{USAGE}");
             exit(2);
         }
+    }
+}
+
+#[cfg(test)]
+mod sandglass_tests {
+    use super::{decode_hex, sandglass_hash, to_hex};
+
+    #[derive(serde::Deserialize)]
+    struct Vector {
+        #[serde(rename = "headerHex")]
+        header_hex: String,
+        #[serde(rename = "digestHex")]
+        digest_hex: String,
+    }
+
+    /// The Rust Sandglass core must reproduce the SAME frozen digests the TS side
+    /// pins (src/crypto/sandglass.vectors.json). One wrong bit fails here — this is
+    /// the Node-independent do-or-wedge gate on the Rust port. If the vectors are
+    /// regenerated upstream, re-copy the json (Task 2) and this test tracks it.
+    #[test]
+    fn reproduces_frozen_vectors() {
+        let raw = include_str!("../../../src/crypto/sandglass.vectors.json");
+        let vectors: Vec<Vector> = serde_json::from_str(raw).expect("parse vectors json");
+        assert!(vectors.len() >= 5, "expected >=5 frozen vectors, got {}", vectors.len());
+        for v in &vectors {
+            let header = decode_hex(&v.header_hex).expect("decode header hex");
+            let got = to_hex(&sandglass_hash(&header));
+            assert_eq!(got, v.digest_hex, "Sandglass digest mismatch for header {}", v.header_hex);
+        }
+    }
+
+    use super::{header_height, pow_dispatch, pow_hash, SANDGLASS_FORK_HEIGHT};
+
+    fn header_at_height(height: u32) -> Vec<u8> {
+        let mut h = vec![0u8; 148];
+        h[0] = (height >> 24) as u8;
+        h[1] = (height >> 16) as u8;
+        h[2] = (height >> 8) as u8;
+        h[3] = height as u8;
+        h
+    }
+
+    /// Anti-drift: the Rust gate must switch eras at EXACTLY SANDGLASS_FORK_HEIGHT
+    /// (mirroring genesis.ts). If this Rust const drifts from the TS one, the
+    /// boundary check in parity-harness.ts also catches it against the live TS gate.
+    #[test]
+    fn gate_switches_exactly_at_fork_height() {
+        let below = header_at_height(SANDGLASS_FORK_HEIGHT - 1);
+        let at = header_at_height(SANDGLASS_FORK_HEIGHT);
+        assert_eq!(header_height(&below), SANDGLASS_FORK_HEIGHT - 1);
+        assert_eq!(header_height(&at), SANDGLASS_FORK_HEIGHT);
+        // Below the fork → Argon2id path.
+        assert_eq!(pow_dispatch(&below).unwrap(), pow_hash(&below).unwrap());
+        // At/after the fork → Sandglass path.
+        assert_eq!(pow_dispatch(&at).unwrap(), sandglass_hash(&at));
+        // The two eras must differ for the same-shaped header.
+        assert_ne!(pow_dispatch(&below).unwrap(), pow_dispatch(&at).unwrap());
     }
 }

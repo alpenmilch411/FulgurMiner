@@ -2,7 +2,7 @@
 name = "brc-pow"
 version = "0.1.0"
 edition = "2021"
-description = "Native Rust Argon2id PoW core for BrowserCoin (byte-identical to the WASM core)"
+description = "Native Rust Argon2id + Sandglass v3 PoW core for BrowserCoin (byte-identical to the WASM core)"
 
 [[bin]]
 name = "brc-pow"
@@ -13,6 +13,17 @@ path = "src/main.rs"
 # break PoW byte-parity with src/crypto/pow.ts. Build with `cargo build --locked`
 # so Cargo.lock is honored. Keep in sync with the FulgurMiner copy + re-parity.
 argon2 = "=0.5.3"
+# SHA-256 for the Sandglass v3 seed + finalize (fork #2). Pinned EXACT for the
+# same reason as argon2 — PoW byte-parity with src/crypto/sandglass.ts (which
+# uses @noble/hashes sha256). SHA-256 is standardized, so any correct impl
+# agrees; the pin + the frozen vectors guard against any surprise.
+sha2 = "=0.10.8"
+
+[dev-dependencies]
+# Test-only: parse src/crypto/sandglass.vectors.json to reproduce the frozen
+# Sandglass vectors from the Rust core. Not linked into the shipped binary.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [profile.release]
 opt-level = 3

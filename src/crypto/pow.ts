@@ -1,5 +1,7 @@
 import setupArgon2idWasm from 'argon2id/lib/setup.js';
 import { SIMD_WASM_BASE64, NO_SIMD_WASM_BASE64 } from './argon2id-wasm.js';
+import { sandglassHash } from './sandglass.js';
+import { SANDGLASS_FORK_HEIGHT } from '../chain/genesis.js';
 
 /**
  * Memory-hard PoW hash. Replaces SHA-256 for the proof-of-work target check.
@@ -96,6 +98,16 @@ function loadArgon2id(): Promise<(p: Argon2idParams) => Uint8Array> {
 }
 
 export async function powHash(headerBytes: Uint8Array): Promise<Uint8Array> {
+  // Fork #2 height gate: blocks at/after SANDGLASS_FORK_HEIGHT use Sandglass v3;
+  // below it keep Argon2id (all pre-fork history re-verifies bit-identically —
+  // the Argon2id path + salt MUST NOT change). Height is the header's first 4
+  // bytes (u32be), so miner, checkPoW, and the stateless verifier gate identically.
+  const height =
+    ((headerBytes[0]! << 24) | (headerBytes[1]! << 16) | (headerBytes[2]! << 8) | headerBytes[3]!) >>> 0;
+  if (height >= SANDGLASS_FORK_HEIGHT) {
+    return sandglassHash(headerBytes); // synchronous; fork #2 PoW
+  }
+
   const argon2id = await loadArgon2id();
   return argon2id({
     password: headerBytes,

@@ -9,7 +9,7 @@ import { defineConfig } from 'vitest/config';
 //     pick them up — hence the chain-only include below.
 export default defineConfig({
   test: {
-    include: ['src/chain/**/*.test.ts'],
+    include: ['src/chain/**/*.test.ts', 'src/crypto/**/*.test.ts'],
     environment: 'node',
     // Several chain tests mine real Argon2id blocks (boundaryReorg, scripttx,
     // chain-build helpers in testutil). At the v5 PoW floor that is ~10–15 s per

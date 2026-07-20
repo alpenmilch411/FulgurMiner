@@ -11,7 +11,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/node-%E2%89%A520.6-339933?logo=nodedotjs&logoColor=white" alt="node >=20.6">
   <img src="https://img.shields.io/badge/engine-WASM%20%7C%20native%20Rust-B7410E?logo=rust&logoColor=white" alt="engine: WASM or native Rust">
-  <img src="https://img.shields.io/badge/PoW-Argon2id-1F62D6" alt="PoW: Argon2id">
+  <img src="https://img.shields.io/badge/PoW-Argon2id%20to%20Sandglass%20v3-1F62D6" alt="PoW: Argon2id to Sandglass v3">
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20(exp.)-1F62D6" alt="platform: macOS | Windows (experimental)">
   <img src="https://img.shields.io/badge/pool-FulgurPool-1F62D6" alt="pool: FulgurPool">
   <img src="https://img.shields.io/badge/license-MIT-3FB950" alt="license: MIT">
@@ -27,19 +27,19 @@ FulgurMiner is a standalone command-line miner for [BrowserCoin](https://browser
 ## Why FulgurMiner
 
 - **It's not a browser tab.** It runs headless in your terminal — no open window, no foreground requirement. Run it on a server, or just leave it going in the background.
-- **It's faster.** FulgurMiner runs the *same* Argon2id proof-of-work as the browser miner, but with two advantages: a **native Rust core** (~1.9× faster per hash than the browser's WASM) and **every CPU core at full power**, not a single tab the browser throttles to 60% while it's focused. Measured on an Apple M5 (10 cores), that's **~557 H/s vs ~175 for a default browser tab — about 3×** (and still ~1.9× even with the browser run flat-out). See the graph below.
+- **It never gets throttled.** FulgurMiner runs the *same* proof-of-work as the browser miner, but **headless** and across **every CPU core at full power**. A browser tab is just as fast per core *while you're looking at it* — but the moment you switch tabs or apps, the browser parks it on efficiency cores and it drops to a fraction of the speed (measured **280 → 49 H/s per core** on an Apple M5 once the tab is backgrounded). FulgurMiner runs in the background, on servers, across all cores, and **never slows down**. See the graph below.
 - **It tunes itself.** **Smart mode** finds the highest throttle your machine sustains on its own. The **Considerate** profile goes further — it adapts to whatever else you're doing: when your other apps need the CPU it eases off, when they go quiet it ramps back up, mining just the spare capacity. Set it once and forget it.
 - **macOS and Windows.** Developed and tested on macOS. **Windows is experimental** — it should work, but it hasn't been tested on a Windows machine yet, so feedback is very welcome.
 
 ### Performance
 
-Same proof-of-work as the browser miner — but headless, native, and across every core. Measured on an **Apple M5 (10 cores)** at full tilt:
+At **block 33,550** BrowserCoin switches its proof-of-work from Argon2id to **Sandglass v3** — a memory-*latency*-bound hash (a long serial pointer-chase through a small buffer). On the old Argon2id PoW the native Rust core ran ~1.9× the WASM engine; on Sandglass that edge disappears, because the work is spent *waiting on memory*, not computing — so **the native Rust core and the portable WASM engine land within ~5% of each other.** Measured on an **Apple M5 (10 cores)** at full tilt:
 
 <p align="center">
-  <img src="assets/perf.svg" width="720" alt="Hash rate by CPU workers: FulgurMiner native vs WASM vs a browser tab, on an Apple M5">
+  <img src="assets/perf-sandglass.svg" width="720" alt="Sandglass v3 hash rate by CPU workers: FulgurMiner native vs WASM, on an Apple M5">
 </p>
 
-The native engine peaks at **~557 H/s** here — **~1.9× the WASM** the browser runs, across every core at full power, and about **3× a default browser tab** (which caps itself at 60% in a focused tab; the dashed line is that same WASM engine at 60%). Argon2id is memory-bandwidth-bound, so the curves flatten near 8–10 workers.
+Both engines peak near **1,700–1,860 H/s** across all cores. A **browser tab runs the same JavaScript on the same engine**, so — *while it's the focused tab* — it matches this per core (~**280 H/s**). But switch away and the browser parks that tab on efficiency cores: **~49 H/s per core, ~5.7× slower** (measured). FulgurMiner is headless, so it never gets backgrounded — it holds full performance-core speed on every core, on any machine.
 
 ---
 
@@ -75,7 +75,7 @@ This is the **Windows** walkthrough; macOS/Linux is the same idea (open Terminal
 5. Type `npm install` and press Enter.
 6. Type `npm start` and press Enter. The miner opens — paste your **wallet address**, choose your settings, highlight **Start mining** and press Enter. It runs the portable **wasm** engine.
 
-**Optional — switch to the faster "native" engine (~1.6–1.9× the speed):**
+**Optional — build the "native" (Rust) engine** *(optional: a real speedup on the old Argon2id PoW; on Sandglass v3 it's within ~5% of the default engine — see [Performance](#performance))***:**
 
 7. Install **Rust** from [rustup.rs](https://rustup.rs): download and run `rustup-init.exe`, type **1** and press Enter. It installs the **Visual Studio build tools** (accept that), then finishes Rust. *(macOS: if the build later complains about a missing linker, run `xcode-select --install`.)*
 8. **Close the terminal and open a new one** in the FulgurMiner folder. **This step matters** — only a freshly opened terminal sees Rust on your PATH.
@@ -251,7 +251,7 @@ npm start
 
 ## Native engine
 
-By default FulgurMiner uses a portable **wasm** engine that runs anywhere Node runs — zero setup. The **native** (Rust) engine is ~1.9× faster (see [Performance](#performance)). Switch via the **Engine** setting (or `MINER_NATIVE=1`). On the next start FulgurMiner:
+By default FulgurMiner uses a portable **wasm** engine that runs anywhere Node runs — zero setup. The **native** (Rust) engine was ~1.9× faster on the old Argon2id PoW; on **Sandglass v3** (the new PoW from block 33,550) the two are within ~5% (see [Performance](#performance)), so native is now an optional alternative rather than a meaningful speedup. Switch via the **Engine** setting (or `MINER_NATIVE=1`). On the next start FulgurMiner:
 
 - uses the built engine if it's already there;
 - offers to **build it now** (a one-time `cargo build --release`, ~a minute) if you have the [Rust toolchain](https://rustup.rs);
@@ -286,7 +286,7 @@ The status bar shows `native` vs `wasm` so you can confirm which is active. If n
 
 ## How it works
 
-FulgurMiner syncs BrowserCoin's chain from public API helpers (`MINER_HELPERS`). While mining, each tip and block read tries them in rotation and takes the first that answers, so a helper going down doesn't cost you the read — the miner recovers on the next one and keeps mining current work instead of grinding a stale template. Nothing is asked of you when that happens, so a recovered read is only logged with `MINER_DEBUG=1`; a helper that fails several rounds in a row is demoted so reads stop leading with it, and if *every* helper fails a round the miner warns. (If every helper is unreachable while catching up to a new tip, the miner pauses stale work and keeps retrying rather than building on an outdated chain.) A solo block, once found, is broadcast to *every* helper — so a dead one does show up in that line. It builds a block template that pays the coinbase to your address, and searches for a proof-of-work solution across your CPU cores (Argon2id hashing). In **solo** mode it submits a full block when it finds one; in **pool** mode it submits *shares*, which the pool aggregates and splits. It's the same proof-of-work the browser app uses — just running headless, on the native core, across all your cores. The native core only *proposes* nonces; every solution is independently rebuilt and re-validated before submission, so it can never get an invalid block accepted.
+FulgurMiner syncs BrowserCoin's chain from public API helpers (`MINER_HELPERS`). While mining, each tip and block read tries them in rotation and takes the first that answers, so a helper going down doesn't cost you the read — the miner recovers on the next one and keeps mining current work instead of grinding a stale template. Nothing is asked of you when that happens, so a recovered read is only logged with `MINER_DEBUG=1`; a helper that fails several rounds in a row is demoted so reads stop leading with it, and if *every* helper fails a round the miner warns. (If every helper is unreachable while catching up to a new tip, the miner pauses stale work and keeps retrying rather than building on an outdated chain.) A solo block, once found, is broadcast to *every* helper — so a dead one does show up in that line. It builds a block template that pays the coinbase to your address, and searches for a proof-of-work solution across your CPU cores (Argon2id hashing, switching to **Sandglass v3** at block 33,550). In **solo** mode it submits a full block when it finds one; in **pool** mode it submits *shares*, which the pool aggregates and splits. It's the same proof-of-work the browser app uses — just running headless, on the native core, across all your cores. The native core only *proposes* nonces; every solution is independently rebuilt and re-validated before submission, so it can never get an invalid block accepted.
 
 ---
 
