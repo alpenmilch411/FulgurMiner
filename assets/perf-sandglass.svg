@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 432" font-family="'Hanken Grotesk', system-ui, -apple-system, 'Segoe UI', sans-serif" role="img" aria-label="FulgurMiner Sandglass v3 hash rate by CPU workers — native vs WASM, Apple M5">
+  <defs>
+    <linearGradient id="fp-native" x1="56" y1="0" x2="740" y2="0" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#3A78E2"/><stop offset="1" stop-color="#1F62D6"/>
+    </linearGradient>
+  </defs>
+
+  <!-- card -->
+  <rect x="0.5" y="0.5" width="759" height="431" rx="10" fill="#FFFFFF" stroke="#E3E7EE"/>
+
+  <!-- titles -->
+  <text x="28" y="34" font-size="18" font-weight="700" fill="#161A20" font-family="'Cinzel', 'Hanken Grotesk', serif" letter-spacing="0.3">FulgurMiner — hashes per second</text>
+  <text x="28" y="54" font-size="12.5" fill="#69727E">Apple M5 · 10 cores · macOS 26.5 · Sandglass v3 PoW (post-hardfork) · full tilt — measured</text>
+
+  <!-- y grid + labels -->
+  <g font-size="11" fill="#99A2AE" font-family="'Roboto Mono', ui-monospace, monospace">
+    <line x1="56" y1="70"    x2="740" y2="70"    stroke="#EDF0F5"/><text x="48" y="74"    text-anchor="end">2000</text>
+    <line x1="56" y1="130.4" x2="740" y2="130.4" stroke="#EDF0F5"/><text x="48" y="134.4" text-anchor="end">1600</text>
+    <line x1="56" y1="190.8" x2="740" y2="190.8" stroke="#EDF0F5"/><text x="48" y="194.8" text-anchor="end">1200</text>
+    <line x1="56" y1="251.2" x2="740" y2="251.2" stroke="#EDF0F5"/><text x="48" y="255.2" text-anchor="end">800</text>
+    <line x1="56" y1="311.6" x2="740" y2="311.6" stroke="#EDF0F5"/><text x="48" y="315.6" text-anchor="end">400</text>
+    <line x1="56" y1="372"   x2="740" y2="372"   stroke="#D3DAE3"/><text x="48" y="376"   text-anchor="end">0</text>
+  </g>
+  <text x="16" y="225" font-size="11" fill="#69727E" transform="rotate(-90 16 225)" text-anchor="middle">H/s</text>
+
+  <!-- x labels -->
+  <g font-size="11" fill="#69727E" font-family="'Roboto Mono', ui-monospace, monospace" text-anchor="middle">
+    <text x="56" y="390">1</text><text x="132" y="390">2</text><text x="208" y="390">3</text>
+    <text x="284" y="390">4</text><text x="360" y="390">5</text><text x="436" y="390">6</text>
+    <text x="512" y="390">7</text><text x="588" y="390">8</text><text x="664" y="390">9</text><text x="740" y="390">10</text>
+  </g>
+  <text x="398" y="410" font-size="11.5" fill="#69727E" text-anchor="middle">CPU workers</text>
+
+  <!-- WASM (JS) full tilt -->
+  <polyline fill="none" stroke="#5C93F2" stroke-width="2.4" stroke-linejoin="round"
+    points="56,330.2 132,292.9 208,255.4 284,217.2 360,196.4 436,177.2 512,167.7 588,139.2 664,121.6 740,113.2"/>
+  <g fill="#5C93F2">
+    <circle cx="56" cy="330.2" r="2.6"/><circle cx="132" cy="292.9" r="2.6"/><circle cx="208" cy="255.4" r="2.6"/><circle cx="284" cy="217.2" r="2.6"/><circle cx="360" cy="196.4" r="2.6"/><circle cx="436" cy="177.2" r="2.6"/><circle cx="512" cy="167.7" r="2.6"/><circle cx="588" cy="139.2" r="2.6"/><circle cx="664" cy="121.6" r="2.6"/><circle cx="740" cy="113.2" r="2.6"/>
+  </g>
+
+  <!-- native (Rust) full tilt (hero) -->
+  <polyline fill="none" stroke="url(#fp-native)" stroke-width="3.2" stroke-linejoin="round"
+    points="56,329.4 132,290.0 208,253.3 284,214.8 360,190.2 436,168.0 512,146.9 588,125.3 664,108.2 740,91.4"/>
+  <g fill="#1F62D6">
+    <circle cx="56" cy="329.4" r="3.1"/><circle cx="132" cy="290.0" r="3.1"/><circle cx="208" cy="253.3" r="3.1"/><circle cx="284" cy="214.8" r="3.1"/><circle cx="360" cy="190.2" r="3.1"/><circle cx="436" cy="168.0" r="3.1"/><circle cx="512" cy="146.9" r="3.1"/><circle cx="588" cy="125.3" r="3.1"/><circle cx="664" cy="108.2" r="3.1"/><circle cx="740" cy="91.4" r="3.1"/>
+  </g>
+  <text x="734" y="84" font-size="11" font-weight="700" fill="#1F62D6" text-anchor="end" font-family="'Roboto Mono', ui-monospace, monospace">1858 H/s</text>
+  <text x="734" y="128" font-size="11" font-weight="600" fill="#5C93F2" text-anchor="end" font-family="'Roboto Mono', ui-monospace, monospace">1714 H/s</text>
+
+  <!-- legend (top-left, plot is empty there) -->
+  <g font-size="12" fill="#3A434F">
+    <rect x="70" y="78" width="230" height="50" rx="6" fill="#FFFFFF" stroke="#EDF0F5"/>
+    <line x1="82" y1="94"  x2="104" y2="94"  stroke="#1F62D6" stroke-width="3.2"/><circle cx="93" cy="94" r="3.1" fill="#1F62D6"/><text x="112" y="98" font-weight="600">FulgurMiner · native (Rust)</text>
+    <line x1="82" y1="112" x2="104" y2="112" stroke="#5C93F2" stroke-width="2.4"/><circle cx="93" cy="112" r="2.6" fill="#5C93F2"/><text x="112" y="116">FulgurMiner · WASM (JS)</text>
+  </g>
+
+  <!-- callout: native ≈ WASM on Sandglass -->
+  <text x="470" y="300" font-size="13" font-weight="600" fill="#3A434F" text-anchor="middle">native and WASM within ~5%</text>
+  <text x="470" y="318" font-size="11.5" fill="#69727E" text-anchor="middle">Sandglass is memory-latency-bound — compute can't pull ahead</text>
+
+  <!-- footnote -->
+  <text x="28" y="422" font-size="10.5" fill="#99A2AE">Post-hardfork PoW (Sandglass v3), sustained on all 10 cores. Both engines measured; each point is the summed rate of N single-core workers.</text>
+</svg>
