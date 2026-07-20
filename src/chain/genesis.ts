@@ -178,3 +178,41 @@ export const FORK1_ACTIVATION_TIME = 1783267200; // 2026-07-05T16:00:00Z
  *   = 62_287 B. Rounded up to a clean 64 KiB. Must stay < MAX_BLOCK_BYTES.
  */
 export const MAX_TX_BYTES = 65_536;
+
+// ─── Fork #2: Sandglass v3 proof-of-work ────────────────────────────────────
+// Height-gated swap Argon2id → Sandglass v3 at SANDGLASS_FORK_HEIGHT. Same
+// chain/balances/history; blocks below verify with Argon2id, at/after with
+// Sandglass. See src/crypto/sandglass.ts. Height-gated (not time) because the
+// PoW verifier is stateless (header bytes only → cannot compute MTP); height is
+// the header's first 4 bytes. Announced activation (community vote):
+// 2026-07-22 14:00 CEST (= 12:00 UTC), set from mainnet height 32,024 on
+// 2026-07-19 20:18 UTC + ~1,526 blocks of lead. Deploy the frontend well before
+// this height so tabs auto-update and flip together.
+// ⚠️ FOLLOWER: these values are byte-matched to upstream sandglass-v3-fork
+// (fe8153a) — never locally tune them (a different value = a different canonical
+// tip = we reject the fork block and wedge).
+export const SANDGLASS_FORK_HEIGHT = 33_550;
+
+// ASERT re-anchor point for the reset (consensus.ts) ≈ when the chain reaches
+// the fork height. Set to 2026-07-22 12:00 UTC (14:00 CEST). Only a SOFT estimate
+// now — the post-fork difficulty clamp below neutralizes an early/late arrival, so
+// an estimate off by hours is safe (see nextDifficulty).
+export const SANDGLASS_ANCHOR_TIMESTAMP = 1784721600;
+
+// After the fork, the ASERT re-anchor difficulty is clamped to within 4× of the
+// reset (each direction) for this many blocks, so a wrong anchor-timestamp
+// estimate can neither stall the chain nor cause an instant-block storm while the
+// timestamp offset drains out. ~2000 blocks ≈ 3.5 days — far longer than any
+// plausible transient. See nextDifficulty in consensus.ts.
+export const SANDGLASS_ANCHOR_CLAMP_BLOCKS = 2000;
+
+// ⚠️ VERIFY BEFORE DEPLOY. Expected hash ATTEMPTS/block right after the fork =
+// (honest Sandglass H/s) × 150. Sets the reset difficulty. GPU farms leave at
+// the fork → post-fork network is browsers/CPUs (lower, unknown). ERR LOW:
+// too-easy self-corrects in minutes via ASERT; too-hard risks a slow-block
+// stall. 5,000,000 ≈ ~33 kH/s of honest miners.
+// ⚠️ For a FOLLOWER (this fork), "verify" means BYTE-MATCH upstream's value —
+// never locally tune it. This constant is consensus: a locally-tuned attempts
+// value = a different reset difficulty at SANDGLASS_FORK_HEIGHT = we reject the
+// canonical fork block and wedge. Only change it to track an upstream change.
+export const SANDGLASS_ANCHOR_ATTEMPTS = 5_000_000;
