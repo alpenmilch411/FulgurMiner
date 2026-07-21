@@ -1,0 +1,75 @@
+data_dir: /var/lib/vector
+
+sources:
+  wasm:
+    type: file
+    include:
+      - /sources/wasm-machine.json
+    read_from: beginning
+    ignore_checkpoints: false
+  cuda:
+    type: file
+    include:
+      - /sources/cuda-machine.json
+    read_from: beginning
+    ignore_checkpoints: false
+  sessions:
+    type: file
+    include:
+      - /sources/logs/*.jsonl
+    read_from: beginning
+    ignore_checkpoints: false
+
+transforms:
+  parse_wasm:
+    type: remap
+    inputs: [wasm]
+    source: |
+      raw = .message
+      parsed, err = parse_json(raw)
+      if err != null { abort }
+      . = parsed
+      .machine = "wasm-machine"
+      .source_file = "wasm-machine.json"
+      .raw_json = raw
+
+  parse_cuda:
+    type: remap
+    inputs: [cuda]
+    source: |
+      raw = .message
+      parsed, err = parse_json(raw)
+      if err != null { abort }
+      . = parsed
+      .machine = "cuda-machine"
+      .source_file = "cuda-machine.json"
+      .raw_json = raw
+
+  parse_sessions:
+    type: remap
+    inputs: [sessions]
+    source: |
+      raw = .message
+      source_path = .file
+      parsed, err = parse_json(raw)
+      if err != null { abort }
+      . = parsed
+      if !exists(.machine) { .machine = "session" }
+      .source_file = to_string(source_path) ?? "logs/*.jsonl"
+      .raw_json = raw
+
+sinks:
+  clickhouse:
+    type: clickhouse
+    inputs: [parse_wasm, parse_cuda, parse_sessions]
+    endpoint: http://clickhouse:8123
+    database: miner
+    table: events
+    compression: gzip
+    format: json_each_row
+    date_time_best_effort: true
+    skip_unknown_fields: true
+    auth:
+      strategy: basic
+      user: "${CLICKHOUSE_USER}"
+      password: "${CLICKHOUSE_PASSWORD}"

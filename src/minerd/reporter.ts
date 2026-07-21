@@ -5,12 +5,95 @@
 // console directly. ConsoleReporter reproduces today's plain-log output exactly,
 // so `npm run mine` / `mine:dryrun` are unchanged. DashboardReporter (tui.ts) is
 // an alternate implementation that renders a full-screen numbers dashboard.
+import { createWriteStream, mkdirSync, type WriteStream } from 'node:fs';
+import { join } from 'node:path';
 import { blockReward, COIN } from '../chain/genesis.js';
 
 /** Group an integer with thousands separators (e.g. 11772 → '11,772'). */
 function grp(n: number): string {
   if (!Number.isFinite(n)) return '0';
   return Math.round(n).toLocaleString('en-US');
+}
+
+/** ISO timestamps keep plain miner logs directly sortable/graphable. */
+function stamp(): string { return new Date().toISOString(); }
+function line(message: string): void { console.log(`[${stamp()}] ${message}`); }
+function errorLine(message: string): void { console.error(`[${stamp()}] ${message}`); }
+function warnLine(message: string): void { console.warn(`[${stamp()}] ${message}`); }
+
+type JsonlFields = Record<string, unknown>;
+
+/** Optional machine-readable sidecar. Console output remains the primary log;
+ * this stream is append-only JSONL for jq, Python, or a later metrics collector. */
+class JsonlLogger {
+  private stream: WriteStream | null = null;
+  private context: JsonlFields = {};
+
+  constructor(path = process.env.MINER_LOG_FILE) {
+    if (!path && process.env.MINER_LOG_DIR?.trim()) {
+      const dir = process.env.MINER_LOG_DIR.trim();
+      const now = new Date();
+      const fileStamp = now.toISOString().replace(/[-:]/g, '').replace('T', '-').replace(/\.\d{3}Z$/, '');
+      path = join(dir, `miner-${fileStamp}-pid${process.pid}.jsonl`);
+      try { mkdirSync(dir, { recursive: true }); } catch { path = undefined; }
+    }
+    if (!path || path.trim() === '') return;
+    try {
+      this.stream = createWriteStream(path, { flags: 'a' });
+      // Logging must never be able to bring down a miner because a path/disk
+      // becomes unavailable.
+      this.stream.on('error', () => { this.stream = null; });
+    } catch {
+      this.stream = null;
+    }
+  }
+
+  emit(event: string, fields: JsonlFields = {}): void {
+    if (!this.stream) return;
+    try {
+      this.stream.write(`${JSON.stringify({ ts: new Date().toISOString(), event, ...this.context, ...fields })}\n`);
+    } catch {
+      this.stream = null;
+    }
+  }
+
+  setContext(fields: JsonlFields): void {
+    this.context = { ...this.context, ...fields };
+  }
+
+  close(): void {
+    this.stream?.end();
+    this.stream = null;
+  }
+}
+
+function logTextEvent(logger: JsonlLogger, level: string, message: string): void {
+  const base = { level, message };
+  const text = message.trim();
+  let match = /^\[pool-miner\] CUDA_POOL_JOB id=(\S+)/.exec(text);
+  if (match) return logger.emit('cuda_pool_job', { ...base, jobId: match[1] });
+  match = /^\[pool-miner\] CUDA_JOB token=(\d+)/.exec(text);
+  if (match) return logger.emit('cuda_job', { ...base, token: Number(match[1]) });
+  match = /^\[pool-miner\] CUDA_BATCH selected=(\d+) workspace_mib=(\d+) free_mib=(\d+) total_mib=(\d+) reserve_mib=(\d+) guard_mib=(\d+)/.exec(text);
+  if (match) return logger.emit('cuda_batch', {
+    ...base, batch: Number(match[1]), workspaceMiB: Number(match[2]),
+    freeMiB: Number(match[3]), totalMiB: Number(match[4]),
+    reserveMiB: Number(match[5]), guardMiB: Number(match[6]),
+  });
+  match = /^\[pool-miner\] CUDA_BATCH rebalance_pending=(\d+) observations=(\d+)/.exec(text);
+  if (match) return logger.emit('cuda_rebalance', {
+    ...base, batch: Number(match[1]), observations: Number(match[2]), phase: 'pending',
+  });
+  match = /^\[pool-miner\] CUDA_BATCH rebalanced=(\d+)(?: candidate=(\d+))?/.exec(text);
+  if (match) return logger.emit('cuda_rebalance', {
+    ...base, batch: Number(match[1]), candidateBatch: match[2] ? Number(match[2]) : 0, phase: 'applied',
+  });
+  match = /^\[pool-miner\] CUDA_MODE persistent iterations=(\d+)/.exec(text);
+  if (match) return logger.emit('cuda_mode', { ...base, persistent: true, iterations: Number(match[1]) });
+  if (message.includes('nonce slot exhausted')) return logger.emit('nonce_slot_exhausted', base);
+  if (message.includes('BLOCK FOUND')) return logger.emit('block_found', base);
+  if (message.includes('grind error')) return logger.emit('grind_error', base);
+  logger.emit('message', base);
 }
 
 /** Sum the halving-accurate coinbase reward (BRC) for the given accepted block heights. */
@@ -28,7 +111,7 @@ export interface ReporterStatus {
   targetUrl?: string;
   /** Website to hyperlink the shown host to (OSC 8). Falls back to targetUrl. */
   targetPage?: string;
-  backend: 'wasm' | 'native';
+  backend: 'wasm' | 'native' | 'cuda';
   /** Optional one-line note about the backend choice, e.g. why native fell back to
    *  wasm. Shown persistently so the user doesn't have to quit to discover it. */
   backendNote?: string;
@@ -106,6 +189,8 @@ export interface MinerReporter {
   syncProgress(current: number, target: number): void;
   /** Called once, after bootstrap/registration completes. */
   synced(height: number): void;
+  /** Current pool worker identity, refreshed after registration/reregistration. */
+  workerId?(id: string): void;
   /** Called ~1×/sec with the number of hashes in the last window. */
   hashrate(hps: number): void;
   /** Latest chain tip height + difficulty (hex). */
@@ -146,9 +231,11 @@ export interface MinerReporter {
  * The lone `\r` carriage return below is plain ASCII, not an ANSI escape.
  */
 export class ConsoleReporter implements MinerReporter {
+  private readonly jsonl = new JsonlLogger();
   private height = 0;
   private difficultyHex = '0';
   private status_: ReporterStatus | null = null;
+  private workerId_: string | null = null;
   // Sync-progress throttling: emit at most ~1/sec or on a ≥2% jump so plain logs
   // show steady progress without flooding. -1 = no line emitted yet this sync.
   private lastSyncLogAt = 0;
@@ -171,12 +258,19 @@ export class ConsoleReporter implements MinerReporter {
 
   status(s: ReporterStatus): void {
     this.status_ = s;
-    if (s.backendNote) console.log(`[${s.mode === 'pool' ? 'pool-miner' : 'minerd'}] ${s.backendNote}`);
+    const machine = `${s.backend}/${s.mode}`;
+    this.jsonl.setContext({ machine, backend: s.backend });
+    this.jsonl.emit('status', { mode: s.mode, target: s.target, backend: s.backend, workers: s.workers, throttle: s.throttle, address: s.address });
+    if (s.backendNote) line(`[${s.mode === 'pool' ? 'pool-miner' : 'minerd'}] ${s.backendNote}`);
     if (s.mode === 'pool') return; // pool registration line is emitted by poolClient flow
-    const backend = s.backend === 'native' ? 'native (Rust)' : 'wasm (worker_threads)';
+    const backend = s.backend === 'native'
+      ? 'native (Rust)'
+      : s.backend === 'cuda'
+        ? 'cuda'
+        : 'wasm (worker_threads)';
     // Mirror miner.ts's old startup lines so plain mode looks unchanged.
-    console.log(`[minerd] mining to ${s.address.slice(0, 16)}… (${s.workers} workers, throttle ${s.throttle})`);
-    console.log(`[minerd] grind backend: ${backend}`);
+    line(`[minerd] mining to ${s.address.slice(0, 16)}… (${s.workers} workers, throttle ${s.throttle})`);
+    line(`[minerd] grind backend: ${backend}`);
   }
 
   syncProgress(current: number, target: number): void {
@@ -190,7 +284,7 @@ export class ConsoleReporter implements MinerReporter {
       // pages still shows visible progress and never a long silent gap.
       if (now - this.lastSyncLogAt < 500) return;
       this.lastSyncLogAt = now;
-      console.log(`[minerd] verifying BrowserCoin blockchain ${grp(current)} blocks…`);
+      line(`[minerd] verifying BrowserCoin blockchain ${grp(current)} blocks…`);
       return;
     }
     const cur = Math.max(0, Math.min(current, target));
@@ -203,16 +297,26 @@ export class ConsoleReporter implements MinerReporter {
     if (!enoughTime && !enoughChange) return;
     this.lastSyncLogAt = now;
     this.lastSyncPct = pct;
-    console.log(`[minerd] verifying BrowserCoin blockchain ${grp(cur)} / ${grp(target)} (${pct}%)`);
+    this.jsonl.emit('sync_progress', { current: cur, target, percent: pct });
+    line(`[minerd] verifying BrowserCoin blockchain ${grp(cur)} / ${grp(target)} (${pct}%)`);
   }
 
   synced(height: number): void {
     this.height = height;
+    this.jsonl.emit('synced', { height });
     const prefix = this.status_?.mode === 'pool' ? '[pool-miner]' : '[minerd]';
-    console.log(`${prefix} synced to height ${height}`);
+    line(`${prefix} synced to height ${height}`);
+  }
+
+  workerId(id: string): void {
+    this.workerId_ = id;
+    const backend = this.status_?.backend ?? 'unknown';
+    this.jsonl.setContext({ machine: `${backend}/${id}`, backend, workerId: id });
+    this.jsonl.emit('worker_id', { workerId: id });
   }
 
   hashrate(hps: number): void {
+    this.jsonl.emit('hashrate', { hps, height: this.height, workerId: this.workerId_ });
     let smartSuffix = '';
     if (this.smart_) {
       const pct = Math.round(this.smart_.throttle * 100);
@@ -225,19 +329,21 @@ export class ConsoleReporter implements MinerReporter {
       smartSuffix = ` auto ${pct}% ${label}`;
     }
     if (this.status_?.mode === 'pool') {
-      process.stdout.write(`\r[pool-miner] ${hps} H/s${smartSuffix}   `);
+      process.stdout.write(`\r[${stamp()}] [pool-miner] ${hps} H/s${smartSuffix}   `);
     } else {
-      process.stdout.write(`\r[minerd] h=${this.height} diff=${this.difficultyHex} hps:${hps}${smartSuffix}   `);
+      process.stdout.write(`\r[${stamp()}] [minerd] h=${this.height} diff=${this.difficultyHex} hps:${hps}${smartSuffix}   `);
     }
   }
 
   chain(height: number, difficultyHex: string): void {
     this.height = height;
     this.difficultyHex = difficultyHex;
+    this.jsonl.emit('chain', { height, difficultyHex });
   }
 
   found(info: FoundInfo): void {
-    console.log(`\n[minerd] FOUND height=${info.height} hash=${info.hash} ${info.detail}`);
+    this.jsonl.emit('found', { height: info.height, hash: info.hash, accepted: info.accepted, detail: info.detail });
+    line(`\n[minerd] FOUND height=${info.height} hash=${info.hash} ${info.detail}`);
     if (info.accepted && this.status_?.mode !== 'pool') {
       this.soloBlocks.push({ height: info.height, hash: info.hash });
       this.earnings({ kind: 'solo', earnedBrc: this.canonicalSolo().earnedBrc });
@@ -273,17 +379,20 @@ export class ConsoleReporter implements MinerReporter {
   }
 
   share(accepted: boolean, result: string): void {
-    process.stdout.write(`\n[pool-miner] share ${accepted ? 'accepted' : 'rejected'}: ${result}\n`);
+    this.jsonl.emit(accepted ? 'share_accepted' : 'share_rejected', { accepted, result, workerId: this.workerId_ });
+    process.stdout.write(`\n[${stamp()}] [pool-miner] share ${accepted ? 'accepted' : 'rejected'}: ${result}\n`);
   }
 
   event(level: 'info' | 'warn' | 'error', msg: string): void {
-    if (level === 'error') console.error(`\n${msg}`);
-    else if (level === 'warn') console.warn(`\n${msg}`);
-    else console.log(msg);
+    logTextEvent(this.jsonl, level, msg);
+    if (level === 'error') errorLine(`\n${msg}`);
+    else if (level === 'warn') warnLine(`\n${msg}`);
+    else line(msg);
   }
 
   smart(info: SmartInfo): void {
     this.smart_ = info;
+    this.jsonl.emit('smart', { ...info });
   }
 
   // ─── Optional KPI channel ──────────────────────────────
@@ -291,19 +400,23 @@ export class ConsoleReporter implements MinerReporter {
   // ASCII-only plain lines (earnings / jackpot / update nudge) — never SGR or
   // OSC-8 per the INVARIANT above (this is also the piped/non-TTY path).
   earnings(e: EarningsInfo): void {
+    this.jsonl.emit('earnings', { ...e, workerId: this.workerId_ });
     if (e.kind === 'pool-balance') {
-      console.log(`[pool-miner] earnings: ${e.earnedBrc} BRC (pending ${e.pendingBrc}, paid ${e.paidBrc})`);
+      const id = this.workerId_ ? ` miner=${this.workerId_}` : '';
+      line(`[pool-miner] earnings: ${e.earnedBrc} BRC (pending ${e.pendingBrc}, paid ${e.paidBrc})${id}`);
     } else if (e.kind === 'pool-shares') {
-      console.log(`[pool-miner] shares: ${e.shares}${e.pageUrl ? ` (stats: ${e.pageUrl})` : ''}`);
+      const id = this.workerId_ ? ` miner=${this.workerId_}` : '';
+      line(`[pool-miner] shares: ${e.shares}${e.pageUrl ? ` (stats: ${e.pageUrl})` : ''}${id}`);
     } else {
-      console.log(`[minerd] earnings (est): ${e.earnedBrc} BRC (${this.canonicalSolo().count} blocks)`);
+      line(`[minerd] earnings (est): ${e.earnedBrc} BRC (${this.canonicalSolo().count} blocks)`);
     }
   }
 
   jackpot(j: JackpotInfo): void {
     if (this.closed_) return; // the session has ended — never print a stale panel
+    this.jsonl.emit('jackpot', { ...j });
     const last = j.lastWinner ? ` - last ${j.lastWinner.slice(0, 12)}...@${j.lastStrikeHeight ?? '?'}` : '';
-    console.log(`[pool-miner] jackpot: ${Math.round(j.finderBonusPct * 100)}% finder bonus - blocks found: ${j.yourBlockStrikes}${last}`);
+    line(`[pool-miner] jackpot: ${Math.round(j.finderBonusPct * 100)}% finder bonus - blocks found: ${j.yourBlockStrikes}${last}`);
   }
 
   /** Session end. Plain mode has no persistent panel to erase, but this closes
@@ -311,15 +424,17 @@ export class ConsoleReporter implements MinerReporter {
    *  that was already underway when the session stopped) — TUI/plain parity. */
   close(): void {
     this.closed_ = true;
+    this.jsonl.close();
   }
 
   updateNotice(n: UpdateNotice): void {
+    this.jsonl.emit('update_notice', { ...n });
     if (n.mustUpdate) {
-      console.log(`[minerd] UPDATE REQUIRED: v${n.currentVersion} -> v${n.latestVersion ?? '?'} - ${n.notice ?? 'run the update command'}`);
+      line(`[minerd] UPDATE REQUIRED: v${n.currentVersion} -> v${n.latestVersion ?? '?'} - ${n.notice ?? 'run the update command'}`);
     } else if (n.available && n.latestVersion) {
-      console.log(`[minerd] update available: v${n.currentVersion} -> v${n.latestVersion} (press 'u' for the command)`);
+      line(`[minerd] update available: v${n.currentVersion} -> v${n.latestVersion} (press 'u' for the command)`);
     } else if (n.notice) {
-      console.log(`[minerd] notice: ${n.notice}`);
+      line(`[minerd] notice: ${n.notice}`);
     }
   }
 }

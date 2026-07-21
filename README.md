@@ -215,8 +215,18 @@ Every option is an environment variable or a line in `.env.local` (written for y
 | `MINER_WORKERS` | cores − 1 | CPU worker threads. Auto (unset) leaves one core free; inside a CPU-limited container it uses the whole allowance instead of the host's core count. Set it by hand to override. |
 | `MINER_THROTTLE` | `0.75` | Duty cycle (`0.05`–`1.0`): fraction of wall-time spent hashing. Lower = cooler & quieter. Ignored when a Smart mode is on (the mode sets the rate). Any value in the range can be set from the Throttle picker's Custom option, not just the presets. |
 | `MINER_NATIVE` | *(off)* | `1` uses the native Rust engine (built on demand if missing and Rust is installed). |
+| `MINER_CUDA` | *(off)* | `1` uses the opt-in CUDA engine when `cuda-poc/brc-argon-cuda-helper` is built and the NVIDIA runtime is available; otherwise falls back to WASM. |
+| `MINER_CUDA_BATCH` | *(auto)* | Optional CUDA batch cap. Unset/`0` selects the largest batch that fits the detected VRAM budget; each nonce reserves about 32 MiB of VRAM. |
+| `MINER_CUDA_DEVICE` | `0` | CUDA device index. Use `./cuda-poc/brc-argon-cuda-helper --info` (or set this variable first) to verify the selected card. |
+| `MINER_CUDA_VRAM_MAX_MIB` | *(unset)* | Optional total VRAM usage budget. The helper stays below this amount after accounting for other GPU users. |
+| `MINER_CUDA_VRAM_RESERVE_MIB` | `1024` | VRAM kept free for Windows/WSL/display/other CUDA workloads when selecting the batch. |
+| `MINER_CUDA_VRAM_GUARD_MIB` | `2048` | Additional allowance for CUDA driver/context allocation overhead; protects the reserve from optimistic `cudaMalloc` estimates. |
+| `MINER_CUDA_PERSISTENT` | `0` | Enables the opt-in persistent CUDA kernel, which processes multiple nonce batches per launch. |
+| `MINER_CUDA_PERSISTENT_ITERATIONS` | `8` | Batches processed per persistent launch; larger values improve launch amortization but delay job updates. |
 | `MINER_HELPERS` | `api1`/`api2.browsercoin.org` | Comma-separated API helper URLs for chain sync / solo mining. Each read tries them in turn and takes the first that answers, so one dead helper doesn't stop the miner tracking the tip. A helper that keeps failing gets demoted so reads stop leading with it; you get a warning when *every* helper fails a round. A blank or comma-only value falls back to the defaults. |
 | `MINER_DEBUG` | *(off)* | `MINER_DEBUG=1` adds debug lines — the per-helper read failures the miner recovered from on its own, plus snapshot notes. Env var only (`npm run mine` doesn't read `.env.local`). |
+| `MINER_LOG_FILE` | *(off)* | Optional append-only JSONL sidecar path. Console output remains enabled; structured events include hashrate, CUDA jobs/batches, shares, slot exhaustion, earnings, and blocks. |
+| `MINER_LOG_DIR` | *(off)* | Optional directory for one new timestamped JSONL event file per miner start. Created automatically; `MINER_LOG_FILE` takes precedence. |
 | `FULGUR_TUI` | *(auto)* | `0` forces plain logs; otherwise the TUI is used when stdout is a terminal. |
 | `FULGUR_NO_UPDATE_CHECK` | *(off)* | `1` disables the best-effort startup update check. |
 | `JOB_POLL_MS` | `1000` | Pool mode only: fallback polling interval (ms). When the pool supports long-poll, new work arrives instantly; otherwise the miner polls `/job` at this cadence. Clamped to `250`–`60000`. |
@@ -226,15 +236,36 @@ Every option is an environment variable or a line in `.env.local` (written for y
 # Solo-mine
 MINER_PUBKEY=<your-address> MINER_POOL=solo npm run mine
 
+# CUDA solo mining
+MINER_PUBKEY=<your-address> MINER_POOL=solo MINER_CUDA=1 npm run mine
+
 # Considerate smart mode, native engine
 MINER_PUBKEY=<your-address> MINER_SMART=considerate MINER_NATIVE=1 npm run mine
 
 # Mine at a specific pool
 MINER_PUBKEY=<your-address> MINER_POOL=https://pool.example.org npm run mine
 
+# Keep console output and write structured events to a JSONL sidecar
+MINER_LOG_FILE=miner-events.jsonl npm run mine
+
+# Create a separate timestamped file for this miner session
+MINER_LOG_DIR=logs npm run mine
+
 # Safe smoke test — syncs the chain, checks everything agrees, submits nothing
 MINER_PUBKEY=<your-address> npm run mine:dryrun
 ```
+
+## Local observability
+
+The miner can write structured JSONL events alongside its normal console output.
+Use `MINER_LOG_DIR=logs` to create one timestamped file per miner process, or
+`MINER_LOG_FILE=path.jsonl` to append to a specific file. The directory form is
+recommended when running CPU and CUDA miners together because each session gets
+its own file and machine identity.
+
+For local graphs and event inspection, the repository includes a
+Vector → ClickHouse → Grafana stack. See the complete setup and troubleshooting
+instructions in [`observability/README.md`](observability/README.md).
 
 The update check is quiet and best-effort: it reads the latest version from the project's [GitHub releases](https://github.com/alpenmilch411/FulgurMiner/releases) (plus the pool's notice / required-version signal) and fails silently offline. Turn the check off with **Check for updates → off** or `FULGUR_NO_UPDATE_CHECK=1`. FulgurMiner never runs an update for you.
 
@@ -268,7 +299,92 @@ cd native/brc-pow && cargo build --release && cd ../..
 MINER_NATIVE=1 npm start
 ```
 
-The status bar shows `native` vs `wasm` so you can confirm which is active. If native was selected but isn't built yet, the dashboard says so and keeps mining with wasm.
+## CUDA engine (experimental)
+
+The CUDA engine reuses FulgurMiner's existing mining coordination and
+block/share submission paths. It can mine pool jobs or search the full nonce
+range for solo block templates.
+
+### CUDA quick setup (Linux)
+
+You need a CUDA-capable NVIDIA GPU and driver, Node.js 20.6+, Git, Make, a C++
+compiler, and the **CUDA 12.8 Toolkit**. First check that the driver can see the
+GPU:
+
+```bash
+nvidia-smi
+```
+
+Add NVIDIA's CUDA package repository for your exact distribution and release
+using the commands from the [CUDA 12.8 download
+archive](https://developer.nvidia.com/cuda-12-8-0-download-archive?target_os=Linux).
+Choose **Linux**, your architecture and distribution, then **deb (network)** or
+**rpm (network)**. After running the repository setup shown there, install the
+pinned toolkit and normal build tools:
+
+```bash
+# Ubuntu / Debian
+sudo apt update
+sudo apt install build-essential cuda-toolkit-12-8
+
+# Fedora (run these instead)
+sudo dnf install make gcc-c++ cuda-toolkit-12-8
+```
+
+CUDA 12.8 may reject the newer GCC shipped by some Fedora releases. If it does,
+install the GCC compatibility package recommended by NVIDIA's [CUDA 12.8 Linux
+guide](https://docs.nvidia.com/cuda/archive/12.8.0/cuda-installation-guide-linux/#gcc-compatibility-package-for-fedora)
+and set `NVCC_CCBIN` as shown there (for example, `g++-13` on Fedora 41).
+
+On Debian/Ubuntu, do not rely on the distro's unversioned
+`nvidia-cuda-toolkit` package: this build defaults to NVIDIA's versioned compiler at
+`/usr/local/cuda-12.8/bin/nvcc`. Confirm the toolchain, install the Node
+dependencies, build the helper, and run its validation:
+
+```bash
+/usr/local/cuda-12.8/bin/nvcc --version
+npm install
+make -C cuda-poc cuda-helper
+make -C cuda-poc cuda-check
+./cuda-poc/brc-argon-cuda-helper --info
+```
+
+The default build target is `sm_120`, validated on an RTX 5080. For another
+GPU, find its [CUDA compute
+capability](https://developer.nvidia.com/cuda-gpus), remove the decimal point,
+and override the target when building (for example,
+`make -C cuda-poc cuda-helper CUDA_ARCH=sm_89` for capability 8.9). Other GPU
+architectures are currently experimental.
+
+From the repository root, start the configured CUDA solo miner with:
+
+```bash
+MINER_CUDA=1 MINER_CUDA_DEVICE=0 \
+  MINER_CUDA_VRAM_RESERVE_MIB=2048 MINER_CUDA_BATCH=400 \
+  MINER_SMART=off MINER_THROTTLE=1 \
+  MINER_CUDA_PERSISTENT=1 MINER_CUDA_PERSISTENT_ITERATIONS=16 \
+  MINER_LOG_DIR=logs \
+  MINER_PUBKEY=aa507295d44c9338c1f9698ccd55cf8aaf217e14c91cb28ae735381fa46283a7 \
+  MINER_POOL=solo npm run mine
+```
+
+`MINER_CUDA_BATCH=400` is a cap for a high-VRAM card, not a guaranteed
+allocation; the helper lowers it when necessary to preserve the configured
+VRAM reserve and its allocation guard.
+
+CUDA is opt-in. If the helper is missing or cannot initialize the NVIDIA
+runtime, the miner reports the reason and uses the portable WASM engine. The
+CUDA helper honors either the pool-assigned nonce slot or solo's full nonce
+range and does not implement a separate pool protocol. `MINER_CUDA_BATCH=32` is an example that limits the
+working set to roughly 1 GiB. `MINER_WORKERS` controls CPU workers and does not
+create additional CUDA contexts; the CUDA path uses one helper and one active
+batch at a time.
+
+Solo CUDA mining submits only complete blocks, not shares. Its expected block
+finding rate is the same as any other miner at the same hashrate, so long
+periods without a block are normal even when the local CUDA hashrate is high.
+
+The status bar shows `cuda`, `native`, or `wasm` so you can confirm which is active. If CUDA or native was selected but isn't usable, the dashboard says why and keeps mining with wasm.
 
 ## Troubleshooting
 

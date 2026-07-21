@@ -1,0 +1,119 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "graphTooltip": 1,
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Hashrate",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "datasource": {"type": "grafana-clickhouse-datasource", "uid": "miner-clickhouse"},
+      "targets": [{
+        "refId": "A",
+        "queryType": "sql",
+        "rawSql": "SELECT toStartOfInterval(ts, INTERVAL 10 SECOND) AS time, nullIf(avgIf(hps, startsWith(machine, 'cuda/')), 0) AS cuda_hps, nullIf(avgIf(hps, startsWith(machine, 'native/')), 0) AS native_hps, nullIf(avgIf(hps, startsWith(machine, 'wasm/')), 0) AS wasm_hps FROM miner.events WHERE event = 'hashrate' AND $__timeFilter(ts) GROUP BY time ORDER BY time",
+      "format": "table"
+      }],
+      "fieldConfig": {"defaults": {"unit": "h/s", "decimals": 0}, "overrides": []},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom"}, "tooltip": {"mode": "multi"}}
+    },
+    {
+      "type": "timeseries",
+      "title": "CUDA batch and free VRAM",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+      "datasource": {"type": "grafana-clickhouse-datasource", "uid": "miner-clickhouse"},
+      "targets": [{
+        "refId": "A",
+        "queryType": "sql",
+        "rawSql": "SELECT toStartOfInterval(ts, INTERVAL 10 SECOND) AS time, avg(batch) AS batch, avg(workspaceMiB) AS workspace_mib, avg(freeMiB) AS free_vram_mib FROM miner.events WHERE event = 'cuda_batch' AND $__timeFilter(ts) GROUP BY time ORDER BY time",
+      "format": "table"
+      }],
+      "fieldConfig": {"defaults": {"decimals": 0}, "overrides": []},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom"}, "tooltip": {"mode": "multi"}}
+    },
+    {
+      "type": "timeseries",
+      "title": "CUDA rebalance decisions",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 13},
+      "datasource": {"type": "grafana-clickhouse-datasource", "uid": "miner-clickhouse"},
+      "targets": [{
+        "refId": "A",
+        "queryType": "sql",
+        "rawSql": "SELECT ts AS time, concat(machine, ' / rebalance batch') AS metric, toFloat64(batch) AS value FROM miner.events WHERE event = 'cuda_rebalance' AND $__timeFilter(ts) ORDER BY time",
+        "format": "table"
+      }],
+      "fieldConfig": {"defaults": {"unit": "short", "decimals": 0, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}}, "overrides": []},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom"}, "tooltip": {"mode": "multi"}}
+    },
+    {
+      "type": "stat",
+      "title": "Accepted shares (selected range)",
+      "gridPos": {"h": 5, "w": 6, "x": 0, "y": 8},
+      "datasource": {"type": "grafana-clickhouse-datasource", "uid": "miner-clickhouse"},
+      "targets": [{"refId": "A", "queryType": "sql", "rawSql": "SELECT count() AS accepted FROM miner.events WHERE event = 'share_accepted' AND $__timeFilter(ts)", "format": "table"}],
+      "fieldConfig": {"defaults": {"unit": "short", "decimals": 0, "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]}}, "overrides": []},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}}
+    },
+    {
+      "type": "stat",
+      "title": "Blocks found events",
+      "gridPos": {"h": 5, "w": 6, "x": 6, "y": 8},
+      "datasource": {"type": "grafana-clickhouse-datasource", "uid": "miner-clickhouse"},
+      "targets": [{"refId": "A", "queryType": "sql", "rawSql": "SELECT count() AS blocks FROM miner.events WHERE event = 'block_found' AND $__timeFilter(ts)", "format": "table"}],
+      "fieldConfig": {"defaults": {"unit": "short", "decimals": 0}, "overrides": []},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}}
+    },
+    {
+      "type": "timeseries",
+      "title": "Pool jobs and nonce-slot exhaustion",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 13},
+      "datasource": {"type": "grafana-clickhouse-datasource", "uid": "miner-clickhouse"},
+      "targets": [{
+        "refId": "A",
+        "queryType": "sql",
+        "rawSql": "SELECT toStartOfMinute(ts) AS time, concat(machine, ' / ', event) AS metric, count() AS value FROM miner.events WHERE event IN ('cuda_pool_job', 'nonce_slot_exhausted') AND $__timeFilter(ts) GROUP BY time, metric ORDER BY time",
+      "format": "table"
+      }],
+      "fieldConfig": {"defaults": {"unit": "short", "decimals": 0}, "overrides": []},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom"}, "tooltip": {"mode": "multi"}}
+    },
+    {
+      "type": "timeseries",
+      "title": "Event frequency",
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 21},
+      "datasource": {"type": "grafana-clickhouse-datasource", "uid": "miner-clickhouse"},
+      "targets": [{
+        "refId": "A",
+        "queryType": "sql",
+        "rawSql": "SELECT toStartOfInterval(ts, INTERVAL 10 SECOND) AS time, countIf(event = 'share_accepted') AS shares_accepted, countIf(event = 'share_rejected') AS shares_rejected, countIf(event = 'block_found') AS blocks_found, countIf(event = 'cuda_pool_job') AS cuda_pool_jobs, countIf(event = 'cuda_rebalance') AS cuda_rebalances, countIf(event = 'nonce_slot_exhausted') AS nonce_slots_exhausted, countIf(event = 'grind_error') AS grind_errors FROM miner.events WHERE $__timeFilter(ts) GROUP BY time ORDER BY time",
+        "format": "table"
+      }],
+      "fieldConfig": {"defaults": {"unit": "short", "decimals": 0}, "overrides": []},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom"}, "tooltip": {"mode": "multi"}}
+    },
+    {
+      "type": "table",
+      "title": "Recent events",
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 29},
+      "datasource": {"type": "grafana-clickhouse-datasource", "uid": "miner-clickhouse"},
+      "targets": [{"refId": "A", "queryType": "sql", "rawSql": "SELECT ts, machine, event, hps, batch, freeMiB, jobId, token, message FROM miner.events WHERE $__timeFilter(ts) ORDER BY ts DESC LIMIT 100", "format": "table"}],
+      "options": {"showHeader": true}
+    },
+    {
+      "type": "table",
+      "title": "Distinct messages",
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 37},
+      "datasource": {"type": "grafana-clickhouse-datasource", "uid": "miner-clickhouse"},
+      "targets": [{"refId": "A", "queryType": "sql", "rawSql": "SELECT machine, event, message, count() AS occurrences, max(ts) AS last_seen FROM miner.events WHERE message != '' AND $__timeFilter(ts) GROUP BY machine, event, message ORDER BY occurrences DESC, last_seen DESC LIMIT 100", "format": "table"}],
+      "options": {"showHeader": true}
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": ["fulgurminer", "cuda", "wasm"],
+  "templating": {"list": []},
+  "time": {"from": "now-6h", "to": "now"},
+  "title": "FulgurMiner Overview",
+  "uid": "fulgurminer-overview",
+  "version": 2
+}

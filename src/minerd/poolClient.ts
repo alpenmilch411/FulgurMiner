@@ -4,6 +4,7 @@ import { existsSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { GrindPool } from './grindPool.js';
 import { NATIVE_BIN, NativeGrindPool } from './nativeGrindPool.js';
+import { CUDA_HELPER_BIN, CudaGrindPool, cudaRuntimeAvailable } from './cudaGrindPool.js';
 import { hexToBytes } from '../util/binary.js';
 import { HEADER_LEN } from '../chain/block.js';
 import { ConsoleReporter, type MinerReporter, type ReporterStatus } from './reporter.js';
@@ -472,8 +473,12 @@ export async function runPoolClient(
    *  the real engine choice already resolved into `useNative` — never changes
    *  which engine actually mines, only lets a test force this construction
    *  step to throw. */
-  createPool: (useNative: boolean, workers: number, startDuty: number) => GrindPool | NativeGrindPool
-    = (useNative, workers, startDuty) => (useNative ? new NativeGrindPool(workers, startDuty) : new GrindPool(workers, startDuty)),
+  createPool: (useNative: boolean, workers: number, startDuty: number, useCuda?: boolean) => GrindPool | NativeGrindPool | CudaGrindPool
+    = (useNative, workers, startDuty, useCuda = false) => (
+      useCuda ? new CudaGrindPool(workers, startDuty)
+        : useNative ? new NativeGrindPool(workers, startDuty)
+          : new GrindPool(workers, startDuty)
+    ),
 ): Promise<void> {
   // Show "connecting to pool…" as bootstrapping activity before the first job
   // arrives. Pools need no chain sync, but registration + the first job poll
@@ -527,6 +532,7 @@ export async function runPoolClient(
     return;
   }
   let workerId = initialReg.workerId;
+  reporter.workerId?.(workerId);
   const versionFields = {
     latestMinerVersion: initialReg.latestMinerVersion,
     minMinerVersion: initialReg.minMinerVersion,
@@ -538,12 +544,19 @@ export async function runPoolClient(
   // `continuous` grind arg. A stale binary from an older build rejects it and
   // would crash-loop, so probe once and fall back to wasm if missing/outdated.
   const nativeSelected = currentEngine(process.env.MINER_NATIVE) === 'native';
-  const useNative = nativeSelected && existsSync(NATIVE_BIN) && nativeContinuousOk();
+  const cudaSelected = process.env.MINER_CUDA !== undefined
+    && process.env.MINER_CUDA.trim() !== '' && process.env.MINER_CUDA.trim() !== '0';
+  const useNative = !cudaSelected && nativeSelected && existsSync(NATIVE_BIN) && nativeContinuousOk();
+  const useCuda = cudaSelected && cudaRuntimeAvailable(CUDA_HELPER_BIN);
   // Surface the fallback PERSISTENTLY (via status.backendNote, rendered by both
   // reporters) instead of a scrolling event, so the user sees WHY native isn't
   // running without quitting. Distinguish "not built" (needs Rust) from "outdated".
   let backendNote: string | undefined;
-  if (nativeSelected && !useNative) {
+  if (cudaSelected && !useCuda) {
+    backendNote = existsSync(CUDA_HELPER_BIN)
+      ? 'CUDA runtime unavailable — check the NVIDIA driver/toolkit; using wasm'
+      : 'CUDA helper not found — build with make -C cuda-poc cuda-helper; using wasm';
+  } else if (nativeSelected && !useNative) {
     backendNote = existsSync(NATIVE_BIN)
       ? 'native engine outdated — rebuild: cd native/brc-pow && cargo build --release; using wasm'
       : 'native engine not built — install Rust (https://rustup.rs) and build it; using wasm';
@@ -559,7 +572,7 @@ export async function runPoolClient(
     // Correct the passed-in status to what the pool gate actually resolved: the
     // launcher set backend from the engine selection, but nativeContinuousOk() can
     // demote a present-but-stale binary to wasm here.
-    status.backend = useNative ? 'native' : 'wasm';
+    status.backend = useCuda ? 'cuda' : useNative ? 'native' : 'wasm';
     status.backendNote = backendNote;
     // …and to the duty we actually start at, not the manual throttle the launcher
     // baked in (start.ts builds status from cfg.throttle before the mode is applied).
@@ -569,14 +582,14 @@ export async function runPoolClient(
   reporter.status(status ?? {
     mode: 'pool',
     target: poolUrl,
-    backend: useNative ? 'native' : 'wasm',
+    backend: useCuda ? 'cuda' : useNative ? 'native' : 'wasm',
     backendNote,
     workers,
     throttle: startDuty,
     address: payoutAddress,
   });
   reporter.event('info', `[pool-miner] registered worker ${workerId} at ${poolUrl}`);
-  reporter.event('info', `[pool-miner] grind engine: ${useNative ? 'native' : 'wasm'}`);
+  reporter.event('info', `[pool-miner] grind engine: ${useCuda ? 'cuda' : useNative ? 'native' : 'wasm'}`);
   reporter.synced(0);
   let acceptedShares = 0;
 
@@ -588,7 +601,10 @@ export async function runPoolClient(
     try { os.setPriority(10); } catch { /* not permitted on some platforms — ignore */ }
   }
 
-  const pool: GrindPool | NativeGrindPool = createPool(useNative, workers, startDuty);
+  const pool: GrindPool | NativeGrindPool | CudaGrindPool = createPool(useNative, workers, startDuty, useCuda);
+  if (pool instanceof CudaGrindPool) {
+    pool.setInfoLogger((message) => reporter.event('info', `[pool-miner] ${message}`));
+  }
   const smartController = smart !== 'off'
     ? new SmartController(
       pool,
@@ -654,6 +670,7 @@ export async function runPoolClient(
       return;
     }
     workerId = regBody.workerId;
+    reporter.workerId?.(workerId);
     reporter.event('info', `[pool-miner] registered worker ${workerId} at ${poolUrl}`);
   };
 
@@ -783,8 +800,13 @@ export async function runPoolClient(
     // at a stale job, so no in-flight share keeps submitting under a job we're no
     // longer mining. It is re-asserted only AFTER a successful start, below.
     activeJobId = null;
-    pool.stop();
+    // CUDA replaces the job through its START protocol while retaining the
+    // helper process/context. CPU/WASM pools still need an explicit stop.
+    if (!(pool instanceof CudaGrindPool)) pool.stop();
     lastNonzeroTickAt = Date.now();
+    if (pool instanceof CudaGrindPool) {
+      reporter.event('info', `[pool-miner] CUDA_POOL_JOB id=${j.jobId}`);
+    }
     pool.start(
       hexToBytes(j.headerHex),
       j.shareTargetHex,
@@ -799,6 +821,12 @@ export async function runPoolClient(
         reporter.event('info', '[pool-miner] nonce slot exhausted — requesting fresh work');
         exhaustedKey = lastKey;
         lastKey = null;
+        // Do not keep advertising the exhausted job via ?have. A plain /job
+        // request lets the pool issue a fresh nonce slot even when the block
+        // template/job ID itself has not changed.
+        activeJobId = null;
+        forcePlainPoll = true;
+        currentCycle?.abort(new DOMException('nonce slot exhausted', 'WakeError'));
       },
       (err) => reporter.event('warn', `[pool-miner] grind error: ${err.message}`),
       j.nonceStart, // honor the pool's per-worker slot — out-of-slot nonces are
