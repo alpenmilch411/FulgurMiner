@@ -1,5 +1,6 @@
 // src/minerd/miner.ts
 import os from 'node:os';
+import { existsSync } from 'node:fs';
 import { Blockchain, type ReorgDelta } from '../chain/blockchain.js';
 import { hashHeader, type Block, type BlockHeader } from '../chain/block.js';
 import { checkPoW } from '../chain/consensus.js';
@@ -12,7 +13,8 @@ import { VerifierPool, verifyBlocksParallel } from './verify.js';
 import { ChainSync } from './sync.js';
 import { buildTemplate, type Template } from './template.js';
 import { GrindPool } from './grindPool.js';
-import { NativeGrindPool } from './nativeGrindPool.js';
+import { NATIVE_BIN, NativeGrindPool } from './nativeGrindPool.js';
+import { nativePowIsCurrent } from './nativeParity.js';
 import { submitSoloBlock } from './submitSolo.js';
 import { ConsoleReporter, type MinerReporter, type ReporterStatus } from './reporter.js';
 import { restoreSnapshot, saveSnapshot, deleteSnapshot } from './persistence.js';
@@ -592,12 +594,29 @@ export async function runMiner(
   // handle and to persist.
   chainConfirmed = true;
 
-  // Run below normal priority so foreground apps always win the CPU (safeguard).
-  try { os.setPriority(10); } catch { /* not permitted on some platforms — ignore */ }
   // Default = worker_threads + WASM GrindPool (byte-unchanged behavior).
   // Set MINER_NATIVE to use the native Rust grind processes instead (same
   // interface, parity-equivalent solutions, one OS process per nonce range).
-  const useNative = !!process.env.MINER_NATIVE;
+  // Guard as the pool path does: a native binary built before the Sandglass v3
+  // fork (or against the earlier 34,800 fork constant) still grinds Argon2id in the
+  // live range and would solo-mine 100% invalid blocks. Only use native if it
+  // exists AND grinds the current PoW at the fork boundary; otherwise fall back to
+  // wasm and say why. (index.ts's headless solo path never calls resolveEngine, so
+  // this is the only algo gate here.) Resolve this BEFORE lowering priority below:
+  // nativePowIsCurrent() spawns a child that would inherit the lowered priority and
+  // could then time out on a loaded box, falsely demoting a good native binary.
+  const nativeSelected = !!process.env.MINER_NATIVE;
+  const useNative = nativeSelected && existsSync(NATIVE_BIN) && nativePowIsCurrent();
+  let backendNote: string | undefined;
+  if (nativeSelected && !useNative) {
+    backendNote = existsSync(NATIVE_BIN)
+      ? 'native engine outdated — rebuild: cd native/brc-pow && cargo build --release; using wasm'
+      : 'native engine not built — install Rust (https://rustup.rs) and build it; using wasm';
+    reporter.event('warn', `[minerd] ${backendNote}`);
+  }
+
+  // Run below normal priority so foreground apps always win the CPU (safeguard).
+  try { os.setPriority(10); } catch { /* not permitted on some platforms — ignore */ }
   // Smart modes set their OWN starting duty cycle from the mode (Max=100%,
   // Considerate=50%); only Manual uses cfg.throttle. Seeding from cfg.throttle made
   // Smart Max start at a lowered manual throttle and ramp up slowly instead of
@@ -628,6 +647,7 @@ export async function runMiner(
     mode: 'solo',
     target: 'solo',
     backend: useNative ? 'native' : 'wasm',
+    backendNote,
     workers: cfg.workers,
     // The effective starting duty cycle: mode-derived in Smart, the manual value in
     // 'off'. (Not cfg.throttle — that would print the leftover manual throttle while

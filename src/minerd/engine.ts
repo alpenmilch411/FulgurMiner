@@ -6,11 +6,14 @@
 // miner (buildStatus / runMiner) just reads the env as before.
 //
 // Resolution (never blocks mining):
-//   wasm selected                    → wasm.
-//   native selected + binary exists  → native.
-//   native selected + binary missing →
-//       cargo on PATH  → offer to build (cargo build --release in native/brc-pow)
-//                        with a status line; success → native, failure → wasm.
+//   wasm selected                                  → wasm.
+//   native selected + binary reproduces the PoW    → native.
+//   native selected + binary MISSING or STALE      → (a stale binary is one built
+//       before the current PoW fork — it still exists but grinds the old algo and
+//       would mine invalid blocks; existsSync can't tell, so nativePowIsCurrent()
+//       grinds one nonce at the exact fork height and checks the digest)
+//       cargo on PATH  → offer to (re)build (cargo build --release in native/brc-pow)
+//                        with a status line; rebuilt+verified → native, else wasm.
 //       cargo missing  → print the exact build command, fall back to wasm.
 //
 // `MINER_NATIVE=1` set directly in the environment behaves exactly the same: it
@@ -22,6 +25,7 @@ import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline/promises';
 import { stdin as input, stdout as output } from 'node:process';
 import { NATIVE_BIN } from './nativeGrindPool.js';
+import { nativePowIsCurrent } from './nativeParity.js';
 import { currentEngine } from './selectors.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -104,30 +108,45 @@ export async function resolveEngine(
   const ask: Confirm = nonInteractive ? (async () => false) : confirm;
   if (currentEngine(process.env.MINER_NATIVE) !== 'native') return 'wasm';
 
-  // native selected.
-  if (existsSync(NATIVE_BIN)) return 'native';
+  // native selected. A present binary is only trustworthy if it GRINDS the CURRENT
+  // PoW at the fork boundary: after the Sandglass v3 fork a pre-fork build (or one
+  // built against the earlier 34,800 fork constant) still grinds Argon2id in the
+  // live range and would mine invalid blocks, and existsSync can't tell it apart.
+  // Verify with nativePowIsCurrent(); a stale binary is then handled exactly like a
+  // missing one (offer a rebuild / fall back to wasm).
+  const present = existsSync(NATIVE_BIN);
+  if (present && nativePowIsCurrent()) return 'native';
+  if (present) {
+    log('  The native engine is out of date (built before the current PoW fork) — as-is');
+    log('  it would mine invalid blocks, so it must be rebuilt or replaced with wasm.');
+  }
 
-  // Missing binary — try to get one, but NEVER block mining.
+  // No usable binary — try to (re)build one, but NEVER block mining.
   if (hasCargo()) {
     let build = false;
     try {
-      build = await ask('Native engine not built yet. Build it now? (~1 min)');
+      build = await ask(present
+        ? 'Rebuild the native engine now? (~1 min)'
+        : 'Native engine not built yet. Build it now? (~1 min)');
     } catch {
       build = false;
     }
     if (build) {
       log('  Building the native engine (cargo build --release)…');
-      if (buildNative()) {
+      // Re-verify after building: a fresh build from this source should grind the
+      // current PoW, but if the build silently produced a wrong engine we must NOT
+      // return it — fall back to wasm instead of mining invalid work.
+      if (buildNative() && nativePowIsCurrent()) {
         log('  Native engine built. Using native.');
         return 'native';
       }
-      log('  Native build failed — using the wasm engine. If cargo printed a linker/');
-      log('  compiler error, install a C toolchain (Windows: the MSVC build tools via the');
-      log('  Visual Studio installer; macOS: xcode-select --install; Linux: build-essential),');
-      log('  then try again.');
+      log('  Native build did not produce a working engine — using the wasm engine. If');
+      log('  cargo printed a linker/compiler error, install a C toolchain (Windows: the MSVC');
+      log('  build tools via the Visual Studio installer; macOS: xcode-select --install;');
+      log('  Linux: build-essential), then try again.');
     }
   } else {
-    log('  The native engine is ~1.6x faster but needs the Rust toolchain.');
+    log('  The native engine needs the Rust toolchain to (re)build.');
     log('    1) Install Rust from https://rustup.rs (on Windows it also installs the MSVC build tools).');
     log('    2) Open a NEW terminal so cargo is on PATH, then build it:');
     log(`         ${BUILD_CMD}`);

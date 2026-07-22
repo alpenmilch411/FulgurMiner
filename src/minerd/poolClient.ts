@@ -4,6 +4,7 @@ import { existsSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { GrindPool } from './grindPool.js';
 import { NATIVE_BIN, NativeGrindPool } from './nativeGrindPool.js';
+import { nativePowIsCurrent } from './nativeParity.js';
 import { hexToBytes } from '../util/binary.js';
 import { HEADER_LEN } from '../chain/block.js';
 import { ConsoleReporter, type MinerReporter, type ReporterStatus } from './reporter.js';
@@ -534,11 +535,15 @@ export async function runPoolClient(
     releaseNotesUrl: initialReg.releaseNotesUrl,
   };
   void checkForUpdate({ reporter, poolVersionFields: versionFields, signal }).catch(() => {});
-  // Native pool grinding needs a binary that BOTH exists AND understands the
-  // `continuous` grind arg. A stale binary from an older build rejects it and
-  // would crash-loop, so probe once and fall back to wasm if missing/outdated.
+  // Native pool grinding needs a binary that (a) exists, (b) understands the
+  // `continuous` grind arg (an older build rejects it and would crash-loop), and
+  // (c) GRINDS the current PoW at the fork boundary. Post the Sandglass v3 fork a
+  // binary built before the fork (or against the earlier 34,800 fork constant)
+  // still grinds Argon2id in the live range — it passes (a) and (b) but produces
+  // 100% invalid shares — so nativePowIsCurrent() grinds one nonce at exactly the
+  // fork height and checks the digest. Any failure → fall back to wasm.
   const nativeSelected = currentEngine(process.env.MINER_NATIVE) === 'native';
-  const useNative = nativeSelected && existsSync(NATIVE_BIN) && nativeContinuousOk();
+  const useNative = nativeSelected && existsSync(NATIVE_BIN) && nativeContinuousOk() && nativePowIsCurrent();
   // Surface the fallback PERSISTENTLY (via status.backendNote, rendered by both
   // reporters) instead of a scrolling event, so the user sees WHY native isn't
   // running without quitting. Distinguish "not built" (needs Rust) from "outdated".

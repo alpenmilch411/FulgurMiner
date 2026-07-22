@@ -13,9 +13,17 @@ export interface MinerConfig {
   poolUrl?: string; // set via MINER_POOL; enables pool-client mode
 }
 
+// The official BrowserCoin API helper set. Reads try them in rotation and take the
+// first that answers, and every fetched block is independently validated, so adding
+// community-run helpers costs no trust and only adds failover headroom. Keeping only
+// the two browsercoin.org hosts stranded solo miners with "all helpers failed" when
+// that origin had an outage (both down at once) — the community helpers keep the tip
+// reachable through it. Override with MINER_HELPERS.
 const DEFAULT_HELPERS = [
   'https://api1.browsercoin.org',
   'https://api2.browsercoin.org',
+  'https://api1.taitech.eu',
+  'https://api1.cryptec.tech',
 ];
 
 // FulgurPool — the default mining target. FULGURPOOL_URL is the default pool
