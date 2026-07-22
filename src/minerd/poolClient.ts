@@ -99,6 +99,54 @@ export function shouldRegrind(key: string, lastKey: string | null, exhaustedKey:
   return key !== exhaustedKey && key !== lastKey;
 }
 
+/** Grind-watchdog tuning. A grind that HAS produced then goes silent for STALL_MS is a
+ *  stall; a grind that has NOT produced yet (booting / just re-issued) is given
+ *  BOOT_GRACE_MS since the episode (re)started before that counts — so a slow VPS
+ *  worker isn't killed mid-boot, and a respawn's fresh workers get time to come up. */
+export const WATCHDOG_STALL_MS = 12_000;
+export const WATCHDOG_BOOT_GRACE_MS = 30_000;
+/** Stall strikes before the heavy remedy. The 1st..(K-1)th stall re-applies the
+ *  current job to the existing workers (cheap); the Kth respawns the worker pool. */
+export const WATCHDOG_RESPAWN_AFTER_STRIKES = 2;
+export const WATCHDOG_INTERVAL_MS = 3_000;
+
+export type WatchdogAction = 'ok' | 're-apply' | 'respawn';
+
+/**
+ * Pure decision for the grind watchdog, evaluated on every WATCHDOG_INTERVAL_MS tick.
+ *
+ * The old watchdog respawned ALL workers on the FIRST STALL_MS with no hashes. On a
+ * constrained / oversubscribed VPS a full respawn (fresh tsx workers + wasm init) can
+ * itself take longer than STALL_MS, so it never recovers before the next check and
+ * self-sustains — the user sees "no hashes for >12s — restarting grind" on repeat.
+ *
+ * This escalates and separates two states so ordinary job churn can't mask a real stall
+ * and a slow boot isn't mistaken for one:
+ *  - dormant while stopped or between jobs (no active job);
+ *  - `producing` (the current grind episode has landed ≥1 hash): a stall is msSinceTick
+ *    past STALL_MS — keyed on the last REAL hash, NOT reset by job changes;
+ *  - not yet `producing` (booting / just re-issued): a stall is msSinceGrindStart past
+ *    BOOT_GRACE_MS — the episode never produced within its grace;
+ *  - on a stall → RE-APPLY the job to the existing workers (cheap; recovers a transient
+ *    starvation / a briefly wedged grind) for the first (K-1) strikes, then RESPAWN on
+ *    the Kth. `strikes` counts prior consecutive strikes; a real hash resets it to 0.
+ */
+export function watchdogDecision(args: {
+  stopped: boolean;
+  hasActiveJob: boolean;
+  producing: boolean;
+  msSinceTick: number;
+  msSinceGrindStart: number;
+  strikes: number;
+}): WatchdogAction {
+  if (args.stopped || !args.hasActiveJob) return 'ok';
+  const stalled = args.producing
+    ? args.msSinceTick > WATCHDOG_STALL_MS
+    : args.msSinceGrindStart > WATCHDOG_BOOT_GRACE_MS;
+  if (!stalled) return 'ok';
+  return args.strikes + 1 >= WATCHDOG_RESPAWN_AFTER_STRIKES ? 'respawn' : 're-apply';
+}
+
 /** /job poll cadence (ms). Default 1000. After the pool's tip advances, a headless
  *  miner keeps grinding the OLD job until its next /job poll — blocks found in that
  *  window are born stale and get orphaned. Polling every ~1s (vs the old ~3s) closes
@@ -623,6 +671,15 @@ export async function runPoolClient(
   let lastKey: string | null = null;
   let exhaustedKey: string | null = null;
   let lastNonzeroTickAt = Date.now();
+  // When the current grind EPISODE (re)started — a not-yet-producing grind gets a boot
+  // grace from here before the stall watchdog counts, so a slow-booting worker isn't
+  // killed mid-boot. Reset only on an episode start (idle→grinding), not job churn.
+  let grindStartedAt = Date.now();
+  // Has the current episode landed ≥1 real hash? Until it has, the watchdog judges by
+  // the boot grace; after, by time since the last hash. Set on hps>0, reset on episode start.
+  let grindProducing = false;
+  // Consecutive watchdog stall strikes; reset to 0 by any real hash (see onHashrate).
+  let watchdogStrikes = 0;
   // the jobId currently being ground (set synchronously in refresh). A solved
   // nonce whose job has rolled is stale -> submitShare drops it before POSTing.
   let activeJobId: string | null = null;
@@ -788,14 +845,19 @@ export async function runPoolClient(
     // at a stale job, so no in-flight share keeps submitting under a job we're no
     // longer mining. It is re-asserted only AFTER a successful start, below.
     activeJobId = null;
+    // An "episode" begins when a grind (re)starts from idle — the initial job, the job
+    // after a slot exhaustion, or a watchdog restart (all leave lastKey === null). Only
+    // then does the boot-grace clock restart and `producing` reset: a job-to-job change
+    // reuses already-producing workers, so it must NOT reset those (else ordinary job
+    // churn would keep masking a real stall — see watchdogDecision).
+    const episodeStart = lastKey === null;
     pool.stop();
-    lastNonzeroTickAt = Date.now();
     pool.start(
       hexToBytes(j.headerHex),
       j.shareTargetHex,
       onNonce(j),
       (hps) => {
-        if (hps > 0) lastNonzeroTickAt = Date.now();
+        if (hps > 0) { lastNonzeroTickAt = Date.now(); watchdogStrikes = 0; grindProducing = true; }
         smartController?.onHashrate(hps);
         reporter.hashrate(hps);
         if (smartController) reporter.smart?.({ mode: smart as 'max' | 'considerate', throttle: smartController.appliedThrottle(), clamped: smartController.isClamped(), phase: smartController.phase() });
@@ -811,6 +873,10 @@ export async function runPoolClient(
       true,         // share mode: keep grinding the slot for many shares per job
     );
     lastKey = key;
+    if (episodeStart) {
+      grindStartedAt = Date.now();
+      grindProducing = false; // this episode must land its own first hash
+    }
     // nonces solved from here are valid for this job until it rolls. Set only AFTER a
     // successful pool.start (which fires onNonce asynchronously), synchronously here.
     activeJobId = j.jobId;
@@ -866,14 +932,31 @@ export async function runPoolClient(
   if (!stopped) {
     smartController?.start();
     watchdogTimer = setInterval(() => {
-      if (stopped || lastKey === null) return;
-      if (Date.now() - lastNonzeroTickAt <= 12_000) return;
-      reporter.event('warn', '[pool-miner] no hashes for >12s — restarting grind');
-      pool.respawn();
+      const now = Date.now();
+      const action = watchdogDecision({
+        stopped,
+        hasActiveJob: lastKey !== null,
+        producing: grindProducing,
+        msSinceTick: now - lastNonzeroTickAt,
+        msSinceGrindStart: now - grindStartedAt,
+        strikes: watchdogStrikes,
+      });
+      if (action === 'ok') return;
+      // Both remedies clear lastKey + wake(): the poll loop then re-applies the current
+      // job (via refresh, whose episode-start resets the boot-grace clock + `producing`,
+      // giving the re-issued grind time to produce before the next strike). Re-apply
+      // reuses the existing workers (cheap); respawn replaces them.
+      watchdogStrikes++;
+      if (action === 'respawn') {
+        reporter.event('warn', `[pool-miner] grind still stalled after ${watchdogStrikes} tries — restarting workers (a box stuck at 0 H/s may be out of memory or CPU-starved; try lowering MINER_WORKERS)`);
+        pool.respawn();
+        watchdogStrikes = 0;
+      } else {
+        reporter.event('warn', `[pool-miner] grind stalled — re-applying work (attempt ${watchdogStrikes})`);
+      }
       lastKey = null;
-      lastNonzeroTickAt = Date.now();
       wake(); // interrupt the long-poll + force an immediate plain re-poll to re-apply work
-    }, 3000);
+    }, WATCHDOG_INTERVAL_MS);
   }
 
   if (!stopped) {

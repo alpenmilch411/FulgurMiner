@@ -419,3 +419,30 @@ test('NativeGrindPool exhaustion quorum treats permanently down children as comp
     pool.terminate();
   }
 });
+
+// Regression: at throttle 1 (Max) the POST-fork PoW (Sandglass) is synchronous, so a
+// worker's `await powHash` only drains microtasks and — without a periodic macrotask
+// yield — never services queued control messages. A `stop()`+`start()` (the watchdog's
+// "re-apply", and any job change) would then be ignored and the worker stays on the old
+// generation forever. This asserts the worker LEAVES gen1 and picks up gen2 at throttle 1.
+test('GrindPool at throttle 1 picks up a new generation on a synchronous (post-fork) grind', { timeout: 30_000 }, async () => {
+  // height 0x0000830e = 33550 (>= fork) → powHash takes the synchronous Sandglass path.
+  const POST_FORK = new Uint8Array(148);
+  POST_FORK[2] = 0x83;
+  POST_FORK[3] = 0x0e;
+  const noop = (): void => {};
+  const pool = new GrindPool(1, 1); // 1 worker, throttle 1 (Max)
+  try {
+    // gen1: impossible target (0) — grinds a huge range forever, never solves.
+    pool.start(POST_FORK, '0'.repeat(64), noop, noop, noop, noop, 0, 2 ** 31, true);
+    await new Promise((r) => setTimeout(r, 400)); // let the worker enter gen1's tight loop
+    // gen2: easy target (max) — nonce 0 always solves, IF the worker leaves gen1.
+    let solvedGen2 = false;
+    pool.stop();
+    pool.start(POST_FORK, 'f'.repeat(64), () => { solvedGen2 = true; }, noop, noop, noop, 0, 8, false);
+    await waitFor('gen2 solve at throttle 1', () => (solvedGen2 ? true : undefined), 15_000);
+    assert.equal(solvedGen2, true);
+  } finally {
+    pool.terminate();
+  }
+});

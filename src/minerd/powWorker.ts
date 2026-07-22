@@ -98,6 +98,14 @@ async function grind(msg: GrindMsg): Promise<void> {
       port.postMessage({ type: 'hashrate', gen: myGen, hashes });
       hashes = 0;
       lastReport = now;
+      // Yield a MACROTASK (~once/sec) so queued control messages (stop / a new grind
+      // generation) are actually dispatched. POST-fork the hash is SYNCHRONOUS, so at
+      // throttle 1 the `await powHash` above only drains microtasks and the message
+      // queue is never serviced — a stop/re-grind would otherwise go unseen and the
+      // worker would grind a stale generation forever. Below throttle 1 the sleep above
+      // already yields; this makes throttle 1 behave the same.
+      await new Promise((r) => setImmediate(r));
+      if (currentGen !== myGen) return; // a queued stop/new-gen may have just landed
     }
   }
   port.postMessage({ type: 'exhausted', gen: myGen });
