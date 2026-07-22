@@ -1,6 +1,24 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { runShareSubmit, type ShareSubmitDeps } from './poolClient.js';
+import { runShareSubmit, shouldWakeOnStale, type ShareSubmitDeps } from './poolClient.js';
+
+// shouldWakeOnStale coalesces the re-poll: a stale verdict wakes the job-poll loop
+// ONLY when it is for the CURRENT active job AND we haven't already woken for that job.
+// This stops a burst of concurrent stale verdicts from repeatedly aborting the recovery
+// poll, and stops a LATE stale (for an already-superseded job) from aborting a healthy
+// poll for the new job.
+test('shouldWakeOnStale: current active job, not yet woken → wake', () => {
+  assert.equal(shouldWakeOnStale('J1', 'J1', null), true);
+});
+test('shouldWakeOnStale: same job already woken → do NOT wake again (coalesce a burst)', () => {
+  assert.equal(shouldWakeOnStale('J1', 'J1', 'J1'), false);
+});
+test('shouldWakeOnStale: stale is for an OLD job, we already moved on → ignore', () => {
+  assert.equal(shouldWakeOnStale('J1', 'J2', 'J1'), false);
+});
+test('shouldWakeOnStale: a fresh active job that just went stale (last woken was a prior job) → wake', () => {
+  assert.equal(shouldWakeOnStale('J2', 'J2', 'J1'), true);
+});
 
 // retry-until-terminal-or-roll + caps + captured {workerId,epoch} core,
 // tested as a pure function with injected fakes — no network, no timers.
@@ -12,10 +30,11 @@ interface Calls {
   accepted: boolean[];
   backoffs: { attempt: number; retryAfterMs?: number }[];
   sleeps: number[];
+  stales: number;
 }
 
 function makeDeps(over: Partial<ShareSubmitDeps> = {}): { deps: ShareSubmitDeps; calls: Calls; setNow: (v: number) => void } {
-  const calls: Calls = { posts: [], shares: [], events: [], accepted: [], backoffs: [], sleeps: [] };
+  const calls: Calls = { posts: [], shares: [], events: [], accepted: [], backoffs: [], sleeps: [], stales: 0 };
   let t = 0;
   const deps: ShareSubmitDeps = {
     post: async (s) => { calls.posts.push(s); return { status: 200, result: 'accepted' }; },
@@ -27,6 +46,7 @@ function makeDeps(over: Partial<ShareSubmitDeps> = {}): { deps: ShareSubmitDeps;
     getEpoch: () => 0,
     reporter: { share: (ok, label) => calls.shares.push({ ok, label }), event: (kind, msg) => calls.events.push({ kind, msg }) },
     onAccepted: (block) => calls.accepted.push(block),
+    onStale: () => { calls.stales++; },
     deadlineMs: 120_000,
     ...over,
   };
@@ -55,6 +75,26 @@ test('terminal rejected -> true, reporter.share(false), onAccepted NOT called', 
   assert.equal(r, true);
   assert.deepEqual(calls.shares, [{ ok: false, label: 'invalid' }]);
   assert.equal(calls.accepted.length, 0);
+});
+
+test('STALE verdict -> onStale() fires (signal to re-poll the current job) + reporter.share(false)', async () => {
+  const { deps, calls } = makeDeps({ post: async () => ({ status: 200, result: 'stale' }) });
+  const r = await runShareSubmit(deps, 'w', 'job1', 0, 1);
+  assert.equal(r, true);
+  assert.equal(calls.stales, 1);
+  assert.deepEqual(calls.shares, [{ ok: false, label: 'stale' }]);
+});
+
+test('a non-stale reject (invalid) does NOT fire onStale', async () => {
+  const { deps, calls } = makeDeps({ post: async () => ({ status: 200, result: 'invalid' }) });
+  await runShareSubmit(deps, 'w', 'job1', 0, 1);
+  assert.equal(calls.stales, 0);
+});
+
+test('an accepted share does NOT fire onStale', async () => {
+  const { deps, calls } = makeDeps();
+  await runShareSubmit(deps, 'w', 'job1', 0, 1);
+  assert.equal(calls.stales, 0);
 });
 
 test('429 then 200 -> retries, backs off once, returns accepted', async () => {

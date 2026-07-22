@@ -99,6 +99,21 @@ export function shouldRegrind(key: string, lastKey: string | null, exhaustedKey:
   return key !== exhaustedKey && key !== lastKey;
 }
 
+/** Should a `stale` share verdict trigger an immediate /job re-poll? Only when the
+ *  stale share is for the CURRENT active job (`staleJobId === activeJobId`) AND we
+ *  haven't already woken for that job (`staleJobId !== lastStaleWakeJob`). This
+ *  coalesces a burst of concurrent stale verdicts for the same job into ONE re-poll
+ *  (so repeated wakes can't keep aborting the recovery poll) and ignores a LATE stale
+ *  for a job we've already rolled past (so it can't abort a healthy poll for the new
+ *  job). The caller sets lastStaleWakeJob = staleJobId when this returns true. */
+export function shouldWakeOnStale(
+  staleJobId: string,
+  activeJobId: string | null,
+  lastStaleWakeJob: string | null,
+): boolean {
+  return staleJobId === activeJobId && staleJobId !== lastStaleWakeJob;
+}
+
 /** Grind-watchdog tuning. A grind that HAS produced then goes silent for STALL_MS is a
  *  stall; a grind that has NOT produced yet (booting / just re-issued) is given
  *  BOOT_GRACE_MS since the episode (re)started before that counts — so a slow VPS
@@ -345,6 +360,13 @@ export interface ShareSubmitDeps {
   reporter: { share: (ok: boolean, label: string) => void; event: (kind: 'info' | 'warn', msg: string) => void };
   /** Called on a terminal accepted/block verdict (bump counters + block log). */
   onAccepted: (block: boolean) => void;
+  /** Called with the share's jobId on a `stale` pool verdict — a definitive "this job
+   *  already rolled" signal. Lets the caller force an immediate /job re-poll so the
+   *  miner switches to the current job instead of grinding the stale one for the rest
+   *  of the poll window and submitting a storm of further stale shares. The jobId lets
+   *  the caller ignore a late verdict for an already-superseded job and coalesce a burst
+   *  of concurrent stale verdicts into a single re-poll (see shouldWakeOnStale). */
+  onStale?: (jobId: string) => void;
   /** Per-share wall-clock ceiling — caps retries during a long same-job outage. */
   deadlineMs: number;
 }
@@ -400,6 +422,11 @@ export async function runShareSubmit(
       continue;
     }
     if (outcome === 'rejected') {
+      // A `stale` verdict means the pool has already rolled the job we submitted for.
+      // Signal the caller to re-poll /job NOW so we switch to the current job instead
+      // of grinding this stale one for the rest of the poll window and posting a storm
+      // of further stale shares (the activeJobId gate above then drops the old ones).
+      if (r.result === 'stale') deps.onStale?.(jId);
       deps.reporter.share(false, r.result ?? 'rejected');
       return true;
     }
@@ -683,6 +710,9 @@ export async function runPoolClient(
   // the jobId currently being ground (set synchronously in refresh). A solved
   // nonce whose job has rolled is stale -> submitShare drops it before POSTing.
   let activeJobId: string | null = null;
+  // the last job a stale verdict woke a re-poll for — coalesces a burst of stale
+  // verdicts for the same job into a single re-poll (see shouldWakeOnStale / onStale).
+  let lastStaleWakeJob: string | null = null;
   // submission-identity epoch, bumped on reregister. A share captures the epoch
   // at solve time and bails if it rolls, so a retry never posts under a new workerId.
   let epoch = 0;
@@ -738,6 +768,19 @@ export async function runPoolClient(
         onAccepted: (block) => {
           acceptedShares++;
           if (block) reporter.event('info', '[pool-miner] BLOCK FOUND — >=50 BRC! (reward + finder bonus credit after maturity)');
+        },
+        // A stale verdict = the pool already rolled the job we submitted for; re-poll
+        // /job immediately so we switch to the current job (the activeJobId gate then
+        // drops old-job shares) instead of grinding the stale one and posting a storm of
+        // stale shares. Coalesced + job-guarded (shouldWakeOnStale): a BURST of stale
+        // verdicts for the same job wakes once (repeated wakes would keep aborting the
+        // recovery poll), and a LATE stale for a job we've already rolled past is ignored
+        // (it must not abort a healthy poll for the current job).
+        onStale: (staleJobId) => {
+          if (shouldWakeOnStale(staleJobId, activeJobId, lastStaleWakeJob)) {
+            lastStaleWakeJob = staleJobId;
+            wake();
+          }
         },
         deadlineMs: SHARE_DEADLINE_MS,
       },
