@@ -14,6 +14,7 @@ import {
   MAX_BLOCK_BYTES,
   MAX_FUTURE_TIME_S,
   MTP_WINDOW,
+  SANDGLASS2_ANCHOR_HEIGHT,
 } from './genesis.js';
 
 // Retarget reads up to DIFFICULTY_WINDOW headers, and MTP at the window
@@ -43,6 +44,14 @@ export interface ChainBlock {
    * (when extending) and the snapshot writer ever read a non-tip block's state.
    */
   state: State | null;
+  /**
+   * Header of the fork-#3 ASERT anchor (the block at SANDGLASS2_ANCHOR_HEIGHT)
+   * on the branch ending at this block, or null below that height. Inherited
+   * from the parent on insert, so the lookup is O(1) and stays correct across
+   * reorgs — walking back to a fixed height per block would be O(n) each, i.e.
+   * O(n²) over a sync. Stored as a shared reference: one pointer per block.
+   */
+  sandglass2Anchor: BlockHeader | null;
 }
 
 /**
@@ -98,6 +107,7 @@ export class Blockchain {
       hash: genHash,
       work: blockWork(GENESIS.header.difficulty),
       state: emptyState(),
+      sandglass2Anchor: null,
     });
     this.tipHash = genHashHex;
   }
@@ -183,6 +193,38 @@ export class Blockchain {
   }
 
   /**
+   * The fork-#3 anchor a child of this block would retarget against: the block
+   * itself once it reaches SANDGLASS2_ANCHOR_HEIGHT, otherwise whatever its
+   * parent carries.
+   */
+  private inheritAnchor(parent: ChainBlock | undefined, header: BlockHeader): BlockHeader | null {
+    if (header.height === SANDGLASS2_ANCHOR_HEIGHT) return header;
+    return parent?.sandglass2Anchor ?? null;
+  }
+
+  /**
+   * Difficulty a block mined on top of `parentHashHex` must carry. Single place
+   * that assembles every input `nextDifficulty` needs (lookback window + fork-#3
+   * anchor), so callers can't forget one.
+   *
+   * `candidateTimestamp` is REQUIRED: `nextDifficulty` gates the emergency-drop
+   * branch on it being defined, so a no-arg call would silently compute the
+   * un-dropped difficulty while `addBlockInternal` computes the dropped one for
+   * the same block — the miner would grind a template that fails its own
+   * validation with `bad difficulty`.
+   */
+  expectedNextDifficulty(candidateTimestamp: number, parentHashHex: string = this.tipHash): number {
+    const parent = this.blocks.get(parentHashHex);
+    if (!parent) throw new Error('unknown parent for difficulty lookup');
+    return nextDifficulty(
+      parent.block.header.height + 1,
+      this.getRecentHeaders(RETARGET_LOOKBACK, parentHashHex),
+      candidateTimestamp,
+      parent.sandglass2Anchor,
+    );
+  }
+
+  /**
    * Try to add a block. Validates fully: parent exists, PoW, header roots match,
    * timestamp rules, tx signatures + balance/nonce, block size cap. Returns null
    * on success, or an error message.
@@ -235,7 +277,12 @@ export class Blockchain {
 
     // Difficulty must match what the chain expects at this height.
     const lookbackHeaders = this.getRecentHeaders(RETARGET_LOOKBACK, parentHashHex);
-    const expectedDiff = nextDifficulty(header.height, lookbackHeaders, header.timestamp);
+    const expectedDiff = nextDifficulty(
+      header.height,
+      lookbackHeaders,
+      header.timestamp,
+      parent.sandglass2Anchor,
+    );
     if (header.difficulty !== expectedDiff) {
       return `bad difficulty (expected ${expectedDiff.toString(16)} got ${header.difficulty.toString(16)})`;
     }
@@ -281,7 +328,13 @@ export class Blockchain {
 
     // All good. Cache the block and update tip if this branch is now heaviest.
     const work = parent.work + blockWork(header.difficulty);
-    const accepted: ChainBlock = { block, hash, work, state: newState };
+    const accepted: ChainBlock = {
+      block,
+      hash,
+      work,
+      state: newState,
+      sandglass2Anchor: this.inheritAnchor(parent, header),
+    };
     this.blocks.set(hashHex, accepted);
 
     const prevTipHex = this.tipHash;
@@ -372,9 +425,22 @@ export class Blockchain {
 
     const parent = this.blocks.get(bytesToHex(header.prevHash));
     if (!parent) return 'parent block unknown';
+    // Height must follow the parent — the same check addBlockInternal makes.
+    // Load-bearing since fork #3: inheritAnchor keys the ASERT anchor off
+    // header.height alone, so one corrupt snapshot/IDB row claiming height
+    // SANDGLASS2_ANCHOR_HEIGHT at the wrong depth would become this branch's
+    // anchor for the whole restored chain, and the tab would then compute a
+    // difficulty schedule no peer agrees with — rejecting every real block.
+    if (header.height !== parent.block.header.height + 1) return 'height not parent+1';
 
     const work = parent.work + blockWork(header.difficulty);
-    this.blocks.set(hashHex, { block, hash, work, state });
+    this.blocks.set(hashHex, {
+      block,
+      hash,
+      work,
+      state,
+      sandglass2Anchor: this.inheritAnchor(parent, header),
+    });
 
     if (state !== null) {
       // The designated canonical anchor — force it to be the tip so the tail

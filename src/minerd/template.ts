@@ -1,14 +1,11 @@
 // src/minerd/template.ts
 import type { Blockchain } from '../chain/blockchain.js';
 import { encodeHeader, computeTxRoot, type BlockHeader } from '../chain/block.js';
-import { medianTimePast, nextDifficulty } from '../chain/consensus.js';
+import { medianTimePast } from '../chain/consensus.js';
 import { applyBlockTxs, cloneState, stateRoot, type State } from '../chain/state.js';
 import { scriptsActiveForMtp } from '../chain/fork.js';
-import { DIFFICULTY_WINDOW, MTP_WINDOW } from '../chain/genesis.js';
+import { MTP_WINDOW } from '../chain/genesis.js';
 import { compactToTarget } from '../util/binary.js';
-
-// Matches RETARGET_LOOKBACK in blockchain.ts (not exported there).
-const RETARGET_LOOKBACK = DIFFICULTY_WINDOW + MTP_WINDOW - 1;
 
 export interface Template {
   header: BlockHeader;       // nonce = 0; the grinder mutates it
@@ -25,8 +22,10 @@ export function buildTemplate(chain: Blockchain, minerPubkey: Uint8Array): Templ
   const mtp = medianTimePast(chain.getRecentHeaders(MTP_WINDOW));
   const timestamp = Math.max(now, mtp + 1); // strictly above MTP; honest clock otherwise
 
-  const lookback = chain.getRecentHeaders(RETARGET_LOOKBACK);
-  const difficulty = nextDifficulty(height, lookback, timestamp);
+  // Fork #3: delegate to the chain so the fork-#3 anchor (block 35,550's real
+  // header) is fed in the same way the validator (addBlockInternal) does — a
+  // bare nextDifficulty() would omit it and throw above SANDGLASS2_ANCHOR_HEIGHT.
+  const difficulty = chain.expectedNextDifficulty(timestamp);
 
   const txRoot = computeTxRoot([]);
   const postState = cloneState(chain.tipState);

@@ -116,7 +116,10 @@ async function buildBlockOn(
   const height = parent.block.header.height + 1;
 
   const lookback = chain.getRecentHeaders(DIFFICULTY_WINDOW + MTP_WINDOW - 1, parentHashHex);
-  const difficulty = nextDifficulty(height, lookback, timestamp);
+  // Fork #3 adds a 4th arg (the block-35,550 anchor); this capstone only builds
+  // low real-heights (script fork #1), far below SANDGLASS2_ANCHOR_HEIGHT, so the
+  // anchor is always null here.
+  const difficulty = nextDifficulty(height, lookback, timestamp, null);
 
   // Apply against a clone of the parent's immutable state to derive stateRoot —
   // identical to how addBlockInternal will re-derive + check it on insert.

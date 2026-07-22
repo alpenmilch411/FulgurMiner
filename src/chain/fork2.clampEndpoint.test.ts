@@ -5,6 +5,7 @@ import {
   SANDGLASS_FORK_HEIGHT,
   SANDGLASS_ANCHOR_TIMESTAMP,
   SANDGLASS_ANCHOR_CLAMP_BLOCKS,
+  SANDGLASS2_ANCHOR_HEIGHT,
 } from './genesis.js';
 import { compactToTarget } from '../util/binary.js';
 
@@ -38,19 +39,27 @@ describe('fork #2 — difficulty clamp WINDOW ENDPOINT (repo-only guard)', () =>
   const anchorTarget = compactToTarget(SANDGLASS_ANCHOR_DIFFICULTY_COMPACT);
 
   it('CLAMPS the last block in the window (nextHeight = fork + CLAMP_BLOCKS)', () => {
+    // == SANDGLASS2_ANCHOR_HEIGHT, still inside the fork-#2 clamp window (frozen
+    // history that must keep validating). Anchor is null: fork #3 owns > this.
     const nextHeight = SANDGLASS_FORK_HEIGHT + SANDGLASS_ANCHOR_CLAMP_BLOCKS;
+    expect(nextHeight).toBe(SANDGLASS2_ANCHOR_HEIGHT);
     const parent = hdr({ height: nextHeight - 1, timestamp: earlyTs });
-    const d = nextDifficulty(nextHeight, [parent], earlyTs + 1);
+    const d = nextDifficulty(nextHeight, [parent], earlyTs + 1, null);
     // Held at the 4× clamp floor (target ≈ anchorTarget/4), NOT exploded below it.
     expect(compactToTarget(d)).toBeGreaterThan(anchorTarget / 8n);
     expect(compactToTarget(d)).toBeLessThan(anchorTarget); // still harder than the reset
   });
 
-  it('does NOT clamp one block past the window (nextHeight = fork + CLAMP_BLOCKS + 1)', () => {
+  it('hands the block one past the window to fork #3, not the fork-#2 raw tail', () => {
+    // fork + CLAMP_BLOCKS + 1 == SANDGLASS2_ANCHOR_HEIGHT + 1: the exact block
+    // where the fork-#2 clamp used to expire and discharge all its accumulated
+    // drift in one retarget — the cliff that bricked the chain. Fork #3
+    // intercepts it (anchored on the REAL block SANDGLASS2_ANCHOR_HEIGHT) instead
+    // of falling through to the raw fork-#2 tail, and without the real anchor it
+    // REFUSES to retarget rather than guess.
     const nextHeight = SANDGLASS_FORK_HEIGHT + SANDGLASS_ANCHOR_CLAMP_BLOCKS + 1;
+    expect(nextHeight).toBe(SANDGLASS2_ANCHOR_HEIGHT + 1);
     const parent = hdr({ height: nextHeight - 1, timestamp: earlyTs });
-    const d = nextDifficulty(nextHeight, [parent], earlyTs + 1);
-    // Clamp no longer applies → the raw exploded target, far below the 4× floor.
-    expect(compactToTarget(d)).toBeLessThan(anchorTarget / 8n);
+    expect(() => nextDifficulty(nextHeight, [parent], earlyTs + 1, null)).toThrow(/anchor header/);
   });
 });

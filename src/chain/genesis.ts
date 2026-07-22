@@ -216,3 +216,28 @@ export const SANDGLASS_ANCHOR_CLAMP_BLOCKS = 2000;
 // value = a different reset difficulty at SANDGLASS_FORK_HEIGHT = we reject the
 // canonical fork block and wedge. Only change it to track an upstream change.
 export const SANDGLASS_ANCHOR_ATTEMPTS = 5_000_000;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Fork #3 — difficulty repair (emergency hardfork).
+//
+// Fork #2 re-anchored ASERT on a HARDCODED-GUESS timestamp and bounded the
+// result with SANDGLASS_ANCHOR_CLAMP_BLOCKS. That clamp is integral windup: it
+// bounds the target while drift accumulates behind it, so difficulty pinned at
+// the 4× ceiling and at clamp expiry (SANDGLASS_FORK_HEIGHT + CLAMP_BLOCKS) the
+// whole accumulated error would discharge in one retarget → the chain becomes
+// unmineable and freezes.
+//
+// Fix: from SANDGLASS2_ANCHOR_HEIGHT + 1 on, use plain UNBOUNDED ASERT anchored
+// on the REAL header of block SANDGLASS2_ANCHOR_HEIGHT — its actual mined
+// timestamp AND its actual difficulty, both read from the chain, neither
+// guessed. No clamp, no settling band, no reset difficulty, no future cliff. See
+// nextDifficulty (consensus.ts). Blocks at/below this height compute
+// byte-for-byte unchanged (the fork-#2 path stays frozen), so there is no split
+// — the old chain simply halts here on its own.
+//
+// This height is the ONLY constant fork #3 introduces. It equals
+// SANDGLASS_FORK_HEIGHT + SANDGLASS_ANCHOR_CLAMP_BLOCKS (33,550 + 2,000) — the
+// last block the old rules can still produce.
+// ⚠️ FOLLOWER: byte-matched to upstream (11e2da7). A locally-tuned value = a
+// different anchor height = a difficulty schedule no peer agrees with → wedge.
+export const SANDGLASS2_ANCHOR_HEIGHT = 35_550;
