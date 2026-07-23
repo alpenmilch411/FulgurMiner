@@ -343,3 +343,21 @@ test('coldStart: bootstrap rejection propagates to the caller (existing error ha
   deps.bootstrap = async () => { throw new Error('all helpers failed'); };
   await assert.rejects(() => negotiatedColdStart(deps), /all helpers failed/);
 });
+
+test('coldStart: abort landing during bootstrap → ok:false (the final gate decides)', async () => {
+  const { deps, calls, state } = coldDeps();
+  deps.bootstrap = async () => { calls.push('bootstrap'); state.aborted = true; };
+  assert.deepEqual(await negotiatedColdStart(deps), { ok: false, warm: false });
+  assert.equal(calls.filter((c) => c === 'bootstrap').length, 1);
+});
+
+test('coldStart: a throw from the gate-failure re-bootstrap propagates too', async () => {
+  const { deps, calls } = coldDeps({ restore: { restored: true, anchorHeight: 9 }, integrity: false });
+  let boots = 0;
+  deps.bootstrap = async () => {
+    calls.push('bootstrap');
+    if (++boots === 2) throw new Error('helpers gone');
+  };
+  await assert.rejects(() => negotiatedColdStart(deps), /helpers gone/);
+  assert.equal(boots, 2);
+});
