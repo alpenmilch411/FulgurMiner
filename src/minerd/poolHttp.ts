@@ -14,12 +14,20 @@ const POOL_FETCH_TIMEOUT_MS = 15_000;
 export type RespClass = 'ok' | 'transient' | 'fatal';
 export function classify(status: number): RespClass {
   if (status === 200) return 'ok';
-  if (status === 429 || status === 503) return 'transient';
+  // 429 + any 5xx are transient: a cold origin (Render/Cloudflare) commonly answers
+  // 502/500/504 while spinning up, and every miner in the field would otherwise crash
+  // on it (withPoolRetry throws PoolError -> register/refresh rethrow -> process exit
+  // on the headless path). 4xx stay fatal so the explicit 400/404/410/426 handlers run.
+  if (status === 429 || (status >= 500 && status <= 599)) return 'transient';
   return 'fatal';
 }
 
 export function backoffDelay(attempt: number, opts: { retryAfterMs?: number; rnd?: () => number } = {}): number {
-  if (opts.retryAfterMs && opts.retryAfterMs > 0) return opts.retryAfterMs;
+  // Clamp a server-supplied Retry-After to the same 30s ceiling as the exponential
+  // path: an unbounded header (Retry-After: 86400, or a ratelimit-reset parsed as an
+  // absolute epoch) would otherwise park registration idle for hours. The /share path
+  // already clamps via clampShareDelay; this makes the register/poll path match.
+  if (opts.retryAfterMs && opts.retryAfterMs > 0) return Math.min(30_000, opts.retryAfterMs);
   const rnd = opts.rnd ?? Math.random;
   const base = Math.min(30_000, 1_000 * 2 ** attempt);
   const jitter = base * 0.2 * (rnd() * 2 - 1); // ±20%

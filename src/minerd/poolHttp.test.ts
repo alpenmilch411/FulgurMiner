@@ -91,3 +91,27 @@ test('poolFetch honors a short custom timeout (fires TimeoutError, fast)', async
   const call = poolFetch('http://x/job', {}, 20, hangFetch);
   await assert.rejects(() => Promise.race([call, sentinel]), (e) => (e as Error).name === 'TimeoutError');
 });
+
+test('classify: all 5xx are transient (a cold origin 502/500/504 must not kill the miner)', () => {
+  assert.equal(classify(500), 'transient');
+  assert.equal(classify(502), 'transient');
+  assert.equal(classify(503), 'transient');
+  assert.equal(classify(504), 'transient');
+  assert.equal(classify(429), 'transient');
+  assert.equal(classify(200), 'ok');
+  // 4xx that the caller handles explicitly stay fatal so those handlers still run.
+  assert.equal(classify(400), 'fatal');
+  assert.equal(classify(404), 'fatal');
+  assert.equal(classify(410), 'fatal');
+  assert.equal(classify(426), 'fatal');
+});
+
+test('backoffDelay: a huge Retry-After is clamped, not slept verbatim', () => {
+  // 24h header must not park the miner for a day; cap at the same 30s ceiling
+  // the exponential backoff already uses.
+  assert.equal(backoffDelay(0, { retryAfterMs: 86_400_000 }), 30_000);
+  // a reasonable value passes through
+  assert.equal(backoffDelay(0, { retryAfterMs: 5_000 }), 5_000);
+  // the cap boundary
+  assert.equal(backoffDelay(0, { retryAfterMs: 30_000 }), 30_000);
+});
