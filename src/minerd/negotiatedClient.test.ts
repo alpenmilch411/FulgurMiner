@@ -3,7 +3,10 @@ import assert from 'node:assert/strict';
 import {
   buildNegotiatedTemplate, classifyTemplateResult, decodeMempool, headerMatchesTemplate,
   mempoolEntryAcceptable, negotiatedRequired, poolWsUrl, pruneOutstanding, settleOutstanding,
+  negotiatedColdStart, type NegotiatedColdStartDeps,
 } from './negotiatedClient.js';
+import type { RestoreOutcome } from './persistence.js';
+import type { SnapshotConfirmResult } from './miner.js';
 import { Blockchain } from '../chain/blockchain.js';
 import { computeTxRoot, encodeHeader, type Block } from '../chain/block.js';
 import { bytesToHex, compareBytes } from '../util/binary.js';
@@ -230,4 +233,106 @@ test('buildNegotiatedTemplate: a mempool set that conflicts with our state falls
   const block = buildNegotiatedTemplate(chain, poolPub, ['nonsense', 'ffff']);
   assert.equal(block.transactions.length, 0);
   assert.equal(block.header.height, 1);
+});
+
+// ── negotiatedColdStart: restore → confirm → bootstrap → integrity gate ──
+
+/** Dep doubles with a call log + mutable state the tests flip mid-flow. */
+function coldDeps(opts: {
+  restore?: RestoreOutcome;
+  confirm?: SnapshotConfirmResult;
+  integrity?: boolean;
+} = {}) {
+  const calls: string[] = [];
+  const state = { invalidated: false, aborted: false };
+  const deps: NegotiatedColdStartDeps = {
+    restore: () => { calls.push('restore'); return opts.restore ?? { restored: false }; },
+    confirm: async (h) => { calls.push(`confirm:${h}`); return opts.confirm ?? { ok: true }; },
+    bootstrap: async () => { calls.push('bootstrap'); },
+    integrityOK: () => { calls.push('integrity'); return opts.integrity ?? true; },
+    invalidated: () => state.invalidated,
+    clearInvalidated: () => { calls.push('clearInvalidated'); state.invalidated = false; },
+    discardSnapshot: () => { calls.push('discard'); },
+    resetChain: () => { calls.push('reset'); },
+    aborted: () => state.aborted,
+    height: () => 4_242,
+    info: (m) => { calls.push(`info:${m.split(' ')[0]}`); },
+  };
+  return { deps, calls, state };
+}
+
+test('coldStart: no snapshot → one full bootstrap, nothing confirmed or discarded', async () => {
+  const { deps, calls } = coldDeps();
+  assert.deepEqual(await negotiatedColdStart(deps), { ok: true, warm: false });
+  assert.deepEqual(calls, ['restore', 'bootstrap']);
+});
+
+test('coldStart: warm restore, confirmed, integrity ok → delta bootstrap, stays warm', async () => {
+  const { deps, calls } = coldDeps({ restore: { restored: true, anchorHeight: 100 } });
+  assert.deepEqual(await negotiatedColdStart(deps), { ok: true, warm: true });
+  assert.deepEqual(calls, ['restore', 'confirm:100', 'info:resuming', 'bootstrap', 'integrity']);
+});
+
+test('coldStart: forged confirm → file DISCARDED (not just reset), full sync, not warm', async () => {
+  const { deps, calls } = coldDeps({
+    restore: { restored: true, anchorHeight: 7 },
+    confirm: { ok: false, kind: 'forged', reason: 'anchor-not-canonical' },
+  });
+  assert.deepEqual(await negotiatedColdStart(deps), { ok: true, warm: false });
+  assert.ok(calls.includes('discard'));
+  assert.ok(!calls.includes('reset'));           // discard already resets
+  assert.ok(!calls.includes('integrity'));       // not warm → no gate
+  assert.equal(calls.filter((c) => c === 'bootstrap').length, 1);
+});
+
+test('coldStart: indeterminate confirm → file KEPT (reset only), full sync this session', async () => {
+  const { deps, calls } = coldDeps({
+    restore: { restored: true, anchorHeight: 7 },
+    confirm: { ok: false, kind: 'indeterminate', reason: 'helper-unreachable: x' },
+  });
+  assert.deepEqual(await negotiatedColdStart(deps), { ok: true, warm: false });
+  assert.ok(calls.includes('reset'));
+  assert.ok(!calls.includes('discard'));         // keep the file for a later launch
+  assert.equal(calls.filter((c) => c === 'bootstrap').length, 1);
+});
+
+test('coldStart: integrity gate fails → discard + ONE full re-bootstrap, not warm', async () => {
+  const { deps, calls } = coldDeps({ restore: { restored: true, anchorHeight: 9 }, integrity: false });
+  assert.deepEqual(await negotiatedColdStart(deps), { ok: true, warm: false });
+  const i = calls.indexOf('integrity');
+  assert.ok(i > calls.indexOf('bootstrap'));     // gate runs AFTER the first bootstrap
+  assert.deepEqual(calls.slice(i + 1), ['discard', 'clearInvalidated', 'info:re-syncing', 'bootstrap']);
+});
+
+test('coldStart: snapshot invalidated during bootstrap → treated as gate failure', async () => {
+  const { deps, calls, state } = coldDeps({ restore: { restored: true, anchorHeight: 9 } });
+  deps.bootstrap = async () => {
+    calls.push('bootstrap');
+    if (calls.filter((c) => c === 'bootstrap').length === 1) state.invalidated = true;
+  };
+  assert.deepEqual(await negotiatedColdStart(deps), { ok: true, warm: false });
+  assert.ok(calls.includes('discard'));
+  assert.ok(calls.includes('clearInvalidated'));
+  assert.ok(!calls.includes('integrity'));       // invalidated short-circuits the check
+  assert.equal(calls.filter((c) => c === 'bootstrap').length, 2);
+});
+
+test('coldStart: aborted before confirm → ok:false, nothing confirmed, nothing bootstrapped', async () => {
+  const { deps, calls, state } = coldDeps({ restore: { restored: true, anchorHeight: 9 } });
+  state.aborted = true;
+  assert.deepEqual(await negotiatedColdStart(deps), { ok: false, warm: false });
+  assert.deepEqual(calls, ['restore']);
+});
+
+test('coldStart: aborted during confirm → ok:false, never trusts or bootstraps the restore', async () => {
+  const { deps, calls, state } = coldDeps({ restore: { restored: true, anchorHeight: 9 } });
+  deps.confirm = async (h) => { calls.push(`confirm:${h}`); state.aborted = true; return { ok: true }; };
+  assert.deepEqual(await negotiatedColdStart(deps), { ok: false, warm: false });
+  assert.ok(!calls.includes('bootstrap'));
+});
+
+test('coldStart: bootstrap rejection propagates to the caller (existing error handling)', async () => {
+  const { deps } = coldDeps();
+  deps.bootstrap = async () => { throw new Error('all helpers failed'); };
+  await assert.rejects(() => negotiatedColdStart(deps), /all helpers failed/);
 });

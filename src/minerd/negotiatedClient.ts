@@ -24,6 +24,8 @@
 // VerifierPool (parallel-PoW bootstrap), GrindPool (wasm grind workers,
 // continuous share mode). Native engine + smart throttle control are follow-ups;
 // the start duty still honors Smart Max (straight to 1.0).
+import type { SnapshotConfirmResult } from './miner.js';
+import type { RestoreOutcome } from './persistence.js';
 import { Blockchain } from '../chain/blockchain.js';
 import {
   computeTxRoot, encodeBlock, encodeHeader, type Block, type BlockHeader,
@@ -292,6 +294,103 @@ export function poolWsUrl(poolUrl: string): string {
   return poolUrl
     .replace(/\/+$/, '')
     .replace(/^https?:/i, (m) => (m.toLowerCase() === 'https:' ? 'wss:' : 'ws:')) + '/ws';
+}
+
+/**
+ * Cold-start orchestration for the negotiated path: restore the local snapshot,
+ * network-confirm it, bootstrap (delta when warm, full otherwise), then prove a
+ * snapshot-seeded chain with the dryrun-equivalent integrity gate. Mirrors the
+ * solo cold start in miner.ts step for step — the trust boundary is the SAME
+ * functions (restoreSnapshot / confirmRestoredSnapshot / chainIntegrityOK), only
+ * the lifecycle around them differs (no warm handle, teardown via the WS
+ * session). Deps injected so every branch is unit-testable. Exported for tests.
+ *
+ * Returns ok:false only when the run signal aborted mid-start — the caller
+ * tears down and must never mine (or persist) the unconfirmed chain. A thrown
+ * bootstrap rejection propagates unchanged to the caller's existing handler.
+ */
+export interface NegotiatedColdStartDeps {
+  /** restoreSnapshot(chain, debug) — never throws; anomalies reset to genesis. */
+  restore: () => RestoreOutcome;
+  /** confirmRestoredSnapshot: pin the anchor to the helper + PoW spot-check. */
+  confirm: (anchorHeight: number) => Promise<SnapshotConfirmResult>;
+  /** sync.bootstrap(progress). Throws propagate to the caller. */
+  bootstrap: () => Promise<void>;
+  /** chainIntegrityOK — the dryrun-equivalent post-restore gate. */
+  integrityOK: () => boolean;
+  /** Has onSnapshotInvalidated fired (deep reorg below the anchor)? */
+  invalidated: () => boolean;
+  clearInvalidated: () => void;
+  /** deleteSnapshot() + chain.reset() — the snapshot is proven or presumed bad. */
+  discardSnapshot: () => void;
+  /** chain.reset() ONLY — an indeterminate confirm keeps the file for a later launch. */
+  resetChain: () => void;
+  aborted: () => boolean;
+  height: () => number;
+  /** User-facing line; the caller adds the [nego-miner] prefix. */
+  info: (msg: string) => void;
+  debug?: (msg: string) => void;
+}
+
+export async function negotiatedColdStart(
+  deps: NegotiatedColdStartDeps,
+): Promise<{ ok: boolean; warm: boolean }> {
+  const restore = deps.restore();
+  let warm = restore.restored;
+
+  if (restore.restored) {
+    // Never network-confirm (or trust) a restore on an already-aborting run.
+    if (deps.aborted()) return { ok: false, warm: false };
+    const confirm = await deps.confirm(restore.anchorHeight);
+    if (deps.aborted()) return { ok: false, warm: false };
+    if (!confirm.ok) {
+      deps.debug?.(
+        `restored snapshot ${confirm.kind} (${confirm.reason}) — full replay` +
+          (confirm.kind === 'forged' ? ' (deleting file)' : ' (keeping file for retry)'),
+      );
+      // forged = the network PROVES the anchor isn't canonical → delete the file.
+      // indeterminate = merely couldn't confirm (helper down/lagging/timeout) →
+      // keep the file for a later healthy-helper launch; still don't trust it now.
+      if (confirm.kind === 'forged') deps.discardSnapshot();
+      else deps.resetChain();
+      warm = false;
+      deps.info(
+        confirm.kind === 'forged'
+          ? 'saved chain did not match the network — re-syncing from genesis…'
+          : 'could not confirm saved chain against the network — re-syncing this session…',
+      );
+    }
+  }
+
+  if (warm) {
+    deps.info(`resuming saved chain (height ${deps.height().toLocaleString('en-US')}) — catching up…`);
+  }
+
+  await deps.bootstrap();
+
+  // Post-restore safety gate (same as solo): prove a snapshot-seeded chain mines
+  // on the correct state before any template is built. Also entered when a deep
+  // reorg invalidated the snapshot mid-bootstrap — the listener already reset
+  // the chain and bootstrap full-replayed, so the seeded prefix is gone; discard
+  // is then just file/flag hygiene and the chain is NOT warm.
+  if (!deps.aborted() && (warm || deps.invalidated())) {
+    const ok = !deps.invalidated() && deps.integrityOK();
+    if (!ok) {
+      deps.debug?.(
+        deps.invalidated()
+          ? 'snapshot invalidated during catch-up — full replay'
+          : 'post-restore integrity check failed — discarding snapshot, full replay',
+      );
+      deps.discardSnapshot();
+      deps.clearInvalidated();
+      warm = false;
+      deps.info('re-syncing chain from genesis…');
+      await deps.bootstrap();
+    }
+  }
+
+  if (deps.aborted()) return { ok: false, warm: false };
+  return { ok: true, warm };
 }
 
 /**
