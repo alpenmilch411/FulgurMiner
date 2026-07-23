@@ -2,8 +2,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   buildNegotiatedTemplate, classifyTemplateResult, decodeMempool, headerMatchesTemplate,
-  mempoolEntryAcceptable, negotiatedRequired, poolWsUrl, pruneOutstanding, settleOutstanding,
-  negotiatedColdStart, type NegotiatedColdStartDeps,
+  isHexTarget, mempoolEntryAcceptable, negotiatedRequired, parseFrame, poolWsUrl,
+  pruneOutstanding, settleOutstanding, negotiatedColdStart, type NegotiatedColdStartDeps,
 } from './negotiatedClient.js';
 import type { RestoreOutcome } from './persistence.js';
 import type { SnapshotConfirmResult } from './miner.js';
@@ -360,4 +360,27 @@ test('coldStart: a throw from the gate-failure re-bootstrap propagates too', asy
   };
   await assert.rejects(() => negotiatedColdStart(deps), /helpers gone/);
   assert.equal(boots, 2);
+});
+
+// ─── #6/#7: non-object frames + a malformed share/template target must never
+// reach the grind workers (BigInt('0xundefined') crash-respawn storm) ────────
+
+test('isHexTarget: only accepts non-empty hex of a sane length', () => {
+  assert.equal(isHexTarget('0'.repeat(64)), true);
+  assert.equal(isHexTarget('00000002dd4ea'), true);
+  assert.equal(isHexTarget('undefined'), false);
+  assert.equal(isHexTarget(''), false);
+  assert.equal(isHexTarget(undefined), false);
+  assert.equal(isHexTarget(null), false);
+  assert.equal(isHexTarget('0xdeadbeef'), false); // no 0x prefix expected
+  assert.equal(isHexTarget('zzzz'), false);
+});
+
+test('parseFrame: a JSON null / non-object frame is rejected, not returned', () => {
+  assert.equal(parseFrame('null'), null);
+  assert.equal(parseFrame('123'), null);
+  assert.equal(parseFrame('"a string"'), null);
+  assert.equal(parseFrame('not json'), null);
+  const ok = parseFrame('{"type":"chain_info"}');
+  assert.deepEqual(ok, { type: 'chain_info' });
 });

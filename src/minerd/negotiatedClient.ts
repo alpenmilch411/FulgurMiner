@@ -300,6 +300,24 @@ export function poolWsUrl(poolUrl: string): string {
     .replace(/^https?:/i, (m) => (m.toLowerCase() === 'https:' ? 'wss:' : 'ws:')) + '/ws';
 }
 
+/** A share/template target must be non-empty hex (no 0x). A missing or malformed
+ *  poolTargetHex would reach the workers as "undefined"/"null" and throw
+ *  `BigInt('0xundefined')`, triggering a crash-respawn storm. Exported for tests. */
+export function isHexTarget(s: unknown): boolean {
+  return typeof s === 'string' && /^[0-9a-fA-F]{1,64}$/.test(s);
+}
+
+/** Parse a WebSocket text frame to a message OBJECT, or null. JSON.parse('null')
+ *  returns null (not a throw), and JSON.parse('5')/'"x"' return non-objects — all of
+ *  which would make `handleMsg(msg).msg.type` throw OUTSIDE the parse catch and crash
+ *  the process. Only a plain object is a usable frame. Exported for tests. */
+export function parseFrame(data: string): Record<string, unknown> | null {
+  let v: unknown;
+  try { v = JSON.parse(data); } catch { return null; }
+  if (v === null || typeof v !== 'object' || Array.isArray(v)) return null;
+  return v as Record<string, unknown>;
+}
+
 /**
  * Cold-start orchestration for the negotiated path: restore the local snapshot,
  * network-confirm it, bootstrap (delta when warm, full otherwise), then prove a
@@ -881,6 +899,15 @@ export async function runNegotiatedPoolClient(
           }
           break;
         }
+        if (!isHexTarget(msg.poolTargetHex)) {
+          // A missing/malformed target would otherwise reach the grind workers as
+          // "undefined"/"null" and throw BigInt('0xundefined') — refuse it like the
+          // foreign-header case above rather than grind on garbage.
+          reporter.event('warn', '[nego-miner] template accepted with a missing/malformed share target — rebuilding');
+          if (resultWatchdog) { clearTimeout(resultWatchdog); resultWatchdog = null; }
+          scheduleRegister(RETRY_BUILD_DELAY_MS);
+          break;
+        }
         if (resultWatchdog) { clearTimeout(resultWatchdog); resultWatchdog = null; }
         // Reset the backoff only on a CORRELATED answer. Resetting on any
         // message at all lets a foreign or uncorrelated result hold the
@@ -901,7 +928,7 @@ export async function runNegotiatedPoolClient(
 
       case 'share_target':
         // Vardiff retarget for the current template.
-        if (grinding && msg.templateId === grinding.templateId) {
+        if (grinding && msg.templateId === grinding.templateId && isHexTarget(msg.poolTargetHex)) {
           grinding.targetHex = String(msg.poolTargetHex);
           startGrind();
         }
@@ -972,8 +999,8 @@ export async function runNegotiatedPoolClient(
       sock.send(JSON.stringify({ type: 'auth', address: payoutAddress, mode: 'negotiated' }));
     };
     sock.onmessage = (ev: MessageEvent) => {
-      let msg: Record<string, unknown>;
-      try { msg = JSON.parse(String(ev.data)); } catch { return; }
+      const msg = parseFrame(String(ev.data));
+      if (msg === null) return; // non-JSON or non-object frame (incl. literal `null`) — ignore
       handleMsg(msg);
     };
     sock.onclose = () => {
