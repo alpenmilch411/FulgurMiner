@@ -29,7 +29,7 @@ import { createDemandSignal } from './demand.js';
  * circular). Returns true only when a snapshot-seeded chain is provably mining on
  * the correct state. A `false` here forces a discard + full replay.
  */
-function chainIntegrityOK(chain: Blockchain, minerPubkey: Uint8Array): boolean {
+export function chainIntegrityOK(chain: Blockchain, minerPubkey: Uint8Array): boolean {
   try {
     const t = buildTemplate(chain, minerPubkey);
     const okPrev = compareBytes(t.header.prevHash, chain.tip.hash) === 0;
@@ -131,13 +131,13 @@ function debugLog(reporter: MinerReporter): ((msg: string) => void) | undefined 
 }
 
 // How often to persist a fresh snapshot: whichever of these comes first.
-const SAVE_EVERY_BLOCKS = 50;
-const SAVE_EVERY_MS = 60_000;
+export const SAVE_EVERY_BLOCKS = 50;
+export const SAVE_EVERY_MS = 60_000;
 
 // Bound the snapshot-confirmation fetch so a half-open helper connection can't
 // wedge startup — on timeout the confirm comes back 'indeterminate' (keep the
 // file, full-sync this session) rather than hanging unresponsive.
-const SNAPSHOT_CONFIRM_TIMEOUT_MS = 15_000;
+export const SNAPSHOT_CONFIRM_TIMEOUT_MS = 15_000;
 
 /** The subset of the grind-pool surface that runMiner depends on. Both the
  *  default worker_threads GrindPool and the native NativeGrindPool implement it. */
