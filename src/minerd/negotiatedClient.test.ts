@@ -95,14 +95,17 @@ test('headerMatchesTemplate: rejects a header the pool changed — this is the w
 // second template was registered while the first was still pending. Treating a
 // result as "must be the last one I sent" made the two cancel each other out
 // forever and the miner never started grinding.
-function twoInFlight(): { a: { block: Block; at: number }; b: { block: Block; at: number } } {
+function entryFor(block: Block, at: number): { headerHex: string; at: number } {
+  return { headerHex: bytesToHex(encodeHeader(block.header)), at };
+}
+function twoInFlight(): { a: { headerHex: string; at: number }; b: { headerHex: string; at: number } } {
   const chain = new Blockchain();
   return {
-    a: { block: buildNegotiatedTemplate(chain, new Uint8Array(32).fill(1), []), at: 1_000 },
-    b: { block: buildNegotiatedTemplate(chain, new Uint8Array(32).fill(2), []), at: 2_000 },
+    a: entryFor(buildNegotiatedTemplate(chain, new Uint8Array(32).fill(1), []), 1_000),
+    b: entryFor(buildNegotiatedTemplate(chain, new Uint8Array(32).fill(2), []), 2_000),
   };
 }
-const hexOf = (e: { block: Block }): string => bytesToHex(encodeHeader(e.block.header));
+const hexOf = (e: { headerHex: string }): string => e.headerHex;
 
 test('settleOutstanding: a result for the OLDER template does not discard the newer one', () => {
   const { a, b } = twoInFlight();
@@ -140,7 +143,7 @@ test('settleOutstanding: out-of-order results both settle (newer answered first)
 
 test('settleOutstanding: a header matching nothing in flight is refused', () => {
   const { a, b } = twoInFlight();
-  const foreign = { block: buildNegotiatedTemplate(new Blockchain(), new Uint8Array(32).fill(3), []), at: 0 };
+  const foreign = entryFor(buildNegotiatedTemplate(new Blockchain(), new Uint8Array(32).fill(3), []), 0);
   assert.equal(settleOutstanding([a, b], hexOf(foreign)), null);
   assert.equal(settleOutstanding([], hexOf(a)), null);
   assert.equal(settleOutstanding([a], 'not-a-header'), null);
@@ -174,16 +177,12 @@ test('pruneOutstanding: retires by AGE, so a slow pool cannot be evicted by coun
   assert.deepEqual(pruneOutstanding([slow, fresh], now), [slow, fresh], 'a slow pool is still correlatable');
   assert.deepEqual(pruneOutstanding([fresh], now), [fresh]);
 
-  // A burst well past the count cap stays bounded and keeps the NEWEST ones.
-  // Fixture order matters: production appends on send, so the list runs
-  // oldest-first and the newest entries are the tail. Generating it newest-first
-  // would assert the opposite of what production does and still pass.
-  const many = Array.from({ length: 200 }, (_, i) => ({ at: now - (200 - i) }));
-  assert.ok(many[0]!.at < many[199]!.at, 'fixture must be oldest-first, like production');
-  const kept = pruneOutstanding(many, now);
-  assert.equal(kept.length, 64);
-  assert.equal(kept[kept.length - 1], many[199], 'newest survives');
-  assert.equal(kept[0], many[136], 'the oldest 136 are the ones dropped');
+  // No count eviction at all: a live registration must never be pushed out by
+  // volume, however fast a pool streams results. Every accumulation bug in this
+  // state machine ended with a count cap evicting an entry whose answer was
+  // still coming.
+  const many = Array.from({ length: 5_000 }, (_, i) => ({ at: now - (5_000 - i) }));
+  assert.equal(pruneOutstanding(many, now).length, 5_000, 'nothing is evicted by count');
 });
 
 test('buildNegotiatedTemplate: rejects a pool address that is not 32 bytes', () => {

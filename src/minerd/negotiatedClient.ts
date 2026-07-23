@@ -48,11 +48,8 @@ export const REGISTER_MIN_INTERVAL_MS = 2_200;
 // If a registered template gets no template_result (ws blip, server hiccup),
 // re-register rather than sit idle forever.
 const TEMPLATE_RESULT_TIMEOUT_MS = 12_000;
-// Capped re-registration interval. Must stay well below OUTSTANDING_TTL_MS: the
-// two together decide how slow a pool can be and still get its answer
-// correlated. TTL / this cap = the number of registrations that can pile up
-// before the oldest ages out, and that has to stay under
-// MAX_OUTSTANDING_TEMPLATES or a registration is evicted while still live.
+// Capped re-registration interval. Kept well below OUTSTANDING_TTL_MS so a slow
+// pool's answer is still correlatable when it finally lands.
 const TEMPLATE_RESULT_TIMEOUT_MAX_MS = 120_000;
 const RECONNECT_DELAY_MS = 5_000;
 const RETRY_BUILD_DELAY_MS = 5_000;
@@ -73,15 +70,11 @@ const TOTAL_HEX_BUDGET = TX_BYTE_BUDGET * 4;
 // watchdog re-registers). Keep the recent ones so a late result is correlated to
 // the template it belongs to instead of clobbering a newer one.
 //
-// Entries leave by AGE, not by count — evicting on count alone recreates the
-// never-start-grinding livelock against a pool slower than cap × watchdog. A
-// registration stays correlatable for half an hour; with the watchdog capped at
-// 120s the worst case is ~18 sends in that window (12s, 24s, 48s, 96s, then
-// 120s apart), comfortably under the count cap, so nothing live is ever evicted
-// by count and a pool is tolerated up to a 30-minute answer. Past that it is not
-// a slow pool, it is a dead one, and the reconnect/tip-change paths take over.
+// Entries leave by AGE ONLY — see pruneOutstanding for why there is no count
+// cap. A registration stays correlatable for half an hour, so a pool is
+// tolerated up to a 30-minute answer; past that it is not a slow pool, it is a
+// dead one, and the reconnect/tip-change paths take over.
 const OUTSTANDING_TTL_MS = 30 * 60_000;
-const MAX_OUTSTANDING_TEMPLATES = 64;
 // Cap on remembered per-template nonces (see submittedNonces). At a normal
 // vardiff target this holds a handful; the cap only matters if a pool serves a
 // near-maximal share target, where every hash is a share and an unbounded set
@@ -237,10 +230,12 @@ export function headerMatchesTemplate(block: Block, headerHex: unknown): boolean
  * the header belongs to no template this miner built — which must never be
  * ground. Exported for unit tests.
  */
-export function settleOutstanding<T extends { block: Block }>(
+export function settleOutstanding<T extends { headerHex: string }>(
   outstanding: readonly T[], headerHex: unknown,
 ): { matched: T; rest: T[] } | null {
-  const idx = outstanding.findIndex((e) => headerMatchesTemplate(e.block, headerHex));
+  if (typeof headerHex !== 'string') return null;
+  const want = headerHex.toLowerCase();
+  const idx = outstanding.findIndex((e) => e.headerHex === want);
   if (idx < 0) return null;
   const rest = outstanding.slice();
   rest.splice(idx, 1);
@@ -267,13 +262,24 @@ export function classifyTemplateResult(accepted: boolean, inFlightAfter: number)
   return inFlightAfter === 0 ? 'settle-and-retry' : 'ignore-ambiguous';
 }
 
-/** Drop registrations too old to still be answered, then bound the list. Age is
- *  the primary rule — see OUTSTANDING_TTL_MS. Exported for unit tests. */
+/**
+ * Drop registrations too old to still be answered. AGE IS THE ONLY RULE.
+ *
+ * There is deliberately no count-based eviction. Every accumulation bug found in
+ * this state machine ended the same way: some message stream grew the list until
+ * a count cap evicted a registration that was still live, and its own answer
+ * then arrived to find nothing to match — so the miner refused its own work and
+ * never started grinding. A cap large enough to be "safe" only moves the stream
+ * rate that reaches it.
+ *
+ * Dropping the cap is affordable because an entry is just a header hex and a
+ * timestamp (~300 bytes), not the block: even a pool spamming results at the
+ * 2.2s rate limit for the whole TTL leaves the list well under a megabyte.
+ *
+ * Exported for unit tests.
+ */
 export function pruneOutstanding<T extends { at: number }>(entries: T[], now: number): T[] {
-  const fresh = entries.filter((e) => now - e.at <= OUTSTANDING_TTL_MS);
-  return fresh.length > MAX_OUTSTANDING_TEMPLATES
-    ? fresh.slice(fresh.length - MAX_OUTSTANDING_TEMPLATES)
-    : fresh;
+  return entries.filter((e) => now - e.at <= OUTSTANDING_TTL_MS);
 }
 
 /** http(s)://pool → ws(s)://pool/ws. Scheme match is case-insensitive: the
@@ -388,7 +394,7 @@ export async function runNegotiatedPoolClient(
   // and a single slot makes the two results cancel each other out forever (A's
   // result is compared against B, refused, and clears B; B's result then finds
   // nothing pending) — the miner would never start grinding at all.
-  let outstanding: { block: Block; at: number }[] = [];
+  let outstanding: { headerHex: string; at: number }[] = [];
   // Sends not yet answered by a template_result. Tracks the PROTOCOL state, not
   // our bookkeeping: `outstanding` is cleared on a tip change while the pool's
   // answer to the pre-change send is still in transit, so only this can tell
@@ -548,7 +554,11 @@ export async function runNegotiatedPoolClient(
     if (sessionOver(sock)) return;
     const now = Date.now();
     lastRegisterAt = now;
-    outstanding = pruneOutstanding([...outstanding, { block, at: now }], now);
+    // Store only what correlation needs — the header — never the block.
+    outstanding = pruneOutstanding(
+      [...outstanding, { headerHex: bytesToHex(encodeHeader(block.header)), at: now }],
+      now,
+    );
     inFlight++;
     send({ type: 'template', blockHex: bytesToHex(encodeBlock(block)) });
     reporter.chain(block.header.height, block.header.difficulty.toString(16));
@@ -672,11 +682,19 @@ export async function runNegotiatedPoolClient(
         const accepted = msg.accepted === true;
         if (accepted) acceptedShares++;
         reporter.share(accepted, accepted ? (msg.block === true ? 'accepted (BLOCK!)' : 'accepted') : String(msg.reason ?? 'rejected'));
-        if (!accepted && String(msg.reason ?? '').includes('stale')) {
+        if (!accepted && grinding && String(msg.reason ?? '').includes('stale')) {
           // Our template's parent went stale — stop and rebuild off the new tip.
+          //
+          // Guarded on `grinding` and on nothing being in flight: share_result
+          // carries no jobId, so a delayed stale verdict for an OLD job is
+          // indistinguishable from one for the current template. Without the
+          // guard, a burst of them re-registers on every message (growing the
+          // outstanding list faster than it ages out) and can stop a grind that
+          // a newer, still-valid template had just started. If a registration is
+          // already in flight, that one is the rebuild — do not queue another.
           grind.stop();
           grinding = null;
-          scheduleRegister(0);
+          if (inFlight === 0) scheduleRegister(0);
         }
         break;
       }
