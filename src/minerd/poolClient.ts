@@ -871,6 +871,15 @@ export async function runPoolClient(
       stopPoolMode();
       return { kind: 'stopped' };
     }
+    if (r.status === 410) {
+      // The pool retired pool-built jobs mid-session and now requires negotiated
+      // mode (410 is the negotiated-required signal register() hands off on). We
+      // can't hand off to negotiated mode in place on a live session, so stop pool
+      // mode cleanly with a restart hint instead of looping on a dead /job forever.
+      reporter.event('error', '[pool-miner] pool now requires negotiated mode (410) — restart the miner to switch. Stopping pool mode.');
+      stopPoolMode();
+      return { kind: 'stopped' };
+    }
     const cls = classify(r.status);
     if (cls === 'transient') return { kind: 'retry' };
     if (cls === 'fatal') {
