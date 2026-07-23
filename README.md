@@ -249,6 +249,38 @@ npm start
 
 > **Why `--autostash`?** Running `npm install` can modify `package-lock.json` on your machine — some of the build tooling ships different packages per operating system, so the file legitimately differs on Windows, Linux and macOS. That counts as a local change, so a plain `git pull` stops with *"Your local changes to the following files would be overwritten by merge: package-lock.json"*. `--autostash` sets that change aside, pulls, and puts it back. Nothing of yours is lost, and your settings (`.env.local`, `pools.json`) are never touched either way.
 
+## Docker
+
+Docker runs FulgurMiner with plain logs, persisted state, and the native engine built in. Install Docker from [docs.docker.com/get-docker](https://docs.docker.com/get-docker/).
+
+### Run with Docker
+
+If you have the repo cloned:
+
+```bash
+git checkout main
+git pull
+MINER_PUBKEY=<your-address> docker compose up --build
+```
+
+If you do not have the repo cloned:
+
+```bash
+docker pull ghcr.io/alpenmilch411/fulgurminer:v0.2.4
+docker run --rm -it --init \
+  -e MINER_PUBKEY=<your-address> \
+  -v fulgurminer-data:/data \
+  ghcr.io/alpenmilch411/fulgurminer:v0.2.4
+```
+
+Defaults: FulgurPool, native engine, full throttle, and all available CPU cores. Override with the same env vars as a normal run.
+
+### Publish image
+
+For maintainers, run the **Publish Docker Image** workflow from GitHub Actions and enter the version tag, for example `v0.2.4`.
+
+It publishes `ghcr.io/alpenmilch411/fulgurminer:<version>` and a matching `sha-...` tag.
+
 ## Native engine
 
 By default FulgurMiner uses a portable **wasm** engine that runs anywhere Node runs — zero setup. The **native** (Rust) engine was ~1.9× faster on the old Argon2id PoW; on **Sandglass v3** (the new PoW from block 33,550) the two are within ~5% (see [Performance](#performance)), so native is now an optional alternative rather than a meaningful speedup. Switch via the **Engine** setting (or `MINER_NATIVE=1`). On the next start FulgurMiner:

@@ -1,0 +1,23 @@
+services:
+  fulgurminer:
+    build:
+      context: .
+    image: ghcr.io/alpenmilch411/fulgurminer:${FULGUR_IMAGE_TAG:-v0.2.4}
+    restart: unless-stopped
+    init: true
+    environment:
+      MINER_PUBKEY: ${MINER_PUBKEY:-}
+      MINER_POOL: ${MINER_POOL:-}
+      MINER_WORKERS: ${MINER_WORKERS:-999}
+      MINER_THROTTLE: ${MINER_THROTTLE:-1}
+      MINER_SMART: ${MINER_SMART:-off}
+      MINER_NATIVE: ${MINER_NATIVE:-1}
+      MINER_HELPERS: ${MINER_HELPERS:-}
+      MINER_TIP_POLL_MS: ${MINER_TIP_POLL_MS:-}
+      FULGUR_TUI: "0"
+      FULGUR_NO_UPDATE_CHECK: ${FULGUR_NO_UPDATE_CHECK:-1}
+    volumes:
+      - fulgurminer-data:/data
+
+volumes:
+  fulgurminer-data:
