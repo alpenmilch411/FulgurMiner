@@ -26,7 +26,7 @@
 // the start duty still honors Smart Max (straight to 1.0).
 import { Blockchain } from '../chain/blockchain.js';
 import {
-  computeTxRoot, encodeBlock, type Block, type BlockHeader,
+  computeTxRoot, encodeBlock, encodeHeader, type Block, type BlockHeader,
 } from '../chain/block.js';
 import { MAX_BLOCK_BYTES } from '../chain/genesis.js';
 import { applyBlockTxs, cloneState, stateRoot } from '../chain/state.js';
@@ -35,10 +35,12 @@ import { bytesToHex, hexToBytes } from '../util/binary.js';
 import { resolveHelpers } from './config.js';
 import { GrindPool } from './grindPool.js';
 import { HelperPool } from './helperPool.js';
+import { isFulgurPool } from './pools.js';
 import { ConsoleReporter, type MinerReporter, type ReporterStatus } from './reporter.js';
 import { smartStartDuty } from './smartController.js';
 import { startPoolStats } from './poolStats.js';
 import { ChainSync } from './sync.js';
+import { checkForUpdate } from './updateCheck.js';
 import { VerifierPool, verifyBlocksParallel } from './verify.js';
 
 // Stay above the pool's 2s per-connection template throttle.
@@ -55,9 +57,13 @@ const TX_BYTE_BUDGET = MAX_BLOCK_BYTES - 1_024;
 
 /** Does this /register failure mean "pool requires negotiated mode"? (410 is the
  *  documented signal; the error text is a fallback for proxies that rewrite the
- *  status.) Exported for unit tests. */
+ *  status.) The text fallback is bounded to 400 on purpose: every other fatal
+ *  status already has its own handler in poolClient (426 = upgrade required is
+ *  the one that matters), and a body that merely MENTIONS the mode must not be
+ *  able to divert those away from it. Exported for unit tests. */
 export function negotiatedRequired(status: number, body: unknown): boolean {
   if (status === 410) return true;
+  if (status !== 400) return false;
   const err = (body as { error?: string } | null)?.error;
   return typeof err === 'string' && err.toLowerCase().includes('negotiated');
 }
@@ -129,6 +135,25 @@ export function buildNegotiatedTemplate(chain: Blockchain, poolPub: Uint8Array, 
   return { header, transactions: txs };
 }
 
+/**
+ * The header the pool echoes back in `template_result` MUST be the one we just
+ * registered — byte for byte, nonce zeroed.
+ *
+ * This is the load-bearing check of the whole mode. Negotiated mining is only
+ * worth anything because the MINER picks the parent block and the transaction
+ * set; grinding whatever header the pool returns would hand that choice straight
+ * back to the pool (a different `prevHash` steers our hashrate onto a chain of
+ * its choosing, a different `txRoot` censors), which is precisely the power the
+ * mode exists to remove. The pool's own protocol defines the field as our
+ * 148-byte header with the nonce zeroed, so an honest pool always matches.
+ *
+ * Exported for unit tests.
+ */
+export function headerMatchesTemplate(block: Block, headerHex: unknown): boolean {
+  if (typeof headerHex !== 'string') return false;
+  return headerHex.toLowerCase() === bytesToHex(encodeHeader(block.header)).toLowerCase();
+}
+
 /** http(s)://pool → ws(s)://pool/ws */
 export function poolWsUrl(poolUrl: string): string {
   return poolUrl.replace(/^http/, 'ws').replace(/\/+$/, '') + '/ws';
@@ -174,6 +199,13 @@ export async function runNegotiatedPoolClient(
   });
   reporter.event('info', `[nego-miner] ${poolUrl} requires negotiated mode — this miner will build its own blocks (pool-payout coinbase) and mine those.`);
 
+  // Runs BEFORE the chain bootstrap: that is a multi-minute full replay, and a
+  // negotiated miner is a full consensus client — it is the one kind of pool
+  // miner that WEDGES on a consensus fork if it doesn't update. The nudge has to
+  // reach it, and reach it early. No pool version fields here (there is no
+  // /register body in this mode), so this is the GitHub-release check alone.
+  void checkForUpdate({ reporter, signal }).catch(() => {});
+
   // ── Own chain view (same pattern as solo, minus snapshot warm-start) ──
   const chain = new Blockchain();
   const helperPool = new HelperPool(resolveHelpers(process.env), {
@@ -209,6 +241,11 @@ export async function runNegotiatedPoolClient(
   let acceptedShares = 0;
   const stats = startPoolStats({
     poolUrl, address: payoutAddress, getAcceptedShares: () => acceptedShares, reporter, signal,
+    // Same identity gate as the classic path: /jackpot is a FulgurPool-only
+    // endpoint and a third-party pool must never be asked for it, nor be able to
+    // paint the branded panel. Derived from poolUrl so a FulgurPool that ever
+    // adopts negotiated mode keeps its panel instead of silently losing it.
+    wantJackpot: isFulgurPool(poolUrl),
   });
 
   // ── Connection + job state ──
@@ -216,6 +253,9 @@ export async function runNegotiatedPoolClient(
   let stopped = false;
   let lastChainInfo: ChainInfo | null = null;
   let grinding: { templateId: string; headerBytes: Uint8Array; targetHex: string } | null = null;
+  // The template we last sent, kept until its template_result arrives so the
+  // returned header can be checked against it (see headerMatchesTemplate).
+  let pendingTemplate: Block | null = null;
   let lastRegisterAt = 0;
   let registerTimer: ReturnType<typeof setTimeout> | null = null;
   let resultWatchdog: ReturnType<typeof setTimeout> | null = null;
@@ -311,6 +351,7 @@ export async function runNegotiatedPoolClient(
       return;
     }
     lastRegisterAt = Date.now();
+    pendingTemplate = block;
     send({ type: 'template', blockHex: bytesToHex(encodeBlock(block)) });
     reporter.chain(block.header.height, block.header.difficulty.toString(16));
     if (resultWatchdog) clearTimeout(resultWatchdog);
@@ -336,11 +377,24 @@ export async function runNegotiatedPoolClient(
 
       case 'template_result': {
         if (resultWatchdog) { clearTimeout(resultWatchdog); resultWatchdog = null; }
+        const mine = pendingTemplate;
+        pendingTemplate = null;
         if (msg.accepted !== true) {
           const reason = String(msg.reason ?? 'unknown');
           reporter.event('warn', `[nego-miner] template rejected: ${reason}`);
           if (reason.includes('rate limited')) scheduleRegister(REGISTER_MIN_INTERVAL_MS);
           else scheduleRegister(RETRY_BUILD_DELAY_MS);
+          break;
+        }
+        // Never grind a header we did not build — that is the entire security
+        // property of negotiated mode (see headerMatchesTemplate). A mismatch is
+        // either a protocol bug or a pool trying to reclaim the parent/tx choice;
+        // either way, refuse it and rebuild rather than mine it.
+        if (!mine || !headerMatchesTemplate(mine, msg.headerHex)) {
+          reporter.event('warn', '[nego-miner] pool returned a header that is not the template this miner built — refusing to grind it, rebuilding. (If this repeats, the pool is not honouring negotiated mode; switch pools or mine solo.)');
+          grind.stop();
+          grinding = null;
+          scheduleRegister(RETRY_BUILD_DELAY_MS);
           break;
         }
         grinding = {
@@ -405,6 +459,7 @@ export async function runNegotiatedPoolClient(
       ws = null;
       grind.stop();
       grinding = null;
+      pendingTemplate = null;
       if (resultWatchdog) { clearTimeout(resultWatchdog); resultWatchdog = null; }
       if (registerTimer) { clearTimeout(registerTimer); registerTimer = null; }
       reporter.event('warn', `[nego-miner] pool connection lost — reconnecting in ${RECONNECT_DELAY_MS / 1000}s`);
