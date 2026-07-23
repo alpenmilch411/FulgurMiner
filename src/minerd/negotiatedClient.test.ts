@@ -10,6 +10,7 @@ import type { SnapshotConfirmResult } from './miner.js';
 import { Blockchain } from '../chain/blockchain.js';
 import { computeTxRoot, encodeHeader, type Block } from '../chain/block.js';
 import { bytesToHex, compareBytes } from '../util/binary.js';
+import { smartStartDuty, CONSIDERATE_START } from './smartController.js';
 
 test('negotiatedRequired: 410 is the definitive signal, regardless of body', () => {
   assert.equal(negotiatedRequired(410, null), true);
@@ -360,6 +361,21 @@ test('coldStart: a throw from the gate-failure re-bootstrap propagates too', asy
   };
   await assert.rejects(() => negotiatedColdStart(deps), /helpers gone/);
   assert.equal(boots, 2);
+});
+
+// ─── #12: the negotiated path now wires the SAME adaptive SmartController as
+// the classic pool path (poolClient.ts), instead of a fixed duty forever. The
+// wiring itself (grind setup / startGrind hashrate callback / connect() /
+// teardown) is integration-level and closes over WebSocket session state, so
+// it is not unit-testable in isolation — verification is code review (this
+// diff mirrors poolClient.ts:682-698,921-923,993,958 site-for-site) plus the
+// live hashrate A/B against brcpool in the release gate. This pins the one
+// PURE invariant the wiring depends on: the mode → start-duty mapping.
+
+test('smartStartDuty drives the negotiated start duty per mode', () => {
+  assert.equal(smartStartDuty('max', 0.75), 1);
+  assert.equal(smartStartDuty('considerate', 0.75), CONSIDERATE_START);
+  assert.equal(smartStartDuty('off', 0.6), 0.6);
 });
 
 // ─── #6/#7: non-object frames + a malformed share/template target must never

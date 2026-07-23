@@ -43,7 +43,8 @@ import {
 import { deleteSnapshot, restoreSnapshot, saveSnapshot, type RestoreOutcome } from './persistence.js';
 import { isFulgurPool } from './pools.js';
 import { ConsoleReporter, type MinerReporter, type ReporterStatus } from './reporter.js';
-import { smartStartDuty } from './smartController.js';
+import { SmartController, smartStartDuty } from './smartController.js';
+import { createDemandSignal } from './demand.js';
 import { startPoolStats } from './poolStats.js';
 import { ChainSync } from './sync.js';
 import { checkForUpdate } from './updateCheck.js';
@@ -590,6 +591,28 @@ export async function runNegotiatedPoolClient(
   maybeSave();
 
   const grind = new GrindPool(workers, startDuty);
+  // Same adaptive-throttle wiring as the classic pool path (poolClient.ts): the
+  // negotiated path used to call smartStartDuty once and never adjust, so
+  // considerate stayed pinned at CONSIDERATE_START and off/max never eased off a
+  // busy box. Native engine on negotiated is a separate future item — this is
+  // wasm-only, matching the grind above.
+  const smartController = smart !== 'off'
+    ? new SmartController(
+      grind,
+      // Considerate leaves the THERMAL ceiling open and eases in via the demand
+      // allowance instead; capping the ceiling at the eased start would strand the
+      // demand loop below its own target (see SmartDemandOptions.demandStart).
+      { start: smart === 'considerate' ? 1 : startDuty },
+      undefined,
+      smart === 'considerate'
+        ? {
+          demand: createDemandSignal({ onWarn: (m) => reporter.event('warn', m) }),
+          workers,
+          demandStart: startDuty,
+        }
+        : undefined,
+    )
+    : null;
   let acceptedShares = 0;
   const stats = startPoolStats({
     poolUrl, address: payoutAddress, getAcceptedShares: () => acceptedShares, reporter, signal,
@@ -695,7 +718,12 @@ export async function runNegotiatedPoolClient(
         if (submittedNonces.size < MAX_SUBMITTED_NONCES) submittedNonces.add(nonce);
         send({ type: 'share', jobId: grinding.templateId, nonce, hashHex: bytesToHex(hash) });
       },
-      (hps) => { reporter.hashrate(hps); windowHashes += hps; },
+      (hps) => {
+        reporter.hashrate(hps);
+        windowHashes += hps;
+        smartController?.onHashrate(hps);
+        if (smartController) reporter.smart?.({ mode: smart as 'max' | 'considerate', throttle: smartController.appliedThrottle(), clamped: smartController.isClamped(), phase: smartController.phase() });
+      },
       () => {
         // Whole nonce space scanned without a network hit — rare, but rebuild
         // with a fresh timestamp so the header (and nonce space) changes.
@@ -1021,6 +1049,7 @@ export async function runNegotiatedPoolClient(
   }
 
   connect();
+  smartController?.start();
 
   // Run until aborted. All exits (abort or otherwise) tear down timers/workers.
   await new Promise<void>((resolve) => {
@@ -1042,6 +1071,7 @@ export async function runNegotiatedPoolClient(
   (connAbort as AbortController | null)?.abort(new DOMException('miner stopped', 'AbortError'));
   unsubInvalidated();
   stats.stop();
+  smartController?.stop();
   grind.terminate();
   // Parting save (best-effort, never throws), gated on the cold start having
   // confirmed the chain — the same belt-and-suspenders solo keeps via
