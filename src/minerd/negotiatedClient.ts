@@ -50,10 +50,19 @@ export const REGISTER_MIN_INTERVAL_MS = 2_200;
 const TEMPLATE_RESULT_TIMEOUT_MS = 12_000;
 const RECONNECT_DELAY_MS = 5_000;
 const RETRY_BUILD_DELAY_MS = 5_000;
+// A register that arrives while another is mid-flight is deferred, not dropped.
+const RETRY_REGISTER_BUSY_MS = 250;
 // The pool marks a miner's hashrate stale after ~15s without a report.
 const HASHRATE_REPORT_MS = 5_000;
 // Leave room for the header + varint/count framing when packing transactions.
 const TX_BYTE_BUDGET = MAX_BLOCK_BYTES - 1_024;
+// Input bounds on the pool-announced mempool (see decodeMempool).
+const MAX_MEMPOOL_ENTRIES = 4_096;
+const MAX_TX_HEX_LEN = TX_BYTE_BUDGET * 2;
+// A slow pool can leave more than one registration in flight (the result
+// watchdog re-registers at 12s). Keep the recent ones so a late result is
+// correlated to the template it belongs to instead of clobbering a newer one.
+const MAX_OUTSTANDING_TEMPLATES = 4;
 
 /** Does this /register failure mean "pool requires negotiated mode"? (410 is the
  *  documented signal; the error text is a fallback for proxies that rewrite the
@@ -84,7 +93,15 @@ interface ChainInfo {
 export function decodeMempool(hexes: string[]): Transaction[] {
   const txs: Transaction[] = [];
   let bytes = 0;
+  let seen = 0;
   for (const hex of hexes) {
+    // Bound the POOL-SUPPLIED input BEFORE touching it. hexToBytes materialises
+    // the whole string, and decodeTx does not require full consumption — so a
+    // single huge entry (or a valid tx followed by megabytes of trailing junk)
+    // would be allocated and parsed before the byte budget below could reject
+    // it. The budget bounds our OUTPUT; these bound the INPUT.
+    if (++seen > MAX_MEMPOOL_ENTRIES) break;
+    if (typeof hex !== 'string' || hex.length > MAX_TX_HEX_LEN) continue;
     try {
       const { tx } = decodeTx(hexToBytes(hex));
       if (validateTxStructure(tx) !== null) continue;
@@ -104,6 +121,11 @@ export function decodeMempool(hexes: string[]): Transaction[] {
  * self-consistent, so the fallback is a rare race, not the steady state).
  */
 export function buildNegotiatedTemplate(chain: Blockchain, poolPub: Uint8Array, mempoolHexes: string[]): Block {
+  // The pool address arrives as hex over the wire. A wrong length would produce
+  // a header that is not 148 bytes, which nothing downstream can decode — fail
+  // here, where the caller turns it into a warn-and-retry, rather than shipping
+  // a malformed template.
+  if (poolPub.length !== 32) throw new Error(`pool address must be 32 bytes, got ${poolPub.length}`);
   const height = chain.height + 1;
   const sctx = chain.nextBlockScriptContext();
   const timestamp = Math.max(Math.floor(Date.now() / 1000), sctx.blockMtp + 1);
@@ -154,9 +176,40 @@ export function headerMatchesTemplate(block: Block, headerHex: unknown): boolean
   return headerHex.toLowerCase() === bytesToHex(encodeHeader(block.header)).toLowerCase();
 }
 
-/** http(s)://pool → ws(s)://pool/ws */
+/**
+ * Correlate an accepted `template_result` to the templates still in flight.
+ *
+ * A single "last one I sent" slot is wrong: if the pool takes longer than the
+ * result watchdog to answer, a second template is registered while the first is
+ * still pending, and the two results cancel each other out — the first is
+ * checked against the second, refused, and clears it; the second then finds
+ * nothing pending. With a consistently slow pool that repeats forever and the
+ * miner never starts grinding at all.
+ *
+ * Returns the matched template and the templates still outstanding after it
+ * (the match and anything older are settled), or null if the header belongs to
+ * no template this miner built — which must never be ground.
+ *
+ * Exported for unit tests.
+ */
+export function settleOutstanding(
+  outstanding: readonly Block[], headerHex: unknown,
+): { matched: Block; rest: Block[] } | null {
+  const idx = outstanding.findIndex((b) => headerMatchesTemplate(b, headerHex));
+  if (idx < 0) return null;
+  return { matched: outstanding[idx]!, rest: outstanding.slice(idx + 1) };
+}
+
+/** http(s)://pool → ws(s)://pool/ws. Scheme match is case-insensitive: the
+ *  headless path resolves MINER_POOL without canonicalising it, so `HTTPS://…`
+ *  reaches here verbatim — fetch does not care, but `new WebSocket()` would
+ *  throw on the un-rewritten scheme. */
 export function poolWsUrl(poolUrl: string): string {
-  return poolUrl.replace(/^http/, 'ws').replace(/\/+$/, '') + '/ws';
+  // Rewrite the WHOLE scheme, not the `http` prefix: a case-insensitive prefix
+  // swap on `HTTPS://` leaves the S behind and yields `wsS://`.
+  return poolUrl
+    .replace(/\/+$/, '')
+    .replace(/^https?:/i, (m) => (m.toLowerCase() === 'https:' ? 'wss:' : 'ws:')) + '/ws';
 }
 
 /**
@@ -253,9 +306,17 @@ export async function runNegotiatedPoolClient(
   let stopped = false;
   let lastChainInfo: ChainInfo | null = null;
   let grinding: { templateId: string; headerBytes: Uint8Array; targetHex: string } | null = null;
-  // The template we last sent, kept until its template_result arrives so the
-  // returned header can be checked against it (see headerMatchesTemplate).
-  let pendingTemplate: Block | null = null;
+  // Templates sent but not yet answered, oldest first. A single slot is not
+  // enough: if a pool takes longer than TEMPLATE_RESULT_TIMEOUT_MS to validate,
+  // the watchdog registers a second template while the first is still pending,
+  // and a single slot makes the two results cancel each other out forever (A's
+  // result is compared against B, refused, and clears B; B's result then finds
+  // nothing pending) — the miner would never start grinding at all.
+  let outstanding: Block[] = [];
+  // True while registerTemplate() is between its first await and its send, so a
+  // timer-driven second call cannot skip the catch-up branch and build on a tip
+  // that has not converged yet.
+  let registering = false;
   let lastRegisterAt = 0;
   let registerTimer: ReturnType<typeof setTimeout> | null = null;
   let resultWatchdog: ReturnType<typeof setTimeout> | null = null;
@@ -273,9 +334,19 @@ export async function runNegotiatedPoolClient(
   }, HASHRATE_REPORT_MS);
 
   const scheduleRegister = (delayMs: number): void => {
+    if (stopped) return;
     if (registerTimer) clearTimeout(registerTimer);
     registerTimer = setTimeout(() => { void registerTemplate(); }, delayMs);
   };
+
+  /** Still the same live session on the same socket? Checked after every await —
+   *  teardown clears the timers that exist AT THAT MOMENT, so an async call
+   *  already in flight would otherwise come back and arm fresh ones. */
+  const sessionOver = (sock: WebSocket | null): boolean =>
+    stopped || ws !== sock || sock === null || sock.readyState !== WebSocket.OPEN;
+
+  // Nonces already submitted for the CURRENT template (see the share callback).
+  const submittedNonces = new Set<number>();
 
   const startGrind = (): void => {
     if (!grinding) return;
@@ -283,7 +354,15 @@ export async function runNegotiatedPoolClient(
       grinding.headerBytes,
       grinding.targetHex,
       (nonce, hash) => {
-        if (grinding) send({ type: 'share', jobId: grinding.templateId, nonce, hashHex: bytesToHex(hash) });
+        if (!grinding) return;
+        // A vardiff retarget restarts the grind over the SAME header and the
+        // same full nonce range, so already-submitted nonces get rehashed and
+        // would be re-sent. The pool deduplicates per template and rate-limits
+        // shares, so a resubmission costs a rejected share and burns budget for
+        // real ones. Dedup locally, per template (cleared on every new one).
+        if (submittedNonces.has(nonce)) return;
+        submittedNonces.add(nonce);
+        send({ type: 'share', jobId: grinding.templateId, nonce, hashHex: bytesToHex(hash) });
       },
       (hps) => { reporter.hashrate(hps); windowHashes += hps; },
       () => {
@@ -301,34 +380,53 @@ export async function runNegotiatedPoolClient(
   };
 
   async function registerTemplate(): Promise<void> {
-    if (stopped || !ws || ws.readyState !== WebSocket.OPEN) return;
+    const sock = ws;
+    if (sessionOver(sock)) return;
     const info = lastChainInfo;
     if (!info) return;
+    // Single-flight. registerTemplate awaits a network catch-up in the middle,
+    // and it is driven by timers — so without this a second call could start
+    // mid-await, see `syncing === true`, SKIP the catch-up entirely and build on
+    // a tip that has not converged. Reschedule rather than drop: a chain_info
+    // arriving during a long catch-up must not be lost.
+    if (registering) { scheduleRegister(RETRY_REGISTER_BUSY_MS); return; }
+    registering = true;
+    try {
+      // Converge our chain onto the pool's announced tip before building. The pool
+      // only accepts templates built on ITS current tip; if we're momentarily ahead
+      // (we synced a block it hasn't seen), the register below gets a 'stale parent'
+      // rejection and the retry loop re-registers once the pool catches up.
+      if (bytesToHex(chain.tip.hash) !== info.tipHash && !chain.hasBlock(info.tipHash)) {
+        syncing = true;
+        try {
+          await sync.catchUp({ height: info.height, tipHash: info.tipHash });
+        } catch (e) {
+          if ((e as Error)?.name === 'AbortError') return;
+          if (sessionOver(sock)) return;
+          reporter.event('warn', `[nego-miner] catch-up failed: ${(e as Error).message} — retrying`);
+          scheduleRegister(RETRY_BUILD_DELAY_MS);
+          return;
+        } finally {
+          syncing = false;
+        }
+        // The catch-up above is the one await in this function: re-check that the
+        // session is still live before arming any timer or sending anything.
+        if (sessionOver(sock)) return;
+        const wanted = (lastChainInfo ?? info).tipHash;
+        if (bytesToHex(chain.tip.hash) !== wanted && !chain.hasBlock(wanted)) {
+          // Helpers haven't served the pool's tip yet — retry shortly.
+          scheduleRegister(RETRY_BUILD_DELAY_MS);
+          return;
+        }
+      }
 
-    // Converge our chain onto the pool's announced tip before building. The pool
-    // only accepts templates built on ITS current tip; if we're momentarily ahead
-    // (we synced a block it hasn't seen), the register below gets a 'stale parent'
-    // rejection and the retry loop re-registers once the pool catches up.
-    if (bytesToHex(chain.tip.hash) !== info.tipHash && !chain.hasBlock(info.tipHash) && !syncing) {
-      syncing = true;
-      try {
-        await sync.catchUp({ height: info.height, tipHash: info.tipHash });
-      } catch (e) {
-        if ((e as Error)?.name === 'AbortError') return;
-        reporter.event('warn', `[nego-miner] catch-up failed: ${(e as Error).message} — retrying`);
-        scheduleRegister(RETRY_BUILD_DELAY_MS);
-        return;
-      } finally {
-        syncing = false;
-      }
-      const wanted = (lastChainInfo ?? info).tipHash;
-      if (bytesToHex(chain.tip.hash) !== wanted && !chain.hasBlock(wanted)) {
-        // Helpers haven't served the pool's tip yet — retry shortly.
-        scheduleRegister(RETRY_BUILD_DELAY_MS);
-        return;
-      }
+      await registerNow(info, sock);
+    } finally {
+      registering = false;
     }
+  }
 
+  async function registerNow(info: ChainInfo, sock: WebSocket | null): Promise<void> {
     const latest = lastChainInfo ?? info;
     // Pool BEHIND us (e.g. replaying its chain after a restart): its announced
     // tip is a block we already hold below our tip. A template built on our tip
@@ -350,8 +448,10 @@ export async function runNegotiatedPoolClient(
       scheduleRegister(RETRY_BUILD_DELAY_MS);
       return;
     }
+    if (sessionOver(sock)) return;
     lastRegisterAt = Date.now();
-    pendingTemplate = block;
+    outstanding.push(block);
+    if (outstanding.length > MAX_OUTSTANDING_TEMPLATES) outstanding.shift();
     send({ type: 'template', blockHex: bytesToHex(encodeBlock(block)) });
     reporter.chain(block.header.height, block.header.difficulty.toString(16));
     if (resultWatchdog) clearTimeout(resultWatchdog);
@@ -368,18 +468,24 @@ export async function runNegotiatedPoolClient(
         const prevTip = lastChainInfo?.tipHash;
         lastChainInfo = info;
         // Periodic re-announce (mempool refresh) with an unchanged tip: our
-        // current template is still valid — keep grinding it.
-        if (grinding && info.tipHash === prevTip) break;
+        // current template is still valid — keep grinding it. `outstanding`
+        // counts too: between our send and the pool's template_result we are
+        // neither grinding nor idle, and re-registering there just puts a second
+        // template in flight for the same parent.
+        if ((grinding || outstanding.length > 0) && info.tipHash === prevTip) break;
         if (grinding) { grind.stop(); grinding = null; }
+        // The tip moved: anything still in flight was built on the old parent.
+        if (info.tipHash !== prevTip) outstanding = [];
         scheduleRegister(0);
         break;
       }
 
       case 'template_result': {
         if (resultWatchdog) { clearTimeout(resultWatchdog); resultWatchdog = null; }
-        const mine = pendingTemplate;
-        pendingTemplate = null;
         if (msg.accepted !== true) {
+          // A rejection is not correlated to a specific template by the protocol;
+          // drop the oldest in-flight one so a stuck entry can't accumulate.
+          outstanding.shift();
           const reason = String(msg.reason ?? 'unknown');
           reporter.event('warn', `[nego-miner] template rejected: ${reason}`);
           if (reason.includes('rate limited')) scheduleRegister(REGISTER_MIN_INTERVAL_MS);
@@ -390,13 +496,21 @@ export async function runNegotiatedPoolClient(
         // property of negotiated mode (see headerMatchesTemplate). A mismatch is
         // either a protocol bug or a pool trying to reclaim the parent/tx choice;
         // either way, refuse it and rebuild rather than mine it.
-        if (!mine || !headerMatchesTemplate(mine, msg.headerHex)) {
-          reporter.event('warn', '[nego-miner] pool returned a header that is not the template this miner built — refusing to grind it, rebuilding. (If this repeats, the pool is not honouring negotiated mode; switch pools or mine solo.)');
+        //
+        // Match against every template still in flight, not just the newest: a
+        // slow pool plus the result watchdog can legitimately leave two pending,
+        // and assuming "the result belongs to the last one I sent" makes the two
+        // cancel each other out forever.
+        const settled = settleOutstanding(outstanding, msg.headerHex);
+        if (!settled) {
+          reporter.event('warn', '[nego-miner] pool returned a header that is not a template this miner built — refusing to grind it, rebuilding. (If this repeats, the pool is not honouring negotiated mode; switch pools or mine solo.)');
           grind.stop();
           grinding = null;
           scheduleRegister(RETRY_BUILD_DELAY_MS);
           break;
         }
+        outstanding = settled.rest;
+        submittedNonces.clear();
         grinding = {
           templateId: String(msg.templateId),
           headerBytes: hexToBytes(String(msg.headerHex)),
@@ -444,7 +558,18 @@ export async function runNegotiatedPoolClient(
     if (stopped) return;
     const url = poolWsUrl(poolUrl);
     reporter.event('info', `[nego-miner] connecting to ${url}…`);
-    const sock = new WebSocket(url);
+    let sock: WebSocket;
+    try {
+      sock = new WebSocket(url);
+    } catch (e) {
+      // The constructor throws synchronously on a URL it cannot parse. The grind
+      // workers, pool stats and the hashrate interval already exist by now, so
+      // letting this escape would leave them all running behind a rejected
+      // promise. Retry on the same backoff as a dropped connection instead.
+      reporter.event('warn', `[nego-miner] cannot open ${url}: ${(e as Error).message} — retrying in ${RECONNECT_DELAY_MS / 1000}s`);
+      reconnectTimer = setTimeout(connect, RECONNECT_DELAY_MS);
+      return;
+    }
     ws = sock;
     sock.onopen = () => {
       sock.send(JSON.stringify({ type: 'auth', address: payoutAddress, mode: 'negotiated' }));
@@ -459,7 +584,8 @@ export async function runNegotiatedPoolClient(
       ws = null;
       grind.stop();
       grinding = null;
-      pendingTemplate = null;
+      outstanding = [];
+      submittedNonces.clear();
       if (resultWatchdog) { clearTimeout(resultWatchdog); resultWatchdog = null; }
       if (registerTimer) { clearTimeout(registerTimer); registerTimer = null; }
       reporter.event('warn', `[nego-miner] pool connection lost — reconnecting in ${RECONNECT_DELAY_MS / 1000}s`);

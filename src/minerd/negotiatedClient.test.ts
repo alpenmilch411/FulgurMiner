@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   buildNegotiatedTemplate, decodeMempool, headerMatchesTemplate, negotiatedRequired, poolWsUrl,
+  settleOutstanding,
 } from './negotiatedClient.js';
 import { Blockchain } from '../chain/blockchain.js';
 import { computeTxRoot, encodeHeader } from '../chain/block.js';
@@ -88,6 +89,70 @@ test('headerMatchesTemplate: rejects a header the pool changed — this is the w
   assert.equal(headerMatchesTemplate(block, ''), false);
   assert.equal(headerMatchesTemplate(block, 'deadbeef'), false);
   assert.equal(headerMatchesTemplate(block, { headerHex: 'x' }), false);
+});
+
+// Two templates in flight: the pool was slower than the result watchdog, so a
+// second template was registered while the first was still pending. Treating a
+// result as "must be the last one I sent" made the two cancel each other out
+// forever and the miner never started grinding.
+function twoInFlight(): { a: ReturnType<typeof buildNegotiatedTemplate>; b: ReturnType<typeof buildNegotiatedTemplate> } {
+  const chain = new Blockchain();
+  const a = buildNegotiatedTemplate(chain, new Uint8Array(32).fill(1), []);
+  const b = buildNegotiatedTemplate(chain, new Uint8Array(32).fill(2), []);
+  return { a, b };
+}
+
+test('settleOutstanding: a late result for the OLDER template does not discard the newer one', () => {
+  const { a, b } = twoInFlight();
+  const hexOf = (t: typeof a): string => bytesToHex(encodeHeader(t.header));
+
+  // A's result arrives first: A is matched, B stays in flight.
+  const first = settleOutstanding([a, b], hexOf(a));
+  assert.ok(first);
+  assert.equal(first.matched, a);
+  assert.deepEqual(first.rest, [b], 'the newer template must survive');
+
+  // B's result then still correlates — this is the step that used to find
+  // nothing pending and livelock.
+  const second = settleOutstanding(first.rest, hexOf(b));
+  assert.ok(second);
+  assert.equal(second.matched, b);
+  assert.deepEqual(second.rest, []);
+});
+
+test('settleOutstanding: matching the newer template settles the older one with it', () => {
+  const { a, b } = twoInFlight();
+  const out = settleOutstanding([a, b], bytesToHex(encodeHeader(b.header)));
+  assert.ok(out);
+  assert.equal(out.matched, b);
+  assert.deepEqual(out.rest, [], 'anything older than the match is settled');
+});
+
+test('settleOutstanding: a header matching nothing in flight is refused', () => {
+  const { a, b } = twoInFlight();
+  const foreign = buildNegotiatedTemplate(new Blockchain(), new Uint8Array(32).fill(3), []);
+  assert.equal(settleOutstanding([a, b], bytesToHex(encodeHeader(foreign.header))), null);
+  assert.equal(settleOutstanding([], bytesToHex(encodeHeader(a.header))), null);
+  assert.equal(settleOutstanding([a], 'not-a-header'), null);
+  assert.equal(settleOutstanding([a], undefined), null);
+});
+
+test('buildNegotiatedTemplate: rejects a pool address that is not 32 bytes', () => {
+  const chain = new Blockchain();
+  assert.throws(() => buildNegotiatedTemplate(chain, new Uint8Array(31), []), /32 bytes/);
+  assert.throws(() => buildNegotiatedTemplate(chain, new Uint8Array(0), []), /32 bytes/);
+});
+
+test('decodeMempool: an oversized pool entry is skipped without being decoded', () => {
+  // 2 MB of hex: well past the block budget. It must be rejected on length,
+  // before hexToBytes allocates it.
+  const huge = 'ab'.repeat(1_000_000);
+  assert.deepEqual(decodeMempool([huge]), []);
+});
+
+test('poolWsUrl: an uppercase scheme still rewrites (headless MINER_POOL is not canonicalised)', () => {
+  assert.equal(poolWsUrl('HTTPS://pool.example.com'), 'wss://pool.example.com/ws');
+  assert.equal(poolWsUrl('Http://localhost:3333'), 'ws://localhost:3333/ws');
 });
 
 test('buildNegotiatedTemplate: a mempool set that conflicts with our state falls back to an empty block', () => {
