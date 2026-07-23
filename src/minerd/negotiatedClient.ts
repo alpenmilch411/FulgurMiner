@@ -48,6 +48,7 @@ export const REGISTER_MIN_INTERVAL_MS = 2_200;
 // If a registered template gets no template_result (ws blip, server hiccup),
 // re-register rather than sit idle forever.
 const TEMPLATE_RESULT_TIMEOUT_MS = 12_000;
+const TEMPLATE_RESULT_TIMEOUT_MAX_MS = 180_000;
 const RECONNECT_DELAY_MS = 5_000;
 const RETRY_BUILD_DELAY_MS = 5_000;
 // A register that arrives while another is mid-flight is deferred, not dropped.
@@ -59,10 +60,22 @@ const TX_BYTE_BUDGET = MAX_BLOCK_BYTES - 1_024;
 // Input bounds on the pool-announced mempool (see decodeMempool).
 const MAX_MEMPOOL_ENTRIES = 4_096;
 const MAX_TX_HEX_LEN = TX_BYTE_BUDGET * 2;
+// Aggregate input bound: a per-entry cap alone still allows thousands of large
+// entries. One block's worth of hex, doubled for slack, is far more than any
+// honest mempool announcement needs.
+const TOTAL_HEX_BUDGET = TX_BYTE_BUDGET * 4;
 // A slow pool can leave more than one registration in flight (the result
-// watchdog re-registers at 12s). Keep the recent ones so a late result is
-// correlated to the template it belongs to instead of clobbering a newer one.
-const MAX_OUTSTANDING_TEMPLATES = 4;
+// watchdog re-registers). Keep the recent ones so a late result is correlated to
+// the template it belongs to instead of clobbering a newer one. Entries leave by
+// AGE, not by count: evicting on count alone would silently recreate the
+// never-start-grinding livelock against a pool slower than cap × watchdog.
+const OUTSTANDING_TTL_MS = 10 * 60_000;
+const MAX_OUTSTANDING_TEMPLATES = 64;
+// Cap on remembered per-template nonces (see submittedNonces). At a normal
+// vardiff target this holds a handful; the cap only matters if a pool serves a
+// near-maximal share target, where every hash is a share and an unbounded set
+// would grow at the hash rate.
+const MAX_SUBMITTED_NONCES = 50_000;
 
 /** Does this /register failure mean "pool requires negotiated mode"? (410 is the
  *  documented signal; the error text is a fallback for proxies that rewrite the
@@ -86,6 +99,16 @@ interface ChainInfo {
   mempool: string[];
 }
 
+/** Is this pool-supplied mempool entry worth decoding at all, given how much
+ *  input we have already scanned? Purely an INPUT bound — nothing here says the
+ *  entry is a valid transaction. Split out so the bound itself is testable
+ *  without having to observe an allocation. Exported for unit tests. */
+export function mempoolEntryAcceptable(hex: unknown, scannedHex: number): boolean {
+  if (typeof hex !== 'string' || hex.length === 0) return false;
+  if (hex.length > MAX_TX_HEX_LEN) return false;
+  return scannedHex + hex.length <= TOTAL_HEX_BUDGET;
+}
+
 /** Decode the pool-announced mempool hexes into structurally-valid txs, bounded
  *  by the block byte budget. Consensus validity is enforced by the applyBlockTxs
  *  simulation in buildNegotiatedTemplate — a set that fails there falls back to
@@ -94,14 +117,21 @@ export function decodeMempool(hexes: string[]): Transaction[] {
   const txs: Transaction[] = [];
   let bytes = 0;
   let seen = 0;
+  let scannedHex = 0;
   for (const hex of hexes) {
     // Bound the POOL-SUPPLIED input BEFORE touching it. hexToBytes materialises
     // the whole string, and decodeTx does not require full consumption — so a
     // single huge entry (or a valid tx followed by megabytes of trailing junk)
     // would be allocated and parsed before the byte budget below could reject
-    // it. The budget bounds our OUTPUT; these bound the INPUT.
+    // it. The budget below bounds our OUTPUT; these bound the INPUT.
+    //
+    // The per-entry cap alone is not enough: `bytes` only counts successfully
+    // decoded canonical txs, so thousands of entries that each fail to decode
+    // (or carry huge trailing junk) would still all be allocated. TOTAL_HEX_BUDGET
+    // bounds the aggregate regardless of how many of them turn out to be usable.
     if (++seen > MAX_MEMPOOL_ENTRIES) break;
-    if (typeof hex !== 'string' || hex.length > MAX_TX_HEX_LEN) continue;
+    if (!mempoolEntryAcceptable(hex, scannedHex)) continue;
+    scannedHex += (hex as string).length;
     try {
       const { tx } = decodeTx(hexToBytes(hex));
       if (validateTxStructure(tx) !== null) continue;
@@ -179,25 +209,40 @@ export function headerMatchesTemplate(block: Block, headerHex: unknown): boolean
 /**
  * Correlate an accepted `template_result` to the templates still in flight.
  *
- * A single "last one I sent" slot is wrong: if the pool takes longer than the
- * result watchdog to answer, a second template is registered while the first is
- * still pending, and the two results cancel each other out — the first is
- * checked against the second, refused, and clears it; the second then finds
+ * A single "the last one I sent" slot is wrong: if the pool takes longer than
+ * the result watchdog to answer, a second template is registered while the
+ * first is still pending, and the two results cancel each other out — the first
+ * is checked against the second, refused, and clears it; the second then finds
  * nothing pending. With a consistently slow pool that repeats forever and the
  * miner never starts grinding at all.
  *
- * Returns the matched template and the templates still outstanding after it
- * (the match and anything older are settled), or null if the header belongs to
- * no template this miner built — which must never be ground.
+ * Only the MATCHED entry is removed, never "everything older than it". The
+ * protocol gives no ordering guarantee between a registration and its result,
+ * so dropping older entries on a match means an out-of-order pair (B answered
+ * before A) discards A, and A's own valid result then reads as foreign and
+ * kills the perfectly good grind that B started.
  *
- * Exported for unit tests.
+ * Returns the matched template and the templates still outstanding, or null if
+ * the header belongs to no template this miner built — which must never be
+ * ground. Exported for unit tests.
  */
-export function settleOutstanding(
-  outstanding: readonly Block[], headerHex: unknown,
-): { matched: Block; rest: Block[] } | null {
-  const idx = outstanding.findIndex((b) => headerMatchesTemplate(b, headerHex));
+export function settleOutstanding<T extends { block: Block }>(
+  outstanding: readonly T[], headerHex: unknown,
+): { matched: T; rest: T[] } | null {
+  const idx = outstanding.findIndex((e) => headerMatchesTemplate(e.block, headerHex));
   if (idx < 0) return null;
-  return { matched: outstanding[idx]!, rest: outstanding.slice(idx + 1) };
+  const rest = outstanding.slice();
+  rest.splice(idx, 1);
+  return { matched: outstanding[idx]!, rest };
+}
+
+/** Drop registrations too old to still be answered, then bound the list. Age is
+ *  the primary rule — see OUTSTANDING_TTL_MS. Exported for unit tests. */
+export function pruneOutstanding<T extends { at: number }>(entries: T[], now: number): T[] {
+  const fresh = entries.filter((e) => now - e.at <= OUTSTANDING_TTL_MS);
+  return fresh.length > MAX_OUTSTANDING_TEMPLATES
+    ? fresh.slice(fresh.length - MAX_OUTSTANDING_TEMPLATES)
+    : fresh;
 }
 
 /** http(s)://pool → ws(s)://pool/ws. Scheme match is case-insensitive: the
@@ -312,11 +357,20 @@ export async function runNegotiatedPoolClient(
   // and a single slot makes the two results cancel each other out forever (A's
   // result is compared against B, refused, and clears B; B's result then finds
   // nothing pending) — the miner would never start grinding at all.
-  let outstanding: Block[] = [];
-  // True while registerTemplate() is between its first await and its send, so a
-  // timer-driven second call cannot skip the catch-up branch and build on a tip
-  // that has not converged yet.
-  let registering = false;
+  let outstanding: { block: Block; at: number }[] = [];
+  // Which socket generation currently has a registration in flight (-1 = none).
+  // Generation-tagged rather than a bare boolean: a registration awaiting a slow
+  // catch-up on a socket that has since closed must not hold off registrations
+  // on the RECONNECTED socket — the stale call cannot send anything anyway
+  // (sessionOver catches it), so it must not gate a live one either.
+  let registeringGen = -1;
+  let socketGen = 0;
+  // Consecutive result-watchdog firings, used to back the re-registration rate
+  // off. A pool that answers slower than a fixed watchdog period would otherwise
+  // be sent a fresh template every period forever, so results keep arriving for
+  // registrations that have already aged out — and mining never starts. Backing
+  // off pushes the registration interval past the pool's latency instead.
+  let watchdogStrikes = 0;
   let lastRegisterAt = 0;
   let registerTimer: ReturnType<typeof setTimeout> | null = null;
   let resultWatchdog: ReturnType<typeof setTimeout> | null = null;
@@ -361,7 +415,10 @@ export async function runNegotiatedPoolClient(
         // shares, so a resubmission costs a rejected share and burns budget for
         // real ones. Dedup locally, per template (cleared on every new one).
         if (submittedNonces.has(nonce)) return;
-        submittedNonces.add(nonce);
+        // Bounded: at a near-maximal share target essentially every hash is a
+        // share, and an unbounded set would grow at the hash rate. Past the cap
+        // dedup degrades (the pool rejects a duplicate anyway) — memory does not.
+        if (submittedNonces.size < MAX_SUBMITTED_NONCES) submittedNonces.add(nonce);
         send({ type: 'share', jobId: grinding.templateId, nonce, hashHex: bytesToHex(hash) });
       },
       (hps) => { reporter.hashrate(hps); windowHashes += hps; },
@@ -389,8 +446,9 @@ export async function runNegotiatedPoolClient(
     // mid-await, see `syncing === true`, SKIP the catch-up entirely and build on
     // a tip that has not converged. Reschedule rather than drop: a chain_info
     // arriving during a long catch-up must not be lost.
-    if (registering) { scheduleRegister(RETRY_REGISTER_BUSY_MS); return; }
-    registering = true;
+    const gen = socketGen;
+    if (registeringGen === gen) { scheduleRegister(RETRY_REGISTER_BUSY_MS); return; }
+    registeringGen = gen;
     try {
       // Converge our chain onto the pool's announced tip before building. The pool
       // only accepts templates built on ITS current tip; if we're momentarily ahead
@@ -422,7 +480,9 @@ export async function runNegotiatedPoolClient(
 
       await registerNow(info, sock);
     } finally {
-      registering = false;
+      // Only release the slot if it is still ours: a reconnect may have handed
+      // it to a newer generation while this call was awaiting.
+      if (registeringGen === gen) registeringGen = -1;
     }
   }
 
@@ -449,19 +509,31 @@ export async function runNegotiatedPoolClient(
       return;
     }
     if (sessionOver(sock)) return;
-    lastRegisterAt = Date.now();
-    outstanding.push(block);
-    if (outstanding.length > MAX_OUTSTANDING_TEMPLATES) outstanding.shift();
+    const now = Date.now();
+    lastRegisterAt = now;
+    outstanding = pruneOutstanding([...outstanding, { block, at: now }], now);
     send({ type: 'template', blockHex: bytesToHex(encodeBlock(block)) });
     reporter.chain(block.header.height, block.header.difficulty.toString(16));
     if (resultWatchdog) clearTimeout(resultWatchdog);
+    // Exponential: 12s, 24s, 48s… capped. A fixed period against a pool slower
+    // than that period is a re-registration treadmill that never converges.
+    const resultWait = Math.min(
+      TEMPLATE_RESULT_TIMEOUT_MS * 2 ** watchdogStrikes,
+      TEMPLATE_RESULT_TIMEOUT_MAX_MS,
+    );
     resultWatchdog = setTimeout(() => {
-      reporter.event('warn', '[nego-miner] no template_result — re-registering');
+      watchdogStrikes++;
+      reporter.event('warn', `[nego-miner] no template_result after ${Math.round(resultWait / 1000)}s — re-registering`);
       scheduleRegister(0);
-    }, TEMPLATE_RESULT_TIMEOUT_MS);
+    }, resultWait);
   }
 
   function handleMsg(msg: Record<string, unknown>): void {
+    // Teardown terminates the grind pool but cannot un-queue messages already
+    // delivered to the socket. Without this, a late accepted template_result
+    // would call startGrind() on a terminated pool and re-arm its rate interval
+    // — an interval nothing is left to clear.
+    if (stopped) return;
     switch (msg.type) {
       case 'chain_info': {
         const info = msg as unknown as ChainInfo;
@@ -482,10 +554,13 @@ export async function runNegotiatedPoolClient(
 
       case 'template_result': {
         if (resultWatchdog) { clearTimeout(resultWatchdog); resultWatchdog = null; }
+        // The pool is answering — reset the re-registration backoff.
+        watchdogStrikes = 0;
         if (msg.accepted !== true) {
-          // A rejection is not correlated to a specific template by the protocol;
-          // drop the oldest in-flight one so a stuck entry can't accumulate.
-          outstanding.shift();
+          // A rejection carries no header, so it cannot be correlated to a
+          // specific registration. Do NOT drop the oldest entry on a guess: with
+          // two in flight, an out-of-order rejection for B would evict A and then
+          // refuse A's own valid acceptance. Age-pruning retires dead entries.
           const reason = String(msg.reason ?? 'unknown');
           reporter.event('warn', `[nego-miner] template rejected: ${reason}`);
           if (reason.includes('rate limited')) scheduleRegister(REGISTER_MIN_INTERVAL_MS);
@@ -570,6 +645,9 @@ export async function runNegotiatedPoolClient(
       reconnectTimer = setTimeout(connect, RECONNECT_DELAY_MS);
       return;
     }
+    // New generation: any registration still awaiting a catch-up belongs to the
+    // OLD socket and must stop gating registrations on this one.
+    socketGen++;
     ws = sock;
     sock.onopen = () => {
       sock.send(JSON.stringify({ type: 'auth', address: payoutAddress, mode: 'negotiated' }));

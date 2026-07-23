@@ -1,11 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  buildNegotiatedTemplate, decodeMempool, headerMatchesTemplate, negotiatedRequired, poolWsUrl,
-  settleOutstanding,
+  buildNegotiatedTemplate, decodeMempool, headerMatchesTemplate, mempoolEntryAcceptable,
+  negotiatedRequired, poolWsUrl, pruneOutstanding, settleOutstanding,
 } from './negotiatedClient.js';
 import { Blockchain } from '../chain/blockchain.js';
-import { computeTxRoot, encodeHeader } from '../chain/block.js';
+import { computeTxRoot, encodeHeader, type Block } from '../chain/block.js';
 import { bytesToHex, compareBytes } from '../util/binary.js';
 
 test('negotiatedRequired: 410 is the definitive signal, regardless of body', () => {
@@ -95,16 +95,17 @@ test('headerMatchesTemplate: rejects a header the pool changed — this is the w
 // second template was registered while the first was still pending. Treating a
 // result as "must be the last one I sent" made the two cancel each other out
 // forever and the miner never started grinding.
-function twoInFlight(): { a: ReturnType<typeof buildNegotiatedTemplate>; b: ReturnType<typeof buildNegotiatedTemplate> } {
+function twoInFlight(): { a: { block: Block; at: number }; b: { block: Block; at: number } } {
   const chain = new Blockchain();
-  const a = buildNegotiatedTemplate(chain, new Uint8Array(32).fill(1), []);
-  const b = buildNegotiatedTemplate(chain, new Uint8Array(32).fill(2), []);
-  return { a, b };
+  return {
+    a: { block: buildNegotiatedTemplate(chain, new Uint8Array(32).fill(1), []), at: 1_000 },
+    b: { block: buildNegotiatedTemplate(chain, new Uint8Array(32).fill(2), []), at: 2_000 },
+  };
 }
+const hexOf = (e: { block: Block }): string => bytesToHex(encodeHeader(e.block.header));
 
-test('settleOutstanding: a late result for the OLDER template does not discard the newer one', () => {
+test('settleOutstanding: a result for the OLDER template does not discard the newer one', () => {
   const { a, b } = twoInFlight();
-  const hexOf = (t: typeof a): string => bytesToHex(encodeHeader(t.header));
 
   // A's result arrives first: A is matched, B stays in flight.
   const first = settleOutstanding([a, b], hexOf(a));
@@ -120,21 +121,44 @@ test('settleOutstanding: a late result for the OLDER template does not discard t
   assert.deepEqual(second.rest, []);
 });
 
-test('settleOutstanding: matching the newer template settles the older one with it', () => {
+test('settleOutstanding: out-of-order results both settle (newer answered first)', () => {
   const { a, b } = twoInFlight();
-  const out = settleOutstanding([a, b], bytesToHex(encodeHeader(b.header)));
-  assert.ok(out);
-  assert.equal(out.matched, b);
-  assert.deepEqual(out.rest, [], 'anything older than the match is settled');
+
+  // The pool answers B before A. B must NOT take A down with it — dropping
+  // "everything older than the match" made A's own valid result read as foreign
+  // and kill the good grind B had just started.
+  const first = settleOutstanding([a, b], hexOf(b));
+  assert.ok(first);
+  assert.equal(first.matched, b);
+  assert.deepEqual(first.rest, [a], 'the older template is still awaiting its own result');
+
+  const second = settleOutstanding(first.rest, hexOf(a));
+  assert.ok(second, 'A must still correlate after B settled first');
+  assert.equal(second.matched, a);
+  assert.deepEqual(second.rest, []);
 });
 
 test('settleOutstanding: a header matching nothing in flight is refused', () => {
   const { a, b } = twoInFlight();
-  const foreign = buildNegotiatedTemplate(new Blockchain(), new Uint8Array(32).fill(3), []);
-  assert.equal(settleOutstanding([a, b], bytesToHex(encodeHeader(foreign.header))), null);
-  assert.equal(settleOutstanding([], bytesToHex(encodeHeader(a.header))), null);
+  const foreign = { block: buildNegotiatedTemplate(new Blockchain(), new Uint8Array(32).fill(3), []), at: 0 };
+  assert.equal(settleOutstanding([a, b], hexOf(foreign)), null);
+  assert.equal(settleOutstanding([], hexOf(a)), null);
   assert.equal(settleOutstanding([a], 'not-a-header'), null);
   assert.equal(settleOutstanding([a], undefined), null);
+});
+
+test('pruneOutstanding: retires by AGE, so a slow pool cannot be evicted by count alone', () => {
+  const now = 1_000_000;
+  const fresh = { at: now - 1_000 };
+  const old = { at: now - 11 * 60_000 };
+  assert.deepEqual(pruneOutstanding([old, fresh], now), [fresh], 'aged-out entry dropped');
+  assert.deepEqual(pruneOutstanding([fresh], now), [fresh]);
+
+  // A burst well past the count cap keeps the NEWEST ones and stays bounded.
+  const many = Array.from({ length: 200 }, (_, i) => ({ at: now - i }));
+  const kept = pruneOutstanding(many, now);
+  assert.equal(kept.length, 64);
+  assert.equal(kept[kept.length - 1], many[many.length - 1], 'keeps the tail of the list');
 });
 
 test('buildNegotiatedTemplate: rejects a pool address that is not 32 bytes', () => {
@@ -143,11 +167,29 @@ test('buildNegotiatedTemplate: rejects a pool address that is not 32 bytes', () 
   assert.throws(() => buildNegotiatedTemplate(chain, new Uint8Array(0), []), /32 bytes/);
 });
 
-test('decodeMempool: an oversized pool entry is skipped without being decoded', () => {
-  // 2 MB of hex: well past the block budget. It must be rejected on length,
-  // before hexToBytes allocates it.
-  const huge = 'ab'.repeat(1_000_000);
+test('mempoolEntryAcceptable: bounds pool input BEFORE it is decoded', () => {
+  const TX_BYTE_BUDGET = 256 * 1024 - 1_024; // MAX_BLOCK_BYTES - 1024
+  const ok = 'ab'.repeat(100);
+
+  assert.equal(mempoolEntryAcceptable(ok, 0), true);
+  // Per-entry cap: one entry may not exceed a block's worth of hex.
+  assert.equal(mempoolEntryAcceptable('a'.repeat(TX_BYTE_BUDGET * 2 + 1), 0), false);
+  // Aggregate cap: many mid-sized entries must not add up without limit. This is
+  // the half the per-entry cap alone does not cover, because `bytes` in
+  // decodeMempool only counts entries that successfully decode.
+  assert.equal(mempoolEntryAcceptable(ok, TX_BYTE_BUDGET * 4), false);
+  assert.equal(mempoolEntryAcceptable(ok, TX_BYTE_BUDGET * 4 - ok.length), true);
+  // Non-strings and empties never reach the decoder.
+  assert.equal(mempoolEntryAcceptable(undefined, 0), false);
+  assert.equal(mempoolEntryAcceptable(12345, 0), false);
+  assert.equal(mempoolEntryAcceptable('', 0), false);
+});
+
+test('decodeMempool: an oversized pool entry is skipped, and scanning continues past it', () => {
+  const huge = 'ab'.repeat(1_000_000); // 2 MB — well past the block budget
   assert.deepEqual(decodeMempool([huge]), []);
+  // `continue`, not `break`: a junk entry must not truncate the rest of the set.
+  assert.deepEqual(decodeMempool([huge, 'zz', 'deadbeef']), []);
 });
 
 test('poolWsUrl: an uppercase scheme still rewrites (headless MINER_POOL is not canonicalised)', () => {
