@@ -150,15 +150,23 @@ test('settleOutstanding: a header matching nothing in flight is refused', () => 
 test('pruneOutstanding: retires by AGE, so a slow pool cannot be evicted by count alone', () => {
   const now = 1_000_000;
   const fresh = { at: now - 1_000 };
-  const old = { at: now - 11 * 60_000 };
+  // Inside the 30-minute TTL: a pool this slow is still answered, not evicted.
+  const slow = { at: now - 25 * 60_000 };
+  const old = { at: now - 31 * 60_000 };
   assert.deepEqual(pruneOutstanding([old, fresh], now), [fresh], 'aged-out entry dropped');
+  assert.deepEqual(pruneOutstanding([slow, fresh], now), [slow, fresh], 'a slow pool is still correlatable');
   assert.deepEqual(pruneOutstanding([fresh], now), [fresh]);
 
-  // A burst well past the count cap keeps the NEWEST ones and stays bounded.
-  const many = Array.from({ length: 200 }, (_, i) => ({ at: now - i }));
+  // A burst well past the count cap stays bounded and keeps the NEWEST ones.
+  // Fixture order matters: production appends on send, so the list runs
+  // oldest-first and the newest entries are the tail. Generating it newest-first
+  // would assert the opposite of what production does and still pass.
+  const many = Array.from({ length: 200 }, (_, i) => ({ at: now - (200 - i) }));
+  assert.ok(many[0]!.at < many[199]!.at, 'fixture must be oldest-first, like production');
   const kept = pruneOutstanding(many, now);
   assert.equal(kept.length, 64);
-  assert.equal(kept[kept.length - 1], many[many.length - 1], 'keeps the tail of the list');
+  assert.equal(kept[kept.length - 1], many[199], 'newest survives');
+  assert.equal(kept[0], many[136], 'the oldest 136 are the ones dropped');
 });
 
 test('buildNegotiatedTemplate: rejects a pool address that is not 32 bytes', () => {
@@ -185,11 +193,12 @@ test('mempoolEntryAcceptable: bounds pool input BEFORE it is decoded', () => {
   assert.equal(mempoolEntryAcceptable('', 0), false);
 });
 
-test('decodeMempool: an oversized pool entry is skipped, and scanning continues past it', () => {
+test('decodeMempool: an oversized pool entry is skipped rather than decoded', () => {
   const huge = 'ab'.repeat(1_000_000); // 2 MB — well past the block budget
   assert.deepEqual(decodeMempool([huge]), []);
-  // `continue`, not `break`: a junk entry must not truncate the rest of the set.
-  assert.deepEqual(decodeMempool([huge, 'zz', 'deadbeef']), []);
+  // The bound itself is asserted in the mempoolEntryAcceptable test above; this
+  // only pins that an oversized entry cannot throw its way out of the loop.
+  assert.deepEqual(decodeMempool([huge, huge, 'zz']), []);
 });
 
 test('poolWsUrl: an uppercase scheme still rewrites (headless MINER_POOL is not canonicalised)', () => {

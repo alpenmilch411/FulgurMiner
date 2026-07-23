@@ -48,7 +48,12 @@ export const REGISTER_MIN_INTERVAL_MS = 2_200;
 // If a registered template gets no template_result (ws blip, server hiccup),
 // re-register rather than sit idle forever.
 const TEMPLATE_RESULT_TIMEOUT_MS = 12_000;
-const TEMPLATE_RESULT_TIMEOUT_MAX_MS = 180_000;
+// Capped re-registration interval. Must stay well below OUTSTANDING_TTL_MS: the
+// two together decide how slow a pool can be and still get its answer
+// correlated. TTL / this cap = the number of registrations that can pile up
+// before the oldest ages out, and that has to stay under
+// MAX_OUTSTANDING_TEMPLATES or a registration is evicted while still live.
+const TEMPLATE_RESULT_TIMEOUT_MAX_MS = 120_000;
 const RECONNECT_DELAY_MS = 5_000;
 const RETRY_BUILD_DELAY_MS = 5_000;
 // A register that arrives while another is mid-flight is deferred, not dropped.
@@ -69,7 +74,12 @@ const TOTAL_HEX_BUDGET = TX_BYTE_BUDGET * 4;
 // the template it belongs to instead of clobbering a newer one. Entries leave by
 // AGE, not by count: evicting on count alone would silently recreate the
 // never-start-grinding livelock against a pool slower than cap × watchdog.
-const OUTSTANDING_TTL_MS = 10 * 60_000;
+// A registration stays correlatable for half an hour. With the watchdog capped
+// at 120s that is at most ~15 in flight from re-registration, comfortably under
+// the count cap — so nothing live is ever evicted by count, and a pool is
+// tolerated up to a 30-minute answer. Past that it is not a slow pool, it is a
+// dead one, and the reconnect/tip-change paths take over.
+const OUTSTANDING_TTL_MS = 30 * 60_000;
 const MAX_OUTSTANDING_TEMPLATES = 64;
 // Cap on remembered per-template nonces (see submittedNonces). At a normal
 // vardiff target this holds a handful; the cap only matters if a pool serves a
@@ -554,13 +564,18 @@ export async function runNegotiatedPoolClient(
 
       case 'template_result': {
         if (resultWatchdog) { clearTimeout(resultWatchdog); resultWatchdog = null; }
-        // The pool is answering — reset the re-registration backoff.
-        watchdogStrikes = 0;
         if (msg.accepted !== true) {
-          // A rejection carries no header, so it cannot be correlated to a
-          // specific registration. Do NOT drop the oldest entry on a guess: with
-          // two in flight, an out-of-order rejection for B would evict A and then
-          // refuse A's own valid acceptance. Age-pruning retires dead entries.
+          // A rejection carries no header, so it generally cannot be correlated
+          // to a specific registration — do NOT drop the oldest on a guess, or an
+          // out-of-order rejection for B evicts A and then refuses A's own valid
+          // acceptance. The one case that IS unambiguous is exactly one entry in
+          // flight, and settling it there matters: a sustained rejection stream
+          // that retained every entry would otherwise fill the count cap and
+          // evict a live registration well inside its TTL.
+          if (outstanding.length === 1) {
+            outstanding = [];
+            watchdogStrikes = 0; // a correlated answer — the pool is responding
+          }
           const reason = String(msg.reason ?? 'unknown');
           reporter.event('warn', `[nego-miner] template rejected: ${reason}`);
           if (reason.includes('rate limited')) scheduleRegister(REGISTER_MIN_INTERVAL_MS);
@@ -584,6 +599,11 @@ export async function runNegotiatedPoolClient(
           scheduleRegister(RETRY_BUILD_DELAY_MS);
           break;
         }
+        // Reset the backoff only on a CORRELATED answer. Resetting on any
+        // message at all lets a foreign or uncorrelated result hold the
+        // re-registration rate high against exactly the slow pool the backoff
+        // exists to converge on.
+        watchdogStrikes = 0;
         outstanding = settled.rest;
         submittedNonces.clear();
         grinding = {
