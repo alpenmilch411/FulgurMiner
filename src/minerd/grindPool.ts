@@ -245,6 +245,8 @@ export class GrindPool {
 
   terminate(): void {
     this.terminating = true;
+    this.gen++;               // a message already queued for the old gen is now stale
+    this.solvedThisGen = true;
     this.clearPendingRespawns();
     this.activeGrind = null;
     if (this.rateTimer) { clearInterval(this.rateTimer); this.rateTimer = null; }

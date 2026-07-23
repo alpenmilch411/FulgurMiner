@@ -446,3 +446,13 @@ test('GrindPool at throttle 1 picks up a new generation on a synchronous (post-f
     pool.terminate();
   }
 });
+
+test('terminate() advances the generation so a late worker message is stale', () => {
+  // stop()/respawn() bump gen; terminate() must too, or a "solved" message already
+  // queued when terminate() runs still matches gen and fires onSolved after shutdown.
+  const pool = new GrindPool(1, 0.5);
+  const genBefore = (pool as unknown as { gen: number }).gen;
+  pool.terminate();
+  const genAfter = (pool as unknown as { gen: number }).gen;
+  assert.ok(genAfter > genBefore, 'terminate() must increment gen (like stop/respawn)');
+});
