@@ -71,14 +71,15 @@ const MAX_TX_HEX_LEN = TX_BYTE_BUDGET * 2;
 const TOTAL_HEX_BUDGET = TX_BYTE_BUDGET * 4;
 // A slow pool can leave more than one registration in flight (the result
 // watchdog re-registers). Keep the recent ones so a late result is correlated to
-// the template it belongs to instead of clobbering a newer one. Entries leave by
-// AGE, not by count: evicting on count alone would silently recreate the
-// never-start-grinding livelock against a pool slower than cap × watchdog.
-// A registration stays correlatable for half an hour. With the watchdog capped
-// at 120s that is at most ~15 in flight from re-registration, comfortably under
-// the count cap — so nothing live is ever evicted by count, and a pool is
-// tolerated up to a 30-minute answer. Past that it is not a slow pool, it is a
-// dead one, and the reconnect/tip-change paths take over.
+// the template it belongs to instead of clobbering a newer one.
+//
+// Entries leave by AGE, not by count — evicting on count alone recreates the
+// never-start-grinding livelock against a pool slower than cap × watchdog. A
+// registration stays correlatable for half an hour; with the watchdog capped at
+// 120s the worst case is ~18 sends in that window (12s, 24s, 48s, 96s, then
+// 120s apart), comfortably under the count cap, so nothing live is ever evicted
+// by count and a pool is tolerated up to a 30-minute answer. Past that it is not
+// a slow pool, it is a dead one, and the reconnect/tip-change paths take over.
 const OUTSTANDING_TTL_MS = 30 * 60_000;
 const MAX_OUTSTANDING_TEMPLATES = 64;
 // Cap on remembered per-template nonces (see submittedNonces). At a normal
@@ -246,6 +247,26 @@ export function settleOutstanding<T extends { block: Block }>(
   return { matched: outstanding[idx]!, rest };
 }
 
+/**
+ * What to do with a `template_result`.
+ *
+ * An ACCEPTED result carries the header, so it correlates itself no matter how
+ * many registrations are in flight. A REJECTED one carries nothing — the only
+ * time it is unambiguous is when it answered the sole unanswered send.
+ *
+ * `inFlightAfter` is the number of sends still unanswered AFTER this result, not
+ * the length of the outstanding list: the list is cleared on a tip change while
+ * the pool's answer to the pre-change send is still on its way, and keying on
+ * the list would then settle a registration this rejection was never about.
+ *
+ * Exported for unit tests.
+ */
+export type TemplateResultAction = 'match-accepted' | 'settle-and-retry' | 'ignore-ambiguous';
+export function classifyTemplateResult(accepted: boolean, inFlightAfter: number): TemplateResultAction {
+  if (accepted) return 'match-accepted';
+  return inFlightAfter === 0 ? 'settle-and-retry' : 'ignore-ambiguous';
+}
+
 /** Drop registrations too old to still be answered, then bound the list. Age is
  *  the primary rule — see OUTSTANDING_TTL_MS. Exported for unit tests. */
 export function pruneOutstanding<T extends { at: number }>(entries: T[], now: number): T[] {
@@ -368,6 +389,12 @@ export async function runNegotiatedPoolClient(
   // result is compared against B, refused, and clears B; B's result then finds
   // nothing pending) — the miner would never start grinding at all.
   let outstanding: { block: Block; at: number }[] = [];
+  // Sends not yet answered by a template_result. Tracks the PROTOCOL state, not
+  // our bookkeeping: `outstanding` is cleared on a tip change while the pool's
+  // answer to the pre-change send is still in transit, so only this can tell
+  // whether a header-less rejection is unambiguous. Reset on reconnect, where
+  // answers to the old socket can no longer arrive.
+  let inFlight = 0;
   // Which socket generation currently has a registration in flight (-1 = none).
   // Generation-tagged rather than a bare boolean: a registration awaiting a slow
   // catch-up on a socket that has since closed must not hold off registrations
@@ -522,6 +549,7 @@ export async function runNegotiatedPoolClient(
     const now = Date.now();
     lastRegisterAt = now;
     outstanding = pruneOutstanding([...outstanding, { block, at: now }], now);
+    inFlight++;
     send({ type: 'template', blockHex: bytesToHex(encodeBlock(block)) });
     reporter.chain(block.header.height, block.header.difficulty.toString(16));
     if (resultWatchdog) clearTimeout(resultWatchdog);
@@ -563,19 +591,22 @@ export async function runNegotiatedPoolClient(
       }
 
       case 'template_result': {
+        inFlight = Math.max(0, inFlight - 1);
+        const action = classifyTemplateResult(msg.accepted === true, inFlight);
+        if (action === 'ignore-ambiguous') {
+          // Another send is still unanswered, and its watchdog is still armed —
+          // leave both alone. Crucially, do NOT schedule a registration here: a
+          // rejection stream that kept appending entries is exactly what filled
+          // the count cap and evicted a live registration. With this branch,
+          // new registrations come only from a tip change or the backing-off
+          // watchdog, so the list cannot grow faster than it ages out.
+          reporter.event('warn', `[nego-miner] template rejected: ${String(msg.reason ?? 'unknown')} (another registration still pending)`);
+          break;
+        }
         if (resultWatchdog) { clearTimeout(resultWatchdog); resultWatchdog = null; }
-        if (msg.accepted !== true) {
-          // A rejection carries no header, so it generally cannot be correlated
-          // to a specific registration — do NOT drop the oldest on a guess, or an
-          // out-of-order rejection for B evicts A and then refuses A's own valid
-          // acceptance. The one case that IS unambiguous is exactly one entry in
-          // flight, and settling it there matters: a sustained rejection stream
-          // that retained every entry would otherwise fill the count cap and
-          // evict a live registration well inside its TTL.
-          if (outstanding.length === 1) {
-            outstanding = [];
-            watchdogStrikes = 0; // a correlated answer — the pool is responding
-          }
+        if (action === 'settle-and-retry') {
+          outstanding = [];
+          watchdogStrikes = 0; // a correlated answer — the pool is responding
           const reason = String(msg.reason ?? 'unknown');
           reporter.event('warn', `[nego-miner] template rejected: ${reason}`);
           if (reason.includes('rate limited')) scheduleRegister(REGISTER_MIN_INTERVAL_MS);
@@ -683,6 +714,7 @@ export async function runNegotiatedPoolClient(
       grind.stop();
       grinding = null;
       outstanding = [];
+      inFlight = 0;
       submittedNonces.clear();
       if (resultWatchdog) { clearTimeout(resultWatchdog); resultWatchdog = null; }
       if (registerTimer) { clearTimeout(registerTimer); registerTimer = null; }

@@ -1,8 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  buildNegotiatedTemplate, decodeMempool, headerMatchesTemplate, mempoolEntryAcceptable,
-  negotiatedRequired, poolWsUrl, pruneOutstanding, settleOutstanding,
+  buildNegotiatedTemplate, classifyTemplateResult, decodeMempool, headerMatchesTemplate,
+  mempoolEntryAcceptable, negotiatedRequired, poolWsUrl, pruneOutstanding, settleOutstanding,
 } from './negotiatedClient.js';
 import { Blockchain } from '../chain/blockchain.js';
 import { computeTxRoot, encodeHeader, type Block } from '../chain/block.js';
@@ -145,6 +145,23 @@ test('settleOutstanding: a header matching nothing in flight is refused', () => 
   assert.equal(settleOutstanding([], hexOf(a)), null);
   assert.equal(settleOutstanding([a], 'not-a-header'), null);
   assert.equal(settleOutstanding([a], undefined), null);
+});
+
+test('classifyTemplateResult: an acceptance correlates itself, a rejection only when it is the sole answer', () => {
+  // Accepted results carry the header, so they correlate however many are in
+  // flight.
+  assert.equal(classifyTemplateResult(true, 0), 'match-accepted');
+  assert.equal(classifyTemplateResult(true, 3), 'match-accepted');
+
+  // A rejection carries nothing. Unambiguous only when it answered the sole
+  // unanswered send.
+  assert.equal(classifyTemplateResult(false, 0), 'settle-and-retry');
+
+  // Ambiguous: another send is still unanswered. Settling here would clear a
+  // registration this rejection was never about — including across a tip change,
+  // where the list was cleared while the pool's answer was still in transit.
+  assert.equal(classifyTemplateResult(false, 1), 'ignore-ambiguous');
+  assert.equal(classifyTemplateResult(false, 9), 'ignore-ambiguous');
 });
 
 test('pruneOutstanding: retires by AGE, so a slow pool cannot be evicted by count alone', () => {
