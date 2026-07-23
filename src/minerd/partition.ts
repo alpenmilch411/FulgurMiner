@@ -19,12 +19,17 @@ export function partitionNonceSpace(workers: number, spaceStart = 0, spaceEnd = 
   const n = Math.max(1, Math.floor(workers));
   const lo = Math.max(0, Math.min(Math.floor(spaceStart), NONCE_SPACE));
   const hi = Math.max(lo, Math.min(Math.floor(spaceEnd), NONCE_SPACE));
-  const step = Math.floor((hi - lo) / n);
+  const width = hi - lo;
+  const base = Math.floor(width / n);
+  const rem = width - base * n; // 0..n-1 extra units, one each to the first `rem` workers
   const ranges: NonceRange[] = [];
+  let cursor = lo;
   for (let i = 0; i < n; i++) {
-    const start = lo + i * step;
-    const end = i === n - 1 ? hi : lo + (i + 1) * step;
+    const size = base + (i < rem ? 1 : 0);
+    const start = cursor;
+    const end = i === n - 1 ? hi : start + size; // last absorbs any rounding, stays == hi
     ranges.push({ start, end });
+    cursor = end;
   }
   return ranges;
 }

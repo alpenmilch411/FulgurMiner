@@ -30,3 +30,30 @@ test('partitionNonceSpace: more workers than nonces -> no crash, last covers end
   assert.equal(r[4]!.end, 2);
   for (const x of r) assert.ok(x.end >= x.start); // never inverted
 });
+
+test('partition: narrow slot (width < workers) still splits across workers, no empty ranges', () => {
+  // 5-wide slot, 8 workers: every worker that gets work must get a non-empty range,
+  // ranges disjoint + contiguous + cover exactly [100,105).
+  const ranges = partitionNonceSpace(8, 100, 105);
+  const nonEmpty = ranges.filter((r) => r.end > r.start);
+  assert.equal(nonEmpty.length, 5, 'exactly 5 workers get a 1-wide range');
+  assert.equal(ranges[0]!.start, 100);
+  assert.equal(ranges[ranges.length - 1]!.end, 105);
+  for (let i = 1; i < ranges.length; i++) assert.equal(ranges[i]!.start, ranges[i - 1]!.end); // contiguous
+  const total = ranges.reduce((s, r) => s + (r.end - r.start), 0);
+  assert.equal(total, 5, 'ranges cover exactly the slot width, no gaps or overlaps');
+});
+
+test('partition: even split unchanged for the common case', () => {
+  const ranges = partitionNonceSpace(4, 0, 400);
+  assert.deepEqual(ranges, [
+    { start: 0, end: 100 }, { start: 100, end: 200 },
+    { start: 200, end: 300 }, { start: 300, end: 400 },
+  ]);
+});
+
+test('partition: width 0 yields all-empty ranges, still n of them, no crash', () => {
+  const ranges = partitionNonceSpace(3, 50, 50);
+  assert.equal(ranges.length, 3);
+  assert.ok(ranges.every((r) => r.start === 50 && r.end === 50));
+});
