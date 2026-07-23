@@ -374,6 +374,27 @@ test('runPoolClient: a 426 on /job (headless shape — signal===undefined) stops
   }
 });
 
+test('runPoolClient: a mid-run 410 on /job stops pool mode cleanly instead of looping on a dead endpoint', async () => {
+  process.env.FULGUR_NO_UPDATE_CHECK = '1';
+  const doFetch: typeof fetch = (async (url: unknown) => {
+    const u = String(url);
+    if (u.includes('/register')) return resp(200, { workerId: 'w1' });
+    if (u.includes('/job')) return resp(410, {});
+    if (u.includes('/balance')) return resp(200, { earnedBrc: 1, pendingBrc: 0, paidBrc: 0 });
+    return resp(404, {});
+  }) as unknown as typeof fetch;
+  const { state, reporter } = makeReporter();
+  // signal omitted — same headless shape as the 426 test above. If the 410 fell
+  // through to classify()==='fatal' (the pre-fix behavior), runPoolClient would
+  // never resolve here (it retries /job forever) and this test would time out.
+  await runPoolClient('https://pool.fulgurpool.xyz', 'a'.repeat(64), 1, 1, reporter, undefined, undefined, 'off', doFetch);
+  assert.ok(
+    state.events.some((e) => e.includes('negotiated mode') && e.includes('410')),
+    'a restart-hint event naming the 410/negotiated hand-off must be reported',
+  );
+  delete process.env.FULGUR_NO_UPDATE_CHECK;
+});
+
 // ─── FIX 2: a construction failure between startPoolStats() and the done()
 // teardown must never leak the stats interval ────────────────────────────────
 // startPoolStats() used to run BEFORE `new GrindPool()`/the smart controller/
