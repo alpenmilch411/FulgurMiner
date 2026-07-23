@@ -75,7 +75,13 @@ export function applyMineEnvOverrides(): void {
 }
 
 async function dryrun(): Promise<void> {
-  const cfg = loadConfig();
+  // dryrun is a solo-only consensus check — it builds its own template and never
+  // talks to a pool, so a malformed/unused MINER_POOL must not fail the gate.
+  // loadConfig() now validates MINER_POOL strictly (throws on a bad value), which
+  // is correct for the mine/start paths below but would needlessly break dryrun
+  // for a value it never reads. Strip it from the env this call sees instead of
+  // reading the real one — the mine/start paths still validate as-is.
+  const cfg = loadConfig({ ...process.env, MINER_POOL: 'solo' });
   const chain = new Blockchain();
 
   // Reuse one persistent VerifierPool across the whole bootstrap (workers created

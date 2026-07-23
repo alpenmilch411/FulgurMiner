@@ -99,3 +99,15 @@ test('isValidTipBody: rejects missing/short/non-numeric fields', () => {
   assert.equal(isValidTipBody({ height: 'abc', tipHash: 'a'.repeat(64) }), false);
   assert.equal(isValidTipBody(null), false);
 });
+
+// strict typed-height guard: Number(...) coercion let null/false/[]/''/1.5 all
+// pass as a "valid" height — a bad helper then looked successful instead of
+// failing over, and a fractional height could flap tipAdvanced.
+test('isValidTipBody: rejects coercible-but-wrong-typed heights; accepts height 0', () => {
+  assert.equal(isValidTipBody({ height: 1.5, tipHash: 'a'.repeat(64) }), false);   // fractional
+  assert.equal(isValidTipBody({ height: null, tipHash: 'a'.repeat(64) }), false);  // Number(null) === 0
+  assert.equal(isValidTipBody({ height: false, tipHash: 'a'.repeat(64) }), false); // Number(false) === 0
+  assert.equal(isValidTipBody({ height: [], tipHash: 'a'.repeat(64) }), false);    // Number([]) === 0
+  assert.equal(isValidTipBody({ height: '', tipHash: 'a'.repeat(64) }), false);    // Number('') === 0
+  assert.equal(isValidTipBody({ height: 0, tipHash: 'a'.repeat(64) }), true);      // genesis height is valid
+});

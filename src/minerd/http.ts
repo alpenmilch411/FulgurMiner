@@ -27,15 +27,18 @@ export interface Tip {
   tipHash: string;
 }
 
-/** A /tip body is only usable if height is a finite non-negative number and
- *  tipHash is 64 hex chars. A malformed 200 body (missing height -> NaN) would
- *  otherwise flow into the tip poller as a NaN height and stop solo grinding with
- *  no rebuild. Exported for tests. */
+/** A /tip body is only usable if height is a real non-negative INTEGER (not merely
+ *  Number(...)-coercible — `null`/`false`/`[]`/`''` all coerce to 0 and `1.5` would
+ *  flap `tipAdvanced`) and tipHash is 64 hex chars. A malformed 200 body (missing
+ *  height -> NaN, or a coercible-but-wrong-typed height) would otherwise flow into
+ *  the tip poller as a bogus height and stop solo grinding with no rebuild, or make
+ *  a bad helper look successful instead of failing over. Exported for tests. */
 export function isValidTipBody(body: unknown): boolean {
   const b = body as { height?: unknown; tipHash?: unknown } | null;
   if (!b || typeof b !== 'object') return false;
-  const h = Number(b.height);
-  return Number.isFinite(h) && h >= 0 && typeof b.tipHash === 'string' && /^[0-9a-f]{64}$/i.test(b.tipHash);
+  const h = b.height;
+  return typeof h === 'number' && Number.isInteger(h) && h >= 0
+    && typeof b.tipHash === 'string' && /^[0-9a-f]{64}$/i.test(b.tipHash);
 }
 
 // Bound every solo helper fetch so a half-open connection can't wedge sync/submit.

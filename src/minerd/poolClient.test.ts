@@ -384,15 +384,24 @@ test('runPoolClient: a mid-run 410 on /job stops pool mode cleanly instead of lo
     return resp(404, {});
   }) as unknown as typeof fetch;
   const { state, reporter } = makeReporter();
-  // signal omitted — same headless shape as the 426 test above. If the 410 fell
-  // through to classify()==='fatal' (the pre-fix behavior), runPoolClient would
-  // never resolve here (it retries /job forever) and this test would time out.
-  await runPoolClient('https://pool.fulgurpool.xyz', 'a'.repeat(64), 1, 1, reporter, undefined, undefined, 'off', doFetch);
-  assert.ok(
-    state.events.some((e) => e.includes('negotiated mode') && e.includes('410')),
-    'a restart-hint event naming the 410/negotiated hand-off must be reported',
-  );
-  delete process.env.FULGUR_NO_UPDATE_CHECK;
+  // A bounded deadline, not an unbounded await: if the 410 branch ever regresses
+  // to classify()==='fatal' (the pre-fix behavior), runPoolClient retries /job
+  // forever and this test would hang `npm test` (node:test has no default
+  // per-test timeout). The signal's abort forces runPoolClient to resolve at the
+  // deadline either way, so a regression FAILS the assertion below instead of
+  // hanging — bounded in both the passing and the (hypothetical) regressed case.
+  const ac = new AbortController();
+  const deadline = setTimeout(() => ac.abort(new DOMException('test deadline', 'AbortError')), 3000);
+  try {
+    await runPoolClient('https://pool.fulgurpool.xyz', 'a'.repeat(64), 1, 1, reporter, ac.signal, undefined, 'off', doFetch);
+    assert.ok(
+      state.events.some((e) => e.includes('negotiated mode') && e.includes('410')),
+      'a restart-hint event naming the 410/negotiated hand-off must be reported',
+    );
+  } finally {
+    clearTimeout(deadline);
+    delete process.env.FULGUR_NO_UPDATE_CHECK;
+  }
 });
 
 // ─── FIX 2: a construction failure between startPoolStats() and the done()

@@ -102,7 +102,11 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   // cpuBudget.ts.
   const workers = resolveWorkers(env.MINER_WORKERS, cpuBudget());
 
-  const tipPollRaw = env.MINER_TIP_POLL_MS !== undefined ? Number(env.MINER_TIP_POLL_MS) : 3000;
+  // A blank value ('') must count as unset (-> 3000), matching the old truthiness
+  // check: Number('') === 0, so a blank MINER_TIP_POLL_MS used to silently floor
+  // to the 500ms minimum instead of the 3000ms default.
+  const tpRaw = env.MINER_TIP_POLL_MS;
+  const tipPollRaw = tpRaw !== undefined && tpRaw.trim() !== '' ? Number(tpRaw) : 3000;
   const tipPollMs = Number.isFinite(tipPollRaw) ? Math.max(500, Math.floor(tipPollRaw)) : 3000;
 
   // Duty cycle: fraction of wall-time spent hashing vs sleeping. Balanced default

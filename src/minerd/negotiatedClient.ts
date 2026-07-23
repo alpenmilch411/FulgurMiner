@@ -930,9 +930,16 @@ export async function runNegotiatedPoolClient(
         if (!isHexTarget(msg.poolTargetHex)) {
           // A missing/malformed target would otherwise reach the grind workers as
           // "undefined"/"null" and throw BigInt('0xundefined') — refuse it like the
-          // foreign-header case above rather than grind on garbage.
+          // foreign-header case above rather than grind on garbage. The header DID
+          // match (settled is a correlated answer), so consume it exactly like the
+          // normal accepted path below: leaving it in `outstanding` would keep a
+          // ghost entry that can later re-correlate to a stale header, and would
+          // make the unconditional reschedule below violate THE RULE (a result may
+          // only schedule a new registration if it also settled one).
           reporter.event('warn', '[nego-miner] template accepted with a missing/malformed share target — rebuilding');
           if (resultWatchdog) { clearTimeout(resultWatchdog); resultWatchdog = null; }
+          outstanding = settled.rest;
+          watchdogStrikes = 0; // a correlated answer — the pool is responding
           scheduleRegister(RETRY_BUILD_DELAY_MS);
           break;
         }

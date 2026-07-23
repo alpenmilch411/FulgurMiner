@@ -45,3 +45,8 @@ test('loadConfig: non-numeric MINER_TIP_POLL_MS falls back to the 3000ms default
   const cfg3 = loadConfig({ MINER_PUBKEY: '00'.repeat(32), MINER_TIP_POLL_MS: '100' });
   assert.equal(cfg3.tipPollMs, 500); // floored at 500 minimum
 });
+
+test('loadConfig: a blank MINER_TIP_POLL_MS (=\'\') is treated as unset, not Number(\'\')=0', () => {
+  const cfg = loadConfig({ MINER_PUBKEY: '00'.repeat(32), MINER_TIP_POLL_MS: '' });
+  assert.equal(cfg.tipPollMs, 3000);
+});
