@@ -1,6 +1,7 @@
 // src/minerd/config.ts
 import { addressFromHex } from '../crypto/keys.js';
 import { cpuBudget, resolveWorkers } from './cpuBudget.js';
+import { canonicalisePoolUrl } from './pools.js';
 
 export interface MinerConfig {
   minerPubkeyHex: string;
@@ -59,7 +60,14 @@ export function resolvePoolUrl(raw: string | undefined): string | undefined {
   const v = (raw ?? '').trim();
   if (v === '') return DEFAULT_POOL || undefined;
   if (/^(solo|off|none)$/i.test(v)) return undefined;
-  return v.replace(/\/+$/, '');
+  // Canonicalise exactly like the TUI/settings/pools.json path: prepend https://
+  // to a scheme-less value (.env.example documents that https:// may be omitted),
+  // drop a trailing slash, reject control chars/credentials/non-http(s). A malformed
+  // value is a clear config error, not a silently-broken pool URL the miner then
+  // POSTs /register to forever.
+  const canon = canonicalisePoolUrl(v);
+  if (!canon.ok) throw new Error(`invalid MINER_POOL "${v}": ${canon.reason}`);
+  return canon.url;
 }
 
 /** Resolve the helper list from MINER_HELPERS (comma-separated), falling back to
@@ -94,9 +102,8 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   // cpuBudget.ts.
   const workers = resolveWorkers(env.MINER_WORKERS, cpuBudget());
 
-  const tipPollMs = env.MINER_TIP_POLL_MS
-    ? Math.max(500, Math.floor(Number(env.MINER_TIP_POLL_MS)))
-    : 3000;
+  const tipPollRaw = env.MINER_TIP_POLL_MS !== undefined ? Number(env.MINER_TIP_POLL_MS) : 3000;
+  const tipPollMs = Number.isFinite(tipPollRaw) ? Math.max(500, Math.floor(tipPollRaw)) : 3000;
 
   // Duty cycle: fraction of wall-time spent hashing vs sleeping. Balanced default
   // 0.75 keeps heat/fan/power in check while staying productive. Clamp to (0.05, 1].
