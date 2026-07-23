@@ -10,6 +10,7 @@ import { HEADER_LEN } from '../chain/block.js';
 import { ConsoleReporter, type MinerReporter, type ReporterStatus } from './reporter.js';
 import { VERSION } from './version.js';
 import { backoffDelay, classify, parseRetryAfterMs, PoolError, poolFetch, withPoolRetry } from './poolHttp.js';
+import { negotiatedRequired, runNegotiatedPoolClient } from './negotiatedClient.js';
 import { startPoolStats } from './poolStats.js';
 import { checkForUpdate } from './updateCheck.js';
 import { isFulgurPool } from './pools.js';
@@ -560,7 +561,7 @@ export async function runPoolClient(
   reporter.event('info', `[pool-miner] connecting to ${poolUrl}…`);
   reporter.syncProgress(0, 0);
 
-  const register = async (): Promise<RegisterBody | null> => {
+  const register = async (): Promise<RegisterBody | 'negotiated' | null> => {
     let waitingSince = 0;
     let nudged = false;
     const reg = await withPoolRetry(
@@ -582,6 +583,11 @@ export async function runPoolClient(
         },
       },
     ).catch((e: unknown) => {
+      if (e instanceof PoolError && negotiatedRequired(e.status, e.body)) {
+        // The pool retired pool-built jobs: miners must build their own blocks
+        // (Stratum-V2-style job negotiation). Hand over to the negotiated client.
+        return 'negotiated' as const;
+      }
       if (e instanceof PoolError && e.status === 400) {
         reporter.event('error', `[pool-miner] registration rejected: ${(e.body as { error?: string } | null)?.error ?? 'bad payoutAddress'} — fix MINER_PUBKEY. Stopping pool mode.`);
         return null;
@@ -594,10 +600,14 @@ export async function runPoolClient(
       if ((e as Error).name === 'AbortError') return null;
       throw e;
     });
+    if (reg === 'negotiated') return reg;
     return reg ? reg.body as RegisterBody : null;
   };
 
   const initialReg = await register();
+  if (initialReg === 'negotiated') {
+    return runNegotiatedPoolClient(poolUrl, payoutAddress, workers, throttle, reporter, signal, status, smart);
+  }
   if (!initialReg) {
     reporter.close?.();
     return;
@@ -741,6 +751,13 @@ export async function runPoolClient(
     dispatcher.clear();
     const regBody = await register();
     if (stopped) return;
+    if (regBody === 'negotiated') {
+      // The pool switched to mandatory negotiated mode mid-run. Stop the classic
+      // loop; the runner/menu restarts pool mode, which then hands off cleanly.
+      reporter.event('warn', '[pool-miner] pool now requires negotiated mode — restart the miner to switch over.');
+      stopPoolMode();
+      return;
+    }
     if (!regBody) {
       stopPoolMode();
       return;
