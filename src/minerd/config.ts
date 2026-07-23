@@ -62,6 +62,21 @@ export function resolvePoolUrl(raw: string | undefined): string | undefined {
   return v.replace(/\/+$/, '');
 }
 
+/** Resolve the helper list from MINER_HELPERS (comma-separated), falling back to
+ *  the defaults. A malformed value (e.g. "," or all-whitespace) filters to [] and
+ *  also falls back, so callers always get >=1 helper (HelperPool requires one).
+ *  Used by loadConfig and by negotiated pool mode (which needs helpers for its
+ *  own chain view even though the pool path otherwise ignores them). */
+export function resolveHelpers(env: Record<string, string | undefined> = process.env): string[] {
+  const parsed = (env.MINER_HELPERS
+    ? env.MINER_HELPERS.split(',')
+    : DEFAULT_HELPERS
+  )
+    .map((h) => h.trim().replace(/\/+$/, ''))
+    .filter((h) => h.length > 0);
+  return parsed.length > 0 ? parsed : DEFAULT_HELPERS;
+}
+
 /** Load + validate miner config from an env-like record (defaults to process.env). */
 export function loadConfig(env: Record<string, string | undefined> = process.env): MinerConfig {
   const minerPubkeyHex = (env.MINER_PUBKEY ?? '').trim().toLowerCase();
@@ -69,15 +84,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   // addressFromHex throws "address must be 32 bytes" on the wrong length.
   const minerPubkey = addressFromHex(minerPubkeyHex);
 
-  const parsedHelpers = (env.MINER_HELPERS
-    ? env.MINER_HELPERS.split(',')
-    : DEFAULT_HELPERS
-  )
-    .map((h) => h.trim().replace(/\/+$/, ''))
-    .filter((h) => h.length > 0);
-  // A malformed MINER_HELPERS (e.g. "," or all-whitespace) filters to []; fall back to
-  // the defaults so solo mode always has >=1 helper (HelperPool requires at least one).
-  const helpers = parsedHelpers.length > 0 ? parsedHelpers : DEFAULT_HELPERS;
+  const helpers = resolveHelpers(env);
 
   // Auto-sizing runs off what we're ACTUALLY allowed to use, not what os.cpus()
   // claims — inside a CPU-limited container the latter is the whole host, which is

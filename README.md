@@ -111,6 +111,8 @@ The first time, set your **Wallet** (paste your address — see below), then hig
 
 By default FulgurMiner mines to **[FulgurPool](https://fulgurpool.xyz)**, the project's own pool — just set your wallet and start. The **Where to mine** picker includes **FulgurPool**, **Solo**, and a built-in **brcpool**. Custom pools can be added or removed directly inside the picker (in both `npm start` and `npm run settings`), or by editing `pools.json` for advanced users. Pool URLs can be written with or without the `https://` scheme; a malformed entry is shown in the picker so you can fix it.
 
+> **Negotiated pools.** Some pools (first: brcpool) no longer build blocks for their miners — instead each miner syncs the chain itself and builds its **own** blocks, with the coinbase paying the pool; the pool only validates them and aggregates payouts (Stratum-V2-style job negotiation, so pooled hashrate can't be used for 51%-style attacks). FulgurMiner detects this automatically and switches over — nothing to configure. Expect a one-time chain download & verify when mining at such a pool (like solo's first sync), then it mines as usual. Requires Node 22+ for the built-in WebSocket.
+
 ## 3. Pick a Mining mode
 
 The **Mode** row chooses how hard FulgurMiner pushes your CPU:
