@@ -593,18 +593,20 @@ export async function runNegotiatedPoolClient(
       case 'template_result': {
         inFlight = Math.max(0, inFlight - 1);
         const action = classifyTemplateResult(msg.accepted === true, inFlight);
+        // THE RULE that keeps this list bounded: a result may only schedule a
+        // new registration if it also removed one (or if nothing at all is left
+        // in flight). Any result that both fails to settle an entry AND queues
+        // another send is an accumulation loop — that is how a rejection stream,
+        // and then an unmatched-acceptance stream, each filled the count cap and
+        // evicted a live registration long before its TTL.
         if (action === 'ignore-ambiguous') {
-          // Another send is still unanswered, and its watchdog is still armed —
-          // leave both alone. Crucially, do NOT schedule a registration here: a
-          // rejection stream that kept appending entries is exactly what filled
-          // the count cap and evicted a live registration. With this branch,
-          // new registrations come only from a tip change or the backing-off
-          // watchdog, so the list cannot grow faster than it ages out.
+          // Another send is still unanswered. Leave the watchdog alone too: it is
+          // covering that send, and clearing it here would drop the only timer.
           reporter.event('warn', `[nego-miner] template rejected: ${String(msg.reason ?? 'unknown')} (another registration still pending)`);
           break;
         }
-        if (resultWatchdog) { clearTimeout(resultWatchdog); resultWatchdog = null; }
         if (action === 'settle-and-retry') {
+          if (resultWatchdog) { clearTimeout(resultWatchdog); resultWatchdog = null; }
           outstanding = [];
           watchdogStrikes = 0; // a correlated answer — the pool is responding
           const reason = String(msg.reason ?? 'unknown');
@@ -624,12 +626,23 @@ export async function runNegotiatedPoolClient(
         // cancel each other out forever.
         const settled = settleOutstanding(outstanding, msg.headerHex);
         if (!settled) {
-          reporter.event('warn', '[nego-miner] pool returned a header that is not a template this miner built — refusing to grind it, rebuilding. (If this repeats, the pool is not honouring negotiated mode; switch pools or mine solo.)');
-          grind.stop();
-          grinding = null;
-          scheduleRegister(RETRY_BUILD_DELAY_MS);
+          reporter.event('warn', '[nego-miner] pool returned a header that is not a template this miner built — refusing to grind it. (If this repeats, the pool is not honouring negotiated mode; switch pools or mine solo.)');
+          // Refuse the foreign header — but do NOT stop a grind already running
+          // on a template we DID build and verify. Killing good work because a
+          // stale or foreign result arrived is self-inflicted downtime, and it
+          // would hand a misbehaving pool an easy way to stop us mining.
+          //
+          // Schedule only if nothing else is coming (see THE RULE above). An
+          // unmatched acceptance is normally just a delayed answer for a template
+          // a tip change already superseded — and that tip change scheduled its
+          // own registration.
+          if (inFlight === 0) {
+            if (resultWatchdog) { clearTimeout(resultWatchdog); resultWatchdog = null; }
+            scheduleRegister(RETRY_BUILD_DELAY_MS);
+          }
           break;
         }
+        if (resultWatchdog) { clearTimeout(resultWatchdog); resultWatchdog = null; }
         // Reset the backoff only on a CORRELATED answer. Resetting on any
         // message at all lets a foreign or uncorrelated result hold the
         // re-registration rate high against exactly the slow pool the backoff
