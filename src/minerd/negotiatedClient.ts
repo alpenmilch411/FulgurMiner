@@ -24,12 +24,11 @@
 // VerifierPool (parallel-PoW bootstrap), GrindPool (wasm grind workers,
 // continuous share mode). Native engine + smart throttle control are follow-ups;
 // the start duty still honors Smart Max (straight to 1.0).
-import type { SnapshotConfirmResult } from './miner.js';
-import type { RestoreOutcome } from './persistence.js';
 import { Blockchain } from '../chain/blockchain.js';
 import {
   computeTxRoot, encodeBlock, encodeHeader, type Block, type BlockHeader,
 } from '../chain/block.js';
+import { checkPoW } from '../chain/consensus.js';
 import { MAX_BLOCK_BYTES } from '../chain/genesis.js';
 import { applyBlockTxs, cloneState, stateRoot } from '../chain/state.js';
 import { decodeTx, encodeTx, validateTxStructure, type Transaction } from '../chain/transaction.js';
@@ -37,6 +36,11 @@ import { bytesToHex, hexToBytes } from '../util/binary.js';
 import { resolveHelpers } from './config.js';
 import { GrindPool } from './grindPool.js';
 import { HelperPool } from './helperPool.js';
+import {
+  chainIntegrityOK, confirmRestoredSnapshot, SAVE_EVERY_BLOCKS, SAVE_EVERY_MS,
+  SNAPSHOT_CONFIRM_TIMEOUT_MS, type SnapshotConfirmResult,
+} from './miner.js';
+import { deleteSnapshot, restoreSnapshot, saveSnapshot, type RestoreOutcome } from './persistence.js';
 import { isFulgurPool } from './pools.js';
 import { ConsoleReporter, type MinerReporter, type ReporterStatus } from './reporter.js';
 import { smartStartDuty } from './smartController.js';
@@ -440,8 +444,22 @@ export async function runNegotiatedPoolClient(
   // /register body in this mode), so this is the GitHub-release check alone.
   void checkForUpdate({ reporter, signal }).catch(() => {});
 
-  // ── Own chain view (same pattern as solo, minus snapshot warm-start) ──
+  // ── Own chain view (same pattern as solo, INCLUDING snapshot warm-start) ──
   const chain = new Blockchain();
+  const debug = process.env.MINER_DEBUG
+    ? (m: string): void => reporter.event('info', `[nego-miner] ${m}`)
+    : undefined;
+  // Deep reorg below the snapshot anchor: the cached prefix is no longer
+  // canonical — drop the file, reset, and let the next catch-up full-replay.
+  // (Solo's listener minus the solo-earnings reset: this path holds no reward
+  // ledger, the pool pays out.)
+  let snapshotInvalidated = false;
+  const unsubInvalidated = chain.onSnapshotInvalidated(() => {
+    snapshotInvalidated = true;
+    deleteSnapshot();
+    try { chain.reset(); } catch { /* genesis-only re-init; ignore */ }
+    debug?.('snapshot invalidated (deep reorg) — cleared; will full-replay');
+  });
   const helperPool = new HelperPool(resolveHelpers(process.env), {
     onInfo: (m) => reporter.event('info', m),
   });
@@ -457,10 +475,67 @@ export async function runNegotiatedPoolClient(
   let targetHeight = 0;
   try { targetHeight = (await helperPool.getTip(signal)).height; } catch { /* indeterminate progress */ }
   reporter.event('info', `[nego-miner] syncing own chain from ${helperPool.primary()}${targetHeight ? ` (target height ${targetHeight.toLocaleString('en-US')})` : ''}…`);
+
+  let cold: { ok: boolean; warm: boolean };
   try {
-    await sync.bootstrap((h) => reporter.syncProgress(h, targetHeight));
+    cold = await negotiatedColdStart({
+      restore: () => restoreSnapshot(chain, debug),
+      confirm: (anchorHeight) =>
+        confirmRestoredSnapshot({
+          anchorHeight,
+          anchorHash: chain.tip.hash,
+          // Bounded, cancellable fetch (the solo pattern): per-call controller,
+          // timeout OR the run signal, listener released in finally — never a
+          // composite held on the long-lived run signal (timedFetch invariant).
+          fetchBlockAt: async (h) => {
+            const ac = new AbortController();
+            const t = setTimeout(
+              () => ac.abort(new DOMException(`snapshot confirm timed out after ${SNAPSHOT_CONFIRM_TIMEOUT_MS}ms`, 'TimeoutError')),
+              SNAPSHOT_CONFIRM_TIMEOUT_MS,
+            );
+            const onAbort = (): void => ac.abort(signal!.reason ?? new DOMException('aborted', 'AbortError'));
+            if (signal) {
+              if (signal.aborted) ac.abort(signal.reason);
+              else signal.addEventListener('abort', onAbort, { once: true });
+            }
+            try {
+              return await helperPool.blockAt(h, ac.signal);
+            } finally {
+              clearTimeout(t);
+              if (signal) signal.removeEventListener('abort', onAbort);
+            }
+          },
+          checkPoW,
+        }),
+      bootstrap: () => sync.bootstrap((h) => reporter.syncProgress(h, targetHeight)),
+      // The gate only needs SOME 32-byte credit key to build a local throwaway
+      // template; the miner's own payout key is the natural one. Local check
+      // only — nothing here is sent to the pool.
+      integrityOK: () => {
+        try { return chainIntegrityOK(chain, hexToBytes(payoutAddress)); } catch { return false; }
+      },
+      invalidated: () => snapshotInvalidated,
+      clearInvalidated: () => { snapshotInvalidated = false; },
+      discardSnapshot: () => {
+        deleteSnapshot();
+        try { chain.reset(); } catch { /* genesis-only re-init; ignore */ }
+      },
+      resetChain: () => { try { chain.reset(); } catch { /* ignore */ } },
+      aborted: () => signal?.aborted === true,
+      height: () => chain.height,
+      info: (m) => reporter.event('info', `[nego-miner] ${m}`),
+      debug,
+    });
   } catch (e) {
     if (!signal?.aborted) reporter.event('error', `[nego-miner] chain bootstrap failed: ${(e as Error).message}`);
+    unsubInvalidated();
+    void verifier?.terminate();
+    reporter.close?.();
+    return;
+  }
+  if (!cold.ok) {
+    // Aborted mid-cold-start — never mine on (or persist) an unconfirmed chain.
+    unsubInvalidated();
     void verifier?.terminate();
     reporter.close?.();
     return;
@@ -470,6 +545,23 @@ export async function runNegotiatedPoolClient(
   verifier = null;
   reporter.synced(chain.height);
   reporter.event('info', `[nego-miner] chain synced at height ${chain.height.toLocaleString('en-US')}`);
+
+  // ── Snapshot persistence: debounced saves (solo cadence) ──
+  // Every save below writes a bootstrapped + (if warm) integrity-proven chain:
+  // all earlier paths return before reaching this point, which is the solo
+  // `chainConfirmed` invariant expressed as control flow.
+  let lastSaveHeight = -SAVE_EVERY_BLOCKS;
+  let lastSaveAt = 0;
+  const maybeSave = (): void => {
+    const now = Date.now();
+    if (chain.height - lastSaveHeight < SAVE_EVERY_BLOCKS && now - lastSaveAt < SAVE_EVERY_MS) return;
+    lastSaveHeight = chain.height;
+    lastSaveAt = now;
+    if (saveSnapshot(chain)) debug?.(`snapshot saved at height ${chain.height}`);
+  };
+  // Write one immediately so the very next launch is warm even if this process
+  // dies early (subject to a finalized anchor existing — short chains skip).
+  maybeSave();
 
   const grind = new GrindPool(workers, startDuty);
   let acceptedShares = 0;
@@ -609,6 +701,8 @@ export async function runNegotiatedPoolClient(
         } finally {
           syncing = false;
         }
+        // The chain advanced — let the save debounce decide whether to persist.
+        maybeSave();
         // The catch-up above is the one await in this function: re-check that the
         // session is still live before arming any timer or sending anything.
         if (sessionOver(sock)) return;
@@ -872,8 +966,13 @@ export async function runNegotiatedPoolClient(
   if (registerTimer) clearTimeout(registerTimer);
   if (resultWatchdog) clearTimeout(resultWatchdog);
   if (reconnectTimer) clearTimeout(reconnectTimer);
+  unsubInvalidated();
   stats.stop();
   grind.terminate();
+  // Parting save (best-effort, never throws). Only reachable after the cold
+  // start confirmed the chain, so an unconfirmed state is never persisted; a
+  // mid-invalidation genesis-reset chain is too shallow and skips (returns false).
+  if (saveSnapshot(chain)) debug?.(`snapshot saved on shutdown at height ${chain.height}`);
   try { (ws as WebSocket | null)?.close(); } catch { /* already closed */ }
   reporter.close?.();
 }
