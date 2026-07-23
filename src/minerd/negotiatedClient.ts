@@ -456,12 +456,17 @@ export async function runNegotiatedPoolClient(
   // canonical — drop the file, reset, and let the next catch-up full-replay.
   // (Solo's listener minus the solo-earnings reset: this path holds no reward
   // ledger, the pool pays out.)
+  // Late-bound: assigned once the session objects (scheduleRegister) exist, so
+  // a cold-start invalidation keeps its solo-mirror handling (flag + integrity
+  // gate) with no live-session side effects.
+  let onInvalidatedLive: (() => void) | null = null;
   let snapshotInvalidated = false;
   const unsubInvalidated = chain.onSnapshotInvalidated(() => {
     snapshotInvalidated = true;
     deleteSnapshot();
     try { chain.reset(); } catch { /* genesis-only re-init; ignore */ }
     debug?.('snapshot invalidated (deep reorg) — cleared; will full-replay');
+    onInvalidatedLive?.();
   });
   const helperPool = new HelperPool(resolveHelpers(process.env), {
     onInfo: (m) => reporter.event('info', m),
@@ -602,6 +607,12 @@ export async function runNegotiatedPoolClient(
   // (sessionOver catches it), so it must not gate a live one either.
   let registeringGen = -1;
   let socketGen = 0;
+  // Per-connection abort fence. A catch-up launched under socket generation N
+  // must stop fetching the moment N dies — without this, a stale generation's
+  // catch-up keeps mutating the shared chain for minutes while the reconnected
+  // generation is already grinding (this fences MUTATION; sends were already
+  // fenced by sessionOver/registeringGen).
+  let connAbort: AbortController | null = null;
   // Consecutive result-watchdog firings, used to back the re-registration rate
   // off. A pool that answers slower than a fixed watchdog period would otherwise
   // be sent a fresh template every period forever, so results keep arriving for
@@ -629,6 +640,14 @@ export async function runNegotiatedPoolClient(
     if (registerTimer) clearTimeout(registerTimer);
     registerTimer = setTimeout(() => { void registerTemplate(); }, delayMs);
   };
+
+  // A mid-session deep-reorg reset must start recovery NOW, not at the pool's
+  // next tip change: kick a registration, whose catch-up re-syncs the reset
+  // chain. Deliberately NOT grind.stop(): the accepted template stays valid to
+  // the POOL (it validates against its own chain) while ours rebuilds — killing
+  // verified work on our own state change is the self-inflicted-downtime
+  // anti-pattern. The rebuilt template replaces the grind on acceptance.
+  onInvalidatedLive = () => { scheduleRegister(0); };
 
   /** Still the same live session on the same socket? Checked after every await —
    *  teardown clears the timers that exist AT THAT MOMENT, so an async call
@@ -692,9 +711,23 @@ export async function runNegotiatedPoolClient(
       // (we synced a block it hasn't seen), the register below gets a 'stale parent'
       // rejection and the retry loop re-registers once the pool catches up.
       if (bytesToHex(chain.tip.hash) !== info.tipHash && !chain.hasBlock(info.tipHash)) {
+        // Bind this catch-up's helper fetches to the CURRENT connection: if the
+        // socket dies mid-await, the next page fetch aborts instead of letting a
+        // stale generation keep mutating the chain the live generation mines on.
+        // A fresh ChainSync per call because the signal must be captured per
+        // invocation — two generations' catch-ups can overlap, so a shared
+        // mutable signal source would fence the wrong one. ChainSync is a
+        // stateless wrapper (config only), so this allocates nothing meaningful.
+        const connSignal = connAbort?.signal ?? signal;
+        const connSync = new ChainSync({
+          chain,
+          cores: workers,
+          getBlocks: (from, max) => helperPool.getBlocks(from, max, connSignal),
+          verifyBlocksParallel: (blocks, cores) => verifyBlocksParallel(blocks, cores),
+        });
         syncing = true;
         try {
-          await sync.catchUp({ height: info.height, tipHash: info.tipHash });
+          await connSync.catchUp({ height: info.height, tipHash: info.tipHash });
         } catch (e) {
           if ((e as Error)?.name === 'AbortError') return;
           if (sessionOver(sock)) return;
@@ -930,6 +963,10 @@ export async function runNegotiatedPoolClient(
     // New generation: any registration still awaiting a catch-up belongs to the
     // OLD socket and must stop gating registrations on this one.
     socketGen++;
+    // Supersede the previous connection's fence: any of its catch-ups still in
+    // flight must not keep fetching under the new generation.
+    connAbort?.abort(new DOMException('socket superseded', 'AbortError'));
+    connAbort = new AbortController();
     ws = sock;
     sock.onopen = () => {
       sock.send(JSON.stringify({ type: 'auth', address: payoutAddress, mode: 'negotiated' }));
@@ -942,6 +979,7 @@ export async function runNegotiatedPoolClient(
     sock.onclose = () => {
       if (ws !== sock || stopped) return;
       ws = null;
+      connAbort?.abort(new DOMException('socket closed', 'AbortError'));
       grind.stop();
       grinding = null;
       outstanding = [];
@@ -969,6 +1007,12 @@ export async function runNegotiatedPoolClient(
   if (registerTimer) clearTimeout(registerTimer);
   if (resultWatchdog) clearTimeout(resultWatchdog);
   if (reconnectTimer) clearTimeout(reconnectTimer);
+  // onclose is a no-op once stopped — abort the fence explicitly so an
+  // in-flight catch-up's next page fetch cancels instead of running on.
+  // Cast needed: TS's flow narrowing doesn't account for `connect()` reassigning
+  // this from within its own body, so it sees the `= null` initializer as still
+  // in effect here (the same reason `ws` below carries an explicit cast).
+  (connAbort as AbortController | null)?.abort(new DOMException('miner stopped', 'AbortError'));
   unsubInvalidated();
   stats.stop();
   grind.terminate();
