@@ -279,10 +279,7 @@ test('coldStart: forged confirm → file DISCARDED (not just reset), full sync, 
     confirm: { ok: false, kind: 'forged', reason: 'anchor-not-canonical' },
   });
   assert.deepEqual(await negotiatedColdStart(deps), { ok: true, warm: false });
-  assert.ok(calls.includes('discard'));
-  assert.ok(!calls.includes('reset'));           // discard already resets
-  assert.ok(!calls.includes('integrity'));       // not warm → no gate
-  assert.equal(calls.filter((c) => c === 'bootstrap').length, 1);
+  assert.deepEqual(calls, ['restore', 'confirm:7', 'discard', 'info:saved', 'bootstrap']);
 });
 
 test('coldStart: indeterminate confirm → file KEPT (reset only), full sync this session', async () => {
@@ -291,9 +288,7 @@ test('coldStart: indeterminate confirm → file KEPT (reset only), full sync thi
     confirm: { ok: false, kind: 'indeterminate', reason: 'helper-unreachable: x' },
   });
   assert.deepEqual(await negotiatedColdStart(deps), { ok: true, warm: false });
-  assert.ok(calls.includes('reset'));
-  assert.ok(!calls.includes('discard'));         // keep the file for a later launch
-  assert.equal(calls.filter((c) => c === 'bootstrap').length, 1);
+  assert.deepEqual(calls, ['restore', 'confirm:7', 'reset', 'info:could', 'bootstrap']);
 });
 
 test('coldStart: integrity gate fails → discard + ONE full re-bootstrap, not warm', async () => {
@@ -328,6 +323,18 @@ test('coldStart: aborted during confirm → ok:false, never trusts or bootstraps
   const { deps, calls, state } = coldDeps({ restore: { restored: true, anchorHeight: 9 } });
   deps.confirm = async (h) => { calls.push(`confirm:${h}`); state.aborted = true; return { ok: true }; };
   assert.deepEqual(await negotiatedColdStart(deps), { ok: false, warm: false });
+  assert.ok(!calls.includes('bootstrap'));
+});
+
+test('coldStart: abort racing a FORGED confirm still deletes the file, never bootstraps', async () => {
+  const { deps, calls, state } = coldDeps({ restore: { restored: true, anchorHeight: 9 } });
+  deps.confirm = async (h) => {
+    calls.push(`confirm:${h}`);
+    state.aborted = true;
+    return { ok: false, kind: 'forged', reason: 'anchor-not-canonical' };
+  };
+  assert.deepEqual(await negotiatedColdStart(deps), { ok: false, warm: false });
+  assert.ok(calls.includes('discard'));
   assert.ok(!calls.includes('bootstrap'));
 });
 

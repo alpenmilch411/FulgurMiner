@@ -346,7 +346,6 @@ export async function negotiatedColdStart(
     // Never network-confirm (or trust) a restore on an already-aborting run.
     if (deps.aborted()) return { ok: false, warm: false };
     const confirm = await deps.confirm(restore.anchorHeight);
-    if (deps.aborted()) return { ok: false, warm: false };
     if (!confirm.ok) {
       deps.debug?.(
         `restored snapshot ${confirm.kind} (${confirm.reason}) — full replay` +
@@ -364,6 +363,10 @@ export async function negotiatedColdStart(
           : 'could not confirm saved chain against the network — re-syncing this session…',
       );
     }
+    // Abort-gate AFTER classifying the result (solo parity): a forged file is
+    // deleted even when the run is aborting — leaving it would only defer the
+    // same verdict to the next launch.
+    if (deps.aborted()) return { ok: false, warm: false };
   }
 
   if (warm) {
@@ -969,10 +972,14 @@ export async function runNegotiatedPoolClient(
   unsubInvalidated();
   stats.stop();
   grind.terminate();
-  // Parting save (best-effort, never throws). Only reachable after the cold
-  // start confirmed the chain, so an unconfirmed state is never persisted; a
-  // mid-invalidation genesis-reset chain is too shallow and skips (returns false).
-  if (saveSnapshot(chain)) debug?.(`snapshot saved on shutdown at height ${chain.height}`);
+  // Parting save (best-effort, never throws), gated on the cold start having
+  // confirmed the chain — the same belt-and-suspenders solo keeps via
+  // `chainConfirmed` (control flow already guarantees it today; the guard makes
+  // the invariant survive refactors). After a mid-session deep-reorg reset this
+  // may persist a partially re-replayed chain: that is safe and matches solo —
+  // every block in it passed full validation, and the next launch re-confirms
+  // the anchor against the network before trusting it.
+  if (cold.ok && saveSnapshot(chain)) debug?.(`snapshot saved on shutdown at height ${chain.height}`);
   try { (ws as WebSocket | null)?.close(); } catch { /* already closed */ }
   reporter.close?.();
 }
