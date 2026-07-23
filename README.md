@@ -171,6 +171,24 @@ Once mining, FulgurMiner shows a live, framed dashboard:
 
 Everything below is optional. FulgurMiner works out of the box with the menu above.
 
+## Desktop control panel (GUI)
+
+Prefer a window to a terminal? A small, zero-dependency local web panel lives in
+[`gui/`](gui/README.md). It wraps the headless miner in a dark-theme UI with one-click
+start/stop, live hashrate / height / difficulty, CPU-core capping, engine and mode
+selection, an editable payout address, a **Solo ⇄ Pool** switch, your confirmed wallet
+balance, and a live est. blocks/day readout. It runs the same on **Windows, macOS, and
+Linux** (Node built-ins only — no extra `npm install`).
+
+```bash
+npm run gui                 # serves http://localhost:7311
+npm run install-shortcut    # optional: a double-click icon on your Desktop
+```
+
+Or double-click the launcher for your OS (`FulgurMiner-Windows.bat` /
+`FulgurMiner-macOS.command` / `FulgurMiner-Linux.sh`). See [`gui/README.md`](gui/README.md)
+for the full guide.
+
 ## Running without the TUI
 
 For servers, scripts, or any non-interactive setup, run the plain-log miner:

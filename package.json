@@ -14,6 +14,8 @@
     "settings": "tsx src/minerd/settings.ts",
     "mine": "tsx src/minerd/index.ts",
     "mine:dryrun": "tsx src/minerd/index.ts dryrun",
+    "gui": "node gui/server.mjs",
+    "install-shortcut": "node gui/install-shortcut.mjs",
     "test": "npm run test:chain && npm run test:minerd",
     "test:chain": "vitest run",
     "test:minerd": "node --import tsx --test src/minerd/*.test.ts",

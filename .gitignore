@@ -6,3 +6,6 @@ native/brc-pow/target/
 .fulgurminer/
 *.log
 .DS_Store
+
+# GUI control panel runtime state (regenerated on first run)
+gui/state.json
