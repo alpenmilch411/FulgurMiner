@@ -27,6 +27,17 @@ export interface Tip {
   tipHash: string;
 }
 
+/** A /tip body is only usable if height is a finite non-negative number and
+ *  tipHash is 64 hex chars. A malformed 200 body (missing height -> NaN) would
+ *  otherwise flow into the tip poller as a NaN height and stop solo grinding with
+ *  no rebuild. Exported for tests. */
+export function isValidTipBody(body: unknown): boolean {
+  const b = body as { height?: unknown; tipHash?: unknown } | null;
+  if (!b || typeof b !== 'object') return false;
+  const h = Number(b.height);
+  return Number.isFinite(h) && h >= 0 && typeof b.tipHash === 'string' && /^[0-9a-f]{64}$/i.test(b.tipHash);
+}
+
 // Bound every solo helper fetch so a half-open connection can't wedge sync/submit.
 // Generous because /blocks can return up to 200 blocks; /tip and /block are quick.
 const HTTP_TIMEOUT_MS = 30_000;
@@ -96,8 +107,12 @@ export async function getJsonWithRetry(url: string, opts: GetJsonOpts = {}): Pro
 }
 
 export async function getTip(base: string, opts: GetJsonOpts = {}): Promise<Tip> {
-  const body = (await getJsonWithRetry(`${base}/tip`, opts)) as Tip;
-  return { height: Number(body.height), tipHash: String(body.tipHash) };
+  const body = await getJsonWithRetry(`${base}/tip`, opts);
+  if (!isValidTipBody(body)) {
+    throw new Error(`malformed /tip from ${base}`);
+  }
+  const b = body as { height: number; tipHash: string };
+  return { height: Number(b.height), tipHash: String(b.tipHash) };
 }
 
 /** Canonical blocks from `fromHeight` (inclusive), oldest-first, up to `max` (server caps at 200). */

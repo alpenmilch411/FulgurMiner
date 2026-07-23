@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { getJsonWithRetry, isHelperAccept, decodeBlockHex, MAX_BLOCK_HEX } from './http.js';
+import { getJsonWithRetry, isHelperAccept, decodeBlockHex, MAX_BLOCK_HEX, isValidTipBody } from './http.js';
 
 // The 30s request timeout wired into the solo sync path means a
 // slow/cold-start /blocks now throws TimeoutError; ChainSync.bootstrap has no retry,
@@ -89,4 +89,13 @@ test('decodeBlockHex rejects an oversized block hex before decoding (DoS guard)'
 test('decodeBlockHex rejects a non-string block entry', () => {
   assert.throws(() => decodeBlockHex(12345 as unknown, 0), /non-string/);
   assert.throws(() => decodeBlockHex(undefined as unknown), /non-string/);
+});
+
+test('isValidTipBody: rejects missing/short/non-numeric fields', () => {
+  assert.equal(isValidTipBody({ height: 35550, tipHash: 'a'.repeat(64) }), true);
+  assert.equal(isValidTipBody({ tipHash: 'a'.repeat(64) }), false);        // missing height -> NaN
+  assert.equal(isValidTipBody({ height: 1, tipHash: 'xyz' }), false);       // bad hash
+  assert.equal(isValidTipBody({ height: -1, tipHash: 'a'.repeat(64) }), false);
+  assert.equal(isValidTipBody({ height: 'abc', tipHash: 'a'.repeat(64) }), false);
+  assert.equal(isValidTipBody(null), false);
 });
