@@ -685,16 +685,20 @@ export async function runNegotiatedPoolClient(
         if (!accepted && grinding && String(msg.reason ?? '').includes('stale')) {
           // Our template's parent went stale — stop and rebuild off the new tip.
           //
-          // Guarded on `grinding` and on nothing being in flight: share_result
-          // carries no jobId, so a delayed stale verdict for an OLD job is
-          // indistinguishable from one for the current template. Without the
-          // guard, a burst of them re-registers on every message (growing the
-          // outstanding list faster than it ages out) and can stop a grind that
-          // a newer, still-valid template had just started. If a registration is
-          // already in flight, that one is the rebuild — do not queue another.
+          // The `grinding` guard is what bounds this: share_result carries no
+          // jobId, so a burst of stale verdicts is indistinguishable from one,
+          // but the first message clears `grinding` and every later one skips
+          // the branch entirely. That makes it one-shot, so the rebuild below is
+          // scheduled UNCONDITIONALLY.
+          //
+          // It must not be conditional on nothing being in flight: an already
+          // pending registration is not necessarily the rebuild — it may predate
+          // this acceptance and carry the same now-stale parent. Skipping the
+          // schedule there leaves no grind, no watchdog (a correlated acceptance
+          // cleared it) and no timer, which is a permanent stall.
           grind.stop();
           grinding = null;
-          if (inFlight === 0) scheduleRegister(0);
+          scheduleRegister(0);
         }
         break;
       }
